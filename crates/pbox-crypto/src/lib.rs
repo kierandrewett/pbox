@@ -170,6 +170,34 @@ pub fn server_dns_name(box_id: &str) -> Result<String, CryptoError> {
     server_subject(box_id).map(|_| format!("pbox-{box_id}"))
 }
 
+/// Check that a PEM certificate contains the expected DNS subject alternative name.
+pub fn certificate_has_dns_name(
+    certificate_pem: &str,
+    expected_dns_name: &str,
+) -> Result<bool, CryptoError> {
+    let pem = pem::parse(certificate_pem)
+        .map_err(|error| CryptoError::Certificate(format!("parse certificate PEM: {error}")))?;
+    if pem.tag() != "CERTIFICATE" {
+        return Err(CryptoError::Certificate(
+            "certificate PEM has an unexpected tag".to_owned(),
+        ));
+    }
+    let (_, certificate) = x509_parser::parse_x509_certificate(pem.contents())
+        .map_err(|error| CryptoError::Certificate(format!("parse certificate DER: {error}")))?;
+    let subject_alternative_name = certificate
+        .tbs_certificate
+        .subject_alternative_name()
+        .map_err(|error| CryptoError::Certificate(format!("parse certificate SAN: {error}")))?;
+    Ok(subject_alternative_name.is_some_and(|extension| {
+        extension.value.general_names.iter().any(|name| match name {
+            x509_parser::extensions::GeneralName::DNSName(name) => {
+                name.eq_ignore_ascii_case(expected_dns_name)
+            }
+            _ => false,
+        })
+    }))
+}
+
 fn is_id_byte(byte: u8) -> bool {
     byte.is_ascii_lowercase() || byte.is_ascii_digit()
 }
@@ -239,6 +267,23 @@ mod tests {
         assert_ne!(first.private_key_der, second.private_key_der);
         assert_ne!(first.certificate_der, second.certificate_der);
         assert!(first.chain_pem.is_some());
+    }
+
+    #[test]
+    fn certificate_dns_name_check_reads_server_san() {
+        let seed = derive_context_seed("pbox@pve!cli", "secret");
+        let ca = generate_context_ca(&seed).unwrap();
+        let certificate = issue_certificate(
+            &ca,
+            &server_subject("pbx_t3yzd9y3").unwrap(),
+            CertificatePurpose::Server,
+        )
+        .unwrap();
+
+        assert!(
+            certificate_has_dns_name(&certificate.certificate_pem, "pbox-pbx_t3yzd9y3").unwrap()
+        );
+        assert!(!certificate_has_dns_name(&certificate.certificate_pem, "pbox-pbx_other").unwrap());
     }
 
     #[test]

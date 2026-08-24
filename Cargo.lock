@@ -1173,11 +1173,13 @@ dependencies = [
  "base64",
  "ed25519-dalek",
  "hkdf",
+ "pem",
  "rcgen",
  "rustls-pki-types",
  "sha2",
  "thiserror",
  "time",
+ "x509-parser",
 ]
 
 [[package]]

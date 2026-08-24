@@ -30,10 +30,12 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 const MAX_FILE_SIZE: u64 = 64 * 1024 * 1024;
 const FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const FORWARD_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const FORWARD_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const EXEC_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const EXEC_STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const EXEC_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_UPLOAD_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -58,11 +60,20 @@ struct Args {
     forward_allow: Vec<IpNet>,
     #[arg(long, default_value_t = 32)]
     max_exec: usize,
+    #[arg(long, default_value_t = 32)]
+    max_forward: usize,
+    #[arg(long, default_value_t = 32)]
+    max_file: usize,
+    #[arg(long, default_value_t = 64)]
+    max_handshakes: usize,
 }
 
 #[derive(Clone)]
 struct AgentService {
     box_id: String,
+    handshake_slots: Arc<Semaphore>,
+    forward_slots: Arc<Semaphore>,
+    file_slots: Arc<Semaphore>,
     forward_allow: Vec<IpNet>,
     exec_slots: Arc<Semaphore>,
 }
@@ -102,12 +113,18 @@ impl Agent for AgentService {
         &self,
         request: Request<Streaming<ExecRequest>>,
     ) -> Result<Response<Self::ExecStream>, Status> {
+        let handshake_permit = self
+            .handshake_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("too many concurrent handshakes"))?;
         let mut requests = request.into_inner();
-        let first = tokio::time::timeout(EXEC_STREAM_IDLE_TIMEOUT, requests.message())
+        let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, requests.message())
             .await
-            .map_err(|_| Status::deadline_exceeded("exec stream idle timeout"))??
+            .map_err(|_| Status::deadline_exceeded("exec handshake timed out"))??
             .ok_or_else(|| Status::invalid_argument("exec stream is empty"))?;
         validate_exec_request(&first)?;
+        drop(handshake_permit);
         let permit = self
             .exec_slots
             .clone()
@@ -122,16 +139,27 @@ impl Agent for AgentService {
         &self,
         request: Request<Streaming<FileChunk>>,
     ) -> Result<Response<FileResult>, Status> {
+        let handshake_permit = self
+            .handshake_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("too many concurrent handshakes"))?;
         let mut stream = request.into_inner();
-        let first = tokio::time::timeout(FILE_STREAM_IDLE_TIMEOUT, stream.message())
+        let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.message())
             .await
-            .map_err(|_| Status::deadline_exceeded("file stream idle timeout"))??
+            .map_err(|_| Status::deadline_exceeded("file handshake timed out"))??
             .ok_or_else(|| Status::invalid_argument("file stream is empty"))?;
         if first.protocol_version != PROTOCOL {
             return Err(Status::failed_precondition(
                 "unsupported agent protocol version",
             ));
         }
+        drop(handshake_permit);
+        let _file_permit = self
+            .file_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("too many concurrent file requests"))?;
         let path = safe_path(&first.path)?;
         let temporary_path = temporary_path(&path);
         receive_upload(&mut stream, first, &temporary_path, &path)
@@ -149,9 +177,17 @@ impl Agent for AgentService {
                 "unsupported agent protocol version",
             ));
         }
+        let file_permit = self
+            .file_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("too many concurrent file requests"))?;
         let path = safe_path(&request.path)?;
         let (sender, receiver) = mpsc::channel(16);
-        tokio::spawn(read_file(path, sender));
+        tokio::spawn(async move {
+            let _file_permit = file_permit;
+            read_file(path, sender).await;
+        });
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 
@@ -159,10 +195,15 @@ impl Agent for AgentService {
         &self,
         request: Request<Streaming<ForwardEvent>>,
     ) -> Result<Response<Self::ForwardStream>, Status> {
+        let handshake_permit = self
+            .handshake_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("too many concurrent handshakes"))?;
         let mut inbound = request.into_inner();
-        let open_event = inbound
-            .message()
-            .await?
+        let open_event = tokio::time::timeout(HANDSHAKE_TIMEOUT, inbound.message())
+            .await
+            .map_err(|_| Status::deadline_exceeded("forward handshake timed out"))??
             .ok_or_else(|| Status::invalid_argument("forward stream must start with open"))?;
         let forward_event::Event::Open(open) = open_event
             .event
@@ -180,6 +221,12 @@ impl Agent for AgentService {
         if open.host.is_empty() || open.port == 0 || open.port > u16::MAX as u32 {
             return Err(Status::invalid_argument("invalid forward target"));
         }
+        drop(handshake_permit);
+        let forward_permit = self
+            .forward_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("too many concurrent forwards"))?;
         let port = open.port as u16;
         let addresses = tokio::time::timeout(
             FORWARD_CONNECT_TIMEOUT,
@@ -200,6 +247,7 @@ impl Agent for AgentService {
         let (mut reader, mut writer) = socket.into_split();
         let (sender, receiver) = mpsc::channel(32);
         tokio::spawn(async move {
+            let _forward_permit = forward_permit;
             let mut buffer = [0u8; 8192];
             let mut close_code = 0;
             loop {
@@ -515,30 +563,45 @@ where
         return Ok(());
     };
     if !initial_data.is_empty() {
-        writer.write_all(&initial_data).await.map_err(internal_io)?;
+        tokio::time::timeout(EXEC_STDIN_WRITE_TIMEOUT, writer.write_all(&initial_data))
+            .await
+            .map_err(|_| Status::deadline_exceeded("stdin write timed out"))?
+            .map_err(internal_io)?;
     }
     if initial_eof {
-        writer.shutdown().await.map_err(internal_io)?;
+        tokio::time::timeout(EXEC_STDIN_WRITE_TIMEOUT, writer.shutdown())
+            .await
+            .map_err(|_| Status::deadline_exceeded("stdin shutdown timed out"))?
+            .map_err(internal_io)?;
         return Ok(());
     }
-    while let Some(request) = requests.message().await? {
+    while let Some(request) = tokio::time::timeout(EXEC_STREAM_IDLE_TIMEOUT, requests.message())
+        .await
+        .map_err(|_| Status::deadline_exceeded("stdin stream idle timeout"))??
+    {
         if request.protocol_version != PROTOCOL {
             return Err(Status::failed_precondition(
                 "unsupported agent protocol version",
             ));
         }
         if !request.stdin.is_empty() {
-            writer
-                .write_all(&request.stdin)
+            tokio::time::timeout(EXEC_STDIN_WRITE_TIMEOUT, writer.write_all(&request.stdin))
                 .await
+                .map_err(|_| Status::deadline_exceeded("stdin write timed out"))?
                 .map_err(internal_io)?;
         }
         if request.stdin_eof {
-            writer.shutdown().await.map_err(internal_io)?;
+            tokio::time::timeout(EXEC_STDIN_WRITE_TIMEOUT, writer.shutdown())
+                .await
+                .map_err(|_| Status::deadline_exceeded("stdin shutdown timed out"))?
+                .map_err(internal_io)?;
             return Ok(());
         }
     }
-    writer.shutdown().await.map_err(internal_io)?;
+    tokio::time::timeout(EXEC_STDIN_WRITE_TIMEOUT, writer.shutdown())
+        .await
+        .map_err(|_| Status::deadline_exceeded("stdin shutdown timed out"))?
+        .map_err(internal_io)?;
     Ok(())
 }
 
@@ -667,14 +730,12 @@ async fn send_output<R>(
             Ok(size) => size,
             Err(error) if pty && error.raw_os_error() == Some(libc::EIO) => return,
             Err(error) => {
-                let sent = tokio::time::timeout(
+                let _ = tokio::time::timeout(
                     EXEC_STREAM_IDLE_TIMEOUT,
                     sender.send(Err(Status::internal(error.to_string()))),
                 )
                 .await;
-                if !matches!(sent, Ok(Ok(()))) {
-                    output_failure.notify_one();
-                }
+                output_failure.notify_one();
                 return;
             }
         };
@@ -783,7 +844,7 @@ async fn receive_upload(
     file.flush().await.map_err(internal_io)?;
     drop(file);
     if first.mode != 0 {
-        set_mode(temporary_path, first.mode).map_err(internal_io)?;
+        set_mode(temporary_path, safe_mode(first.mode)).map_err(internal_io)?;
     }
     if first.atomic_write {
         tokio::fs::rename(temporary_path, destination)
@@ -954,6 +1015,10 @@ fn metadata_mode(metadata: &std::fs::Metadata) -> u32 {
     }
 }
 
+fn safe_mode(mode: u32) -> u32 {
+    mode & 0o0777
+}
+
 fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -985,10 +1050,25 @@ async fn main() -> Result<()> {
     if args.max_exec == 0 {
         anyhow::bail!("max-exec must be greater than zero");
     }
-    pbox_crypto::server_subject(&args.box_id).context("validate box id")?;
+    if args.max_forward == 0 {
+        anyhow::bail!("max-forward must be greater than zero");
+    }
+    if args.max_file == 0 {
+        anyhow::bail!("max-file must be greater than zero");
+    }
+    if args.max_handshakes == 0 {
+        anyhow::bail!("max-handshakes must be greater than zero");
+    }
+    let server_dns_name = pbox_crypto::server_dns_name(&args.box_id).context("validate box id")?;
     let certificate = tokio::fs::read_to_string(&args.certificate)
         .await
         .with_context(|| format!("read certificate {}", args.certificate.display()))?;
+    let certificate_matches_box =
+        pbox_crypto::certificate_has_dns_name(&certificate, &server_dns_name)
+            .context("validate server certificate identity")?;
+    if !certificate_matches_box {
+        anyhow::bail!("server certificate does not contain DNS SAN {server_dns_name}");
+    }
     let private_key = tokio::fs::read_to_string(&args.private_key)
         .await
         .with_context(|| format!("read private key {}", args.private_key.display()))?;
@@ -1003,6 +1083,9 @@ async fn main() -> Result<()> {
         // control the corresponding pbox estate.
         .client_ca_root(Certificate::from_pem(client_ca));
     let exec_slots = Arc::new(Semaphore::new(args.max_exec));
+    let file_slots = Arc::new(Semaphore::new(args.max_file));
+    let handshake_slots = Arc::new(Semaphore::new(args.max_handshakes));
+    let forward_slots = Arc::new(Semaphore::new(args.max_forward));
     let address = args.listen.parse().context("parse agent listen address")?;
     println!("pbox-agent listening on {}", args.listen);
     Server::builder()
@@ -1010,6 +1093,9 @@ async fn main() -> Result<()> {
         .context("configure agent TLS")?
         .add_service(AgentServer::new(AgentService {
             box_id: args.box_id,
+            handshake_slots,
+            file_slots,
+            forward_slots,
             forward_allow: args.forward_allow,
             exec_slots,
         }))
@@ -1048,5 +1134,11 @@ mod tests {
         assert!(safe_path("").is_err());
         assert!(safe_path("tmp\0file").is_err());
         assert!(safe_path("/tmp/file").is_ok());
+    }
+
+    #[test]
+    fn safe_mode_strips_special_permission_bits() {
+        assert_eq!(safe_mode(0o10755), 0o755);
+        assert_eq!(safe_mode(0o100644), 0o644);
     }
 }

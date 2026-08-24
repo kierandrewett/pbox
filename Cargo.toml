@@ -32,6 +32,8 @@ hkdf = "0.12"
 ipnet = "2.12"
 prost = "0.14"
 rcgen = "0.14"
+x509-parser = "0.18"
+pem = "3.0"
 sha2 = "0.10"
 tonic = { version = "0.14", features = ["transport", "tls-ring"] }
 tonic-prost = "0.14"
