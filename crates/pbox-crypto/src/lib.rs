@@ -138,6 +138,13 @@ pub fn issue_certificate(
             .try_into()
             .map_err(|error| CryptoError::Certificate(format!("invalid SAN: {error}")))?,
     ));
+    if let Some(box_id) = subject.strip_prefix("pbox.cwd.dev/box/") {
+        params.subject_alt_names.push(SanType::DnsName(
+            format!("pbox-{box_id}")
+                .try_into()
+                .map_err(|error| CryptoError::Certificate(format!("invalid DNS SAN: {error}")))?,
+        ));
+    }
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![match purpose {
         CertificatePurpose::Client => ExtendedKeyUsagePurpose::ClientAuth,
@@ -158,6 +165,9 @@ pub fn server_subject(box_id: &str) -> Result<String, CryptoError> {
         return Err(CryptoError::InvalidBoxId(box_id.to_owned()));
     }
     Ok(format!("pbox.cwd.dev/box/{box_id}"))
+}
+pub fn server_dns_name(box_id: &str) -> Result<String, CryptoError> {
+    server_subject(box_id).map(|_| format!("pbox-{box_id}"))
 }
 
 fn is_id_byte(byte: u8) -> bool {
@@ -235,5 +245,14 @@ mod tests {
     fn server_subject_rejects_invalid_ids() {
         assert!(server_subject("pbx_bad!").is_err());
         assert!(server_subject("pbx_t3yzd9y3").is_ok());
+    }
+
+    #[test]
+    fn server_dns_name_matches_box_identity() {
+        assert_eq!(
+            server_dns_name("pbx_t3yzd9y3").unwrap(),
+            "pbox-pbx_t3yzd9y3"
+        );
+        assert!(server_dns_name("invalid").is_err());
     }
 }

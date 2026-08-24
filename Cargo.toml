@@ -1,6 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/pbox-core", "crates/pbox-cli", "crates/pbox-proto", "crates/pbox-crypto"]
+members = [
+    "crates/pbox-core",
+    "crates/pbox-cli",
+    "crates/pbox-proto",
+    "crates/pbox-crypto",
+    "crates/pbox-agent",
+    "crates/pbox-agent-client",
+]
 
 [workspace.package]
 edition = "2024"
@@ -28,4 +35,5 @@ sha2 = "0.10"
 tonic = { version = "0.14", features = ["transport", "tls-ring"] }
 tonic-prost = "0.14"
 time = "0.3"
-tokio = { version = "1.48", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync"] }
+tokio-stream = "0.1"
+tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync"] }

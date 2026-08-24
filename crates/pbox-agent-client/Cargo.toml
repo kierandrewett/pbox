@@ -1,0 +1,14 @@
+[package]
+name = "pbox-agent-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+pbox-crypto = { path = "../pbox-crypto" }
+pbox-proto = { path = "../pbox-proto" }
+tonic.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true

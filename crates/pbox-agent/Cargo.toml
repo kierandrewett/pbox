@@ -1,0 +1,19 @@
+[package]
+name = "pbox-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pbox-agent"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+anyhow.workspace = true
+pbox-proto = { path = "../pbox-proto" }
+sha2.workspace = true
+tonic.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
