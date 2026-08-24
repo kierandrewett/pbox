@@ -314,6 +314,8 @@ pub struct LxcCreateRequest {
     pub unprivileged: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(rename = "ssh-public-keys", skip_serializing_if = "Option::is_none")]
+    pub ssh_public_keys: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start: Option<bool>,
 }
@@ -567,6 +569,7 @@ mod tests {
             ostemplate: Some("local:vztmpl/debian-12.tar.zst".to_owned()),
             memory: Some(1024),
             net0: Some("name=eth0,bridge=vmbr0".to_owned()),
+            ssh_public_keys: Some("ssh-ed25519 AAAA bootstrap".to_owned()),
             start: Some(true),
             ..Default::default()
         };
@@ -579,6 +582,7 @@ mod tests {
         assert_eq!(value["ostemplate"], "local:vztmpl/debian-12.tar.zst");
         assert_eq!(value["memory"], 1024);
         assert_eq!(value["net0"], "name=eth0,bridge=vmbr0");
+        assert_eq!(value["ssh-public-keys"], "ssh-ed25519 AAAA bootstrap");
         assert_eq!(value["start"], true);
         assert!(value.get("hostname").is_none());
 

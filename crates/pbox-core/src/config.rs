@@ -54,8 +54,25 @@ pub struct PveConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct AgentConfig {
+    pub binary: Option<PathBuf>,
+    pub port: u16,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            binary: None,
+            port: 7443,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Config {
     pub pve: PveConfig,
+    pub agent: AgentConfig,
     pub vmid_pattern: VmidPattern,
 }
 
@@ -63,6 +80,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             pve: PveConfig::default(),
+            agent: AgentConfig::default(),
             vmid_pattern: VmidPattern::parse("9xxx").expect("default VMID pattern is valid"),
         }
     }
@@ -77,8 +95,15 @@ pub struct RedactedPveConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RedactedAgentConfig {
+    pub binary: Option<PathBuf>,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RedactedConfig {
     pub pve: RedactedPveConfig,
+    pub agent: RedactedAgentConfig,
     pub vmid_pattern: VmidPattern,
 }
 
@@ -94,6 +119,10 @@ impl Config {
                     .as_ref()
                     .map(|_| "<redacted>".to_owned()),
                 tls_insecure: self.pve.tls_insecure,
+            },
+            agent: RedactedAgentConfig {
+                binary: self.agent.binary.clone(),
+                port: self.agent.port,
             },
             vmid_pattern: self.vmid_pattern.clone(),
         }
@@ -118,6 +147,15 @@ impl Config {
             "pve.tls_insecure".to_owned(),
             self.pve.tls_insecure.to_string(),
         );
+        values.insert(
+            "agent.binary".to_owned(),
+            self.agent
+                .binary
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unset>".to_owned()),
+        );
+        values.insert("agent.port".to_owned(), self.agent.port.to_string());
         values.insert("vmid_pattern".to_owned(), self.vmid_pattern.to_string());
         values
     }
@@ -158,6 +196,18 @@ impl Config {
             "pve.tls_insecure" => {
                 self.pve.tls_insecure = parse_bool(key, value)?;
             }
+            "agent.binary" => {
+                if value.trim().is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        key: key.to_owned(),
+                        reason: "agent binary path cannot be empty".to_owned(),
+                    });
+                }
+                self.agent.binary = Some(PathBuf::from(value));
+            }
+            "agent.port" => {
+                self.agent.port = parse_port(key, value)?;
+            }
             "vmid_pattern" => {
                 self.vmid_pattern =
                     value
@@ -171,13 +221,14 @@ impl Config {
         }
         Ok(())
     }
-
     pub fn unset_value(&mut self, key: &str) -> Result<(), ConfigError> {
         match key {
             "pve.url" => self.pve.url = None,
             "pve.token_id" => self.pve.token_id = None,
             "pve.token_secret" => self.pve.token_secret = None,
             "pve.tls_insecure" => self.pve.tls_insecure = false,
+            "agent.binary" => self.agent.binary = None,
+            "agent.port" => self.agent.port = AgentConfig::default().port,
             "vmid_pattern" => self.vmid_pattern = Config::default().vmid_pattern,
             _ => return Err(ConfigError::UnknownKey(key.to_owned())),
         }
@@ -196,6 +247,12 @@ impl Config {
         }
         if let Some(value) = &overrides.pve_tls_insecure {
             self.pve.tls_insecure = *value;
+        }
+        if let Some(value) = &overrides.agent_binary {
+            self.set_value("agent.binary", value)?;
+        }
+        if let Some(value) = &overrides.agent_port {
+            self.set_value("agent.port", value)?;
         }
         if let Some(value) = &overrides.vmid_pattern {
             self.set_value("vmid_pattern", value)?;
@@ -217,12 +274,30 @@ fn parse_bool(key: &str, value: &str) -> Result<bool, ConfigError> {
         })
 }
 
+fn parse_port(key: &str, value: &str) -> Result<u16, ConfigError> {
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| ConfigError::InvalidValue {
+            key: key.to_owned(),
+            reason: "expected a TCP port from 1 to 65535".to_owned(),
+        })?;
+    if port == 0 {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_owned(),
+            reason: "expected a TCP port from 1 to 65535".to_owned(),
+        });
+    }
+    Ok(port)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConfigOverrides {
     pub pve_url: Option<String>,
     pub pve_token_id: Option<String>,
     pub pve_token_secret: Option<String>,
     pub pve_tls_insecure: Option<bool>,
+    pub agent_binary: Option<String>,
+    pub agent_port: Option<String>,
     pub vmid_pattern: Option<String>,
 }
 
@@ -336,6 +411,8 @@ fn apply_environment(config: &mut Config) -> Result<(), ConfigError> {
             "PBOX_PVE_TLS_INSECURE" => {
                 overrides.pve_tls_insecure = Some(parse_bool("PBOX_PVE_TLS_INSECURE", &value)?)
             }
+            "PBOX_AGENT_BINARY" => overrides.agent_binary = Some(value),
+            "PBOX_AGENT_PORT" => overrides.agent_port = Some(value),
             "PBOX_VMID_PATTERN" => overrides.vmid_pattern = Some(value),
             _ => {}
         }
