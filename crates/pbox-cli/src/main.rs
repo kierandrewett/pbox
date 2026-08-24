@@ -1,5 +1,5 @@
 mod bootstrap;
-
+mod recipes;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use bootstrap::{BootstrapKey, BootstrapRequest, bootstrap_box};
@@ -13,6 +13,7 @@ use pbox_crypto::{
     CertificateMaterial, CertificatePurpose, client_subject, derive_context_seed,
     generate_context_ca, issue_certificate, server_subject,
 };
+use recipes::{RecipeCatalog, RecipeRepository};
 use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
 use std::net::Ipv4Addr;
@@ -60,6 +61,8 @@ enum Command {
     New(NewCommand),
     /// Execute a non-interactive command through pbox-agent.
     Exec(ExecCommand),
+    /// Discover and apply Ansible recipes.
+    Recipe(RecipeCommand),
     /// List pbox-managed containers discovered from PVE metadata.
     List,
     /// Show one pbox discovered from PVE metadata.
@@ -132,6 +135,23 @@ struct ExecCommand {
     /// Command and arguments. Use -- before arguments that start with a hyphen.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     argv: Vec<String>,
+}
+#[derive(Debug, Args)]
+struct RecipeCommand {
+    #[command(subcommand)]
+    command: RecipeSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum RecipeSubcommand {
+    /// Synchronise the configured recipe repository.
+    Sync,
+    /// List recipes discovered in the configured repository.
+    List,
+    /// Search recipe identifiers and descriptions.
+    Search { text: String },
+    /// Show one recipe and its metadata.
+    Info { recipe: String },
 }
 
 #[derive(Debug, Args)]
@@ -234,6 +254,9 @@ fn run() -> Result<RunOutcome> {
             run_new(&store, command, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
         Command::Exec(command) => run_exec(&store, command, cli.json),
+        Command::Recipe(command) => {
+            run_recipe(command.command, &store, cli.json, cli.color).map(|_| RunOutcome::Success)
+        }
         Command::List => run_list(&store, cli.json, cli.color).map(|_| RunOutcome::Success),
         Command::Info { id } => {
             run_info(&store, &id, cli.json, cli.color).map(|_| RunOutcome::Success)
@@ -323,6 +346,144 @@ fn run_config(command: ConfigSubcommand, store: &ConfigStore, json: bool) -> Res
         }
     }
     Ok(())
+}
+
+fn run_recipe(
+    command: RecipeSubcommand,
+    store: &ConfigStore,
+    json: bool,
+    color: ColorChoice,
+) -> Result<()> {
+    match command {
+        RecipeSubcommand::Sync => {
+            let config = load_config(store)?;
+            let catalog = recipe_repository(&config)?.sync()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&catalog)?);
+            } else {
+                println!(
+                    "synced {} recipes from {} @ {}",
+                    catalog.recipes.len(),
+                    catalog.repository,
+                    catalog.revision
+                );
+            }
+        }
+        RecipeSubcommand::List => {
+            let catalog = load_recipe_catalog(store)?;
+            print_recipe_catalog(&catalog, json, color)?;
+        }
+        RecipeSubcommand::Search { text } => {
+            let catalog = load_recipe_catalog(store)?;
+            let query = text.to_lowercase();
+            let filtered =
+                RecipeCatalog {
+                    recipes: catalog
+                        .recipes
+                        .iter()
+                        .filter(|recipe| {
+                            recipe.id.to_lowercase().contains(&query)
+                                || recipe.metadata.description.as_deref().is_some_and(
+                                    |description| description.to_lowercase().contains(&query),
+                                )
+                        })
+                        .cloned()
+                        .collect(),
+                    ..catalog
+                };
+            print_recipe_catalog(&filtered, json, color)?;
+        }
+        RecipeSubcommand::Info { recipe } => {
+            let catalog = load_recipe_catalog(store)?;
+            let result = catalog
+                .recipes
+                .iter()
+                .find(|candidate| candidate.id == recipe)
+                .ok_or_else(|| anyhow!("recipe not found: {recipe}"))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(result)?);
+            } else {
+                print_recipe_info(result, color_enabled(color, json));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn recipe_repository(config: &Config) -> Result<RecipeRepository> {
+    RecipeRepository::new(
+        Some(config.recipes.repository.as_str()),
+        &config.recipes.reference,
+    )
+}
+
+fn load_recipe_catalog(store: &ConfigStore) -> Result<RecipeCatalog> {
+    let config = load_config(store)?;
+    let repository = recipe_repository(&config)?;
+    if config.recipes.auto_sync {
+        repository.sync()
+    } else {
+        repository.discover()
+    }
+}
+
+fn print_recipe_catalog(catalog: &RecipeCatalog, json: bool, color: ColorChoice) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(catalog)?);
+        return Ok(());
+    }
+    let colour = color_enabled(color, json);
+    let accent = if colour { "\x1b[36m" } else { "" };
+    let reset = if colour { "\x1b[0m" } else { "" };
+    println!(
+        "{accent}recipes{reset} {} @ {}",
+        catalog.repository, catalog.revision
+    );
+    println!("{:<28} {:<10} DESCRIPTION", "ID", "KIND");
+    for recipe in &catalog.recipes {
+        println!(
+            "{:<28} {:<10} {}",
+            recipe.id,
+            recipe.kind.as_str(),
+            recipe.metadata.description.as_deref().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+fn print_recipe_info(recipe: &recipes::Recipe, colour: bool) {
+    let accent = if colour { "\x1b[36m" } else { "" };
+    let reset = if colour { "\x1b[0m" } else { "" };
+    println!("{accent}{}{reset}", recipe.id);
+    println!("kind: {}", recipe.kind.as_str());
+    println!("path: {}", recipe.path);
+    if let Some(description) = recipe.metadata.description.as_deref() {
+        println!("description: {description}");
+    }
+    if !recipe.metadata.requires.is_empty() {
+        println!("requires: {}", recipe.metadata.requires.join(", "));
+    }
+    if !recipe.metadata.supports.is_empty() {
+        println!("supports: {}", recipe.metadata.supports.join(", "));
+    }
+    if !recipe.metadata.capabilities.is_empty() {
+        println!("capabilities: {}", recipe.metadata.capabilities.join(", "));
+    }
+    let resources = &recipe.metadata.resources;
+    if resources.cores.is_some() || resources.memory.is_some() || resources.disk.is_some() {
+        println!(
+            "resources: cores={} memory={} disk={}",
+            resources
+                .cores
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            resources
+                .memory
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            resources.disk.as_deref().unwrap_or("-")
+        );
+    }
 }
 
 fn run_exec(store: &ConfigStore, command: ExecCommand, json: bool) -> Result<RunOutcome> {
