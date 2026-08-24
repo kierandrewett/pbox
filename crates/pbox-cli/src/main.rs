@@ -1,5 +1,8 @@
+mod bootstrap;
+
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
+use bootstrap::{BootstrapKey, BootstrapRequest, bootstrap_box};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pbox_agent_client::{AgentClient, ExecResult};
 use pbox_core::{
@@ -7,10 +10,12 @@ use pbox_core::{
     PveClientConfig, PveError, PveTaskResponse, encode_metadata, parse_metadata, select_lxc_ipv4,
 };
 use pbox_crypto::{
-    CertificatePurpose, client_subject, derive_context_seed, generate_context_ca, issue_certificate,
+    CertificateMaterial, CertificatePurpose, client_subject, derive_context_seed,
+    generate_context_ca, issue_certificate, server_subject,
 };
 use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -103,7 +108,7 @@ struct NewCommand {
     /// CPU core count.
     #[arg(long)]
     cores: Option<u64>,
-    /// Leave the new container stopped.
+    /// Leave the new container stopped after bootstrap.
     #[arg(long)]
     stopped: bool,
 }
@@ -112,9 +117,9 @@ struct NewCommand {
 struct ExecCommand {
     /// Public pbox identifier.
     id: String,
-    /// Agent endpoint, for example https://10.0.20.43:7443.
+    /// Agent endpoint override. By default pbox resolves the guest address from PVE.
     #[arg(long)]
-    endpoint: String,
+    endpoint: Option<String>,
     /// Working directory for the command.
     #[arg(long, default_value = "/home/pbox")]
     cwd: String,
@@ -321,36 +326,21 @@ fn run_config(command: ConfigSubcommand, store: &ConfigStore, json: bool) -> Res
 }
 
 fn run_exec(store: &ConfigStore, command: ExecCommand, json: bool) -> Result<RunOutcome> {
+    validate_exec_arguments(&command)?;
     let config = load_config(store)?;
-    let token_id = config
-        .pve
-        .token_id
-        .as_deref()
-        .ok_or_else(|| anyhow!("pve.token_id is not configured"))?;
-    let token_secret = config
-        .pve
-        .token_secret
-        .as_ref()
-        .map(|secret| secret.expose())
-        .ok_or_else(|| anyhow!("pve.token_secret is not configured"))?;
-    let seed = derive_context_seed(token_id, token_secret);
-    let ca = generate_context_ca(&seed).context("derive pbox agent trust root")?;
-    let client_identity =
-        issue_certificate(&ca, &client_subject(&seed), CertificatePurpose::Client)
-            .context("create short-lived pbox agent client certificate")?;
+    let (box_id, endpoint) = resolve_agent_target(&config, &command)?;
+    let materials = agent_materials(&config, &box_id)?;
     let env = command
         .env
         .iter()
         .map(|entry| parse_env_entry(entry))
         .collect::<Result<Vec<_>>>()?;
-    validate_exec_arguments(&command)?;
 
-    let endpoint = command.endpoint;
-    let box_id = command.id;
     let cwd = command.cwd;
     let user = command.user;
     let argv = command.argv;
-    let ca_pem = ca.certificate_pem.clone();
+    let ca_pem = materials.ca.certificate_pem.clone();
+    let client_identity = materials.client;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -406,13 +396,20 @@ fn parse_env_entry(entry: &str) -> Result<(String, String)> {
 
 fn validate_exec_arguments(command: &ExecCommand) -> Result<()> {
     for (label, value) in [
-        ("agent endpoint", command.endpoint.as_str()),
         ("box id", command.id.as_str()),
         ("working directory", command.cwd.as_str()),
         ("guest user", command.user.as_str()),
     ] {
         if value.contains('\0') {
             return Err(anyhow!("{label} cannot contain NUL bytes"));
+        }
+    }
+    if let Some(endpoint) = command.endpoint.as_deref() {
+        if endpoint.is_empty() {
+            return Err(anyhow!("agent endpoint cannot be empty"));
+        }
+        if endpoint.contains('\0') {
+            return Err(anyhow!("agent endpoint cannot contain NUL bytes"));
         }
     }
     if command.argv.is_empty() {
@@ -458,6 +455,13 @@ fn read_value_from_stdin() -> String {
 }
 fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorChoice) -> Result<()> {
     let config = load_config(store)?;
+    let agent_binary = resolve_agent_binary(&config)?;
+    if !agent_binary.is_file() {
+        return Err(anyhow!(
+            "pbox-agent binary does not exist: {}",
+            agent_binary.display()
+        ));
+    }
     let client = client_from_config(&config)?;
     let resources = client
         .list_cluster_resources()
@@ -469,6 +473,9 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         .context("allocate a free PVE VMID")?;
     let existing = discover_boxes(&client)?;
     let id = generate_unique_id(&existing)?;
+    let id_text = id.to_string();
+    let materials = agent_materials(&config, &id_text)?;
+    let key = BootstrapKey::generate(&id_text).context("create temporary bootstrap SSH key")?;
     let metadata = PboxMetadata::new(id.clone(), vmid).with_node(&command.node);
     let description = format!(
         "Managed by `pbox`.\n{}",
@@ -476,7 +483,7 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
     );
     let hostname = command
         .name
-        .unwrap_or_else(|| format!("pbox-{}", id.to_string().trim_start_matches("pbx_")));
+        .unwrap_or_else(|| format!("pbox-{}", id_text.trim_start_matches("pbx_")));
     let request = LxcCreateRequest {
         ostemplate: Some(command.ostemplate),
         hostname: Some(hostname.clone()),
@@ -487,33 +494,71 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         net0: Some(command.net0),
         unprivileged: Some(true),
         description: Some(description),
-        start: Some(!command.stopped),
+        ssh_public_keys: Some(key.public_key().to_owned()),
+        start: Some(true),
     };
-    let task = client
-        .create_lxc(&command.node, vmid, &request)
-        .with_context(|| format!("create box {id} with VMID {vmid} on {}", command.node))?;
-    wait_for_task(&client, &command.node, task).with_context(|| {
+    let task = match client.create_lxc(&command.node, vmid, &request) {
+        Ok(task) => task,
+        Err(error) => {
+            let _ = key.cleanup();
+            return Err(error)
+                .with_context(|| format!("create box {id} with VMID {vmid} on {}", command.node));
+        }
+    };
+    if let Err(error) = wait_for_task(&client, &command.node, task) {
+        let cleanup = key.cleanup().err();
+        return Err(error)
+            .context(format!(
+                "PVE did not finish creating box {id} with VMID {vmid} on {}",
+                command.node
+            ))
+            .context(format_bootstrap_cleanup_failure(&key, cleanup.as_ref()));
+    }
+
+    let ip = match wait_for_lxc_ip(&client, &command.node, vmid) {
+        Ok(ip) => ip,
+        Err(error) => {
+            let cleanup = key.cleanup().err();
+            return Err(error)
+                .context("wait for the new container IPv4 address")
+                .context(format_bootstrap_cleanup_failure(&key, cleanup.as_ref()));
+        }
+    };
+    let bootstrap_request = BootstrapRequest {
+        box_id: &id_text,
+        ip,
+        port: config.agent.port,
+        key: &key,
+        agent_binary: &agent_binary,
+        server_identity: &materials.server,
+        client_ca: &materials.ca,
+        client_subject: &materials.client_subject,
+    };
+    bootstrap_box(&bootstrap_request).with_context(|| {
         format!(
-            "PVE did not finish creating box {id} with VMID {vmid} on {}",
-            command.node
+            "bootstrap box {id}; temporary SSH credentials remain in {} for repair",
+            key.operation_directory().display()
         )
     })?;
-    let ip = if command.stopped {
-        None
+    key.cleanup()
+        .context("remove completed bootstrap credentials")?;
+
+    let (state, output_ip) = if command.stopped {
+        let task = client
+            .shutdown_lxc(&command.node, vmid)
+            .with_context(|| format!("stop bootstrapped box {id}"))?;
+        wait_for_task(&client, &command.node, task)
+            .with_context(|| format!("PVE did not finish stopping box {id}"))?;
+        ("stopped".to_owned(), None)
     } else {
-        discover_lxc_ip(&client, &command.node, vmid)
-            .context("discover the new container IPv4 address")?
+        ("running".to_owned(), Some(ip.to_string()))
     };
     let info = BoxInfo {
         id,
         vmid,
-        state: if command.stopped {
-            "stopped".to_owned()
-        } else {
-            "running".to_owned()
-        },
+        state,
         node: command.node,
-        ip,
+        ip: output_ip,
         name: Some(hostname),
     };
     print_box_info(&info, json, color)
@@ -569,6 +614,7 @@ fn run_box_task<F>(
     store: &ConfigStore,
     requested_id: &str,
     action: &str,
+
     state: &str,
     json: bool,
     color: ColorChoice,
@@ -584,8 +630,11 @@ where
     wait_for_task(&client, &record.node, task)
         .with_context(|| format!("PVE did not finish {action} for box {}", record.id))?;
     let ip = if state == "running" {
-        discover_lxc_ip(&client, &record.node, record.vmid)
-            .with_context(|| format!("discover IPv4 address for box {}", record.id))?
+        Some(
+            wait_for_lxc_ip(&client, &record.node, record.vmid)
+                .with_context(|| format!("discover IPv4 address for box {}", record.id))?
+                .to_string(),
+        )
     } else {
         None
     };
@@ -598,6 +647,21 @@ where
         name: record.name,
     };
     print_box_info(&info, json, color)
+}
+fn format_bootstrap_cleanup_failure(
+    key: &BootstrapKey,
+    cleanup_error: Option<&anyhow::Error>,
+) -> String {
+    match cleanup_error {
+        Some(error) => format!(
+            "could not remove temporary bootstrap credentials in {}: {error}",
+            key.operation_directory().display()
+        ),
+        None => format!(
+            "temporary bootstrap credentials were removed from {}",
+            key.operation_directory().display()
+        ),
+    }
 }
 
 fn run_delete(
@@ -725,6 +789,110 @@ fn client_from_config(config: &Config) -> Result<PveClient> {
     let mut client_config = PveClientConfig::new(url, token_id, token_secret);
     client_config.tls_insecure = config.pve.tls_insecure;
     PveClient::new(client_config).context("create PVE client")
+}
+
+struct AgentMaterials {
+    ca: CertificateMaterial,
+    client: CertificateMaterial,
+    client_subject: String,
+    server: CertificateMaterial,
+}
+
+fn agent_materials(config: &Config, box_id: &str) -> Result<AgentMaterials> {
+    let token_id = config
+        .pve
+        .token_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("pve.token_id is not configured"))?;
+    let token_secret = config
+        .pve
+        .token_secret
+        .as_ref()
+        .map(|secret| secret.expose())
+        .ok_or_else(|| anyhow!("pve.token_secret is not configured"))?;
+    let seed = derive_context_seed(token_id, token_secret);
+    let ca = generate_context_ca(&seed).context("derive pbox agent trust root")?;
+    let client_subject_text = client_subject(&seed);
+    let client = issue_certificate(&ca, &client_subject_text, CertificatePurpose::Client)
+        .context("create short-lived pbox agent client certificate")?;
+    let server_name = server_subject(box_id).context("create pbox agent server identity")?;
+    let server = issue_certificate(&ca, &server_name, CertificatePurpose::Server)
+        .context("create pbox agent server certificate")?;
+    Ok(AgentMaterials {
+        ca,
+        client,
+        client_subject: client_subject_text,
+        server,
+    })
+}
+
+fn resolve_agent_target(config: &Config, command: &ExecCommand) -> Result<(String, String)> {
+    let id: PboxId = command.id.parse().context("parse pbox id")?;
+    if let Some(endpoint) = command.endpoint.as_ref() {
+        return Ok((id.to_string(), endpoint.clone()));
+    }
+    let client = client_from_config(config)?;
+    let record = find_box(&client, &id.to_string())?;
+    if record.state != "running" {
+        return Err(anyhow!("box {} is not running", record.id));
+    }
+    let ip = record
+        .ip
+        .ok_or_else(|| anyhow!("box {} has no discovered IPv4 address", record.id))?;
+    Ok((
+        record.id.to_string(),
+        format!("https://{ip}:{}", config.agent.port),
+    ))
+}
+
+fn resolve_agent_binary(config: &Config) -> Result<PathBuf> {
+    if let Some(path) = config.agent.binary.as_ref() {
+        return Ok(path.clone());
+    }
+    let mut candidates = Vec::new();
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(parent) = executable.parent()
+    {
+        candidates.push(parent.join("pbox-agent"));
+    }
+    if let Ok(current_dir) = std::env::current_dir() {
+        candidates.push(current_dir.join("target/debug/pbox-agent"));
+        candidates.push(current_dir.join("target/release/pbox-agent"));
+    }
+    if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
+        return Ok(path);
+    }
+    Err(anyhow!(
+        "pbox-agent binary was not found; set agent.binary with `pbox config set agent.binary /path/to/pbox-agent`"
+    ))
+}
+
+const LXC_IP_TIMEOUT: Duration = Duration::from_secs(60);
+const LXC_IP_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+fn wait_for_lxc_ip(client: &impl PveApi, node: &str, vmid: u64) -> Result<Ipv4Addr> {
+    let started = Instant::now();
+    let mut last_error = None;
+    while started.elapsed() < LXC_IP_TIMEOUT {
+        match discover_lxc_ip(client, node, vmid) {
+            Ok(Some(address)) => {
+                return address
+                    .parse()
+                    .with_context(|| format!("parse discovered IPv4 address {address}"));
+            }
+            Ok(None) => {}
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        thread::sleep(LXC_IP_POLL_INTERVAL);
+    }
+    Err(anyhow!(
+        "could not discover an IPv4 address within {} seconds{}",
+        LXC_IP_TIMEOUT.as_secs(),
+        last_error
+            .as_deref()
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default()
+    ))
 }
 
 fn discover_lxc_ip(client: &impl PveApi, node: &str, vmid: u64) -> Result<Option<String>> {
