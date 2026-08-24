@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use pbox_agent_client::{AgentClient, ExecResult};
 use pbox_core::{
     Config, ConfigStore, LxcCreateRequest, PboxId, PboxMetadata, PveApi, PveClient,
-    PveClientConfig, PveError, PveTaskResponse, encode_metadata, parse_metadata,
+    PveClientConfig, PveError, PveTaskResponse, encode_metadata, parse_metadata, select_lxc_ipv4,
 };
 use pbox_crypto::{
     CertificatePurpose, client_subject, derive_context_seed, generate_context_ca, issue_certificate,
@@ -158,6 +158,7 @@ struct BoxRecord {
     vmid: u64,
     state: String,
     node: String,
+    ip: Option<String>,
     name: Option<String>,
 }
 
@@ -167,6 +168,7 @@ struct BoxInfo {
     vmid: u64,
     state: String,
     node: String,
+    ip: Option<String>,
     name: Option<String>,
 }
 
@@ -496,6 +498,12 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
             command.node
         )
     })?;
+    let ip = if command.stopped {
+        None
+    } else {
+        discover_lxc_ip(&client, &command.node, vmid)
+            .context("discover the new container IPv4 address")?
+    };
     let info = BoxInfo {
         id,
         vmid,
@@ -505,6 +513,7 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
             "running".to_owned()
         },
         node: command.node,
+        ip,
         name: Some(hostname),
     };
     print_box_info(&info, json, color)
@@ -574,11 +583,18 @@ where
         operation(&client, &record).with_context(|| format!("{action} box {}", record.id))?;
     wait_for_task(&client, &record.node, task)
         .with_context(|| format!("PVE did not finish {action} for box {}", record.id))?;
+    let ip = if state == "running" {
+        discover_lxc_ip(&client, &record.node, record.vmid)
+            .with_context(|| format!("discover IPv4 address for box {}", record.id))?
+    } else {
+        None
+    };
     let info = BoxInfo {
         id: record.id,
         vmid: record.vmid,
         state: state.to_owned(),
         node: record.node,
+        ip,
         name: record.name,
     };
     print_box_info(&info, json, color)
@@ -673,6 +689,7 @@ fn run_info(store: &ConfigStore, requested_id: &str, json: bool, color: ColorCho
         vmid: record.vmid,
         state: record.state,
         node: record.node,
+        ip: record.ip,
         name: record.name,
     };
     print_box_info(&info, json, color)
@@ -710,6 +727,13 @@ fn client_from_config(config: &Config) -> Result<PveClient> {
     PveClient::new(client_config).context("create PVE client")
 }
 
+fn discover_lxc_ip(client: &impl PveApi, node: &str, vmid: u64) -> Result<Option<String>> {
+    let interfaces = client
+        .list_lxc_interfaces(node, vmid)
+        .context("read runtime LXC interfaces")?;
+    Ok(select_lxc_ipv4(&interfaces).map(|address| address.to_string()))
+}
+
 fn discover_boxes(client: &impl PveApi) -> Result<Vec<BoxRecord>> {
     let resources = client
         .list_cluster_resources()
@@ -740,12 +764,24 @@ fn discover_boxes(client: &impl PveApi) -> Result<Vec<BoxRecord>> {
         {
             continue;
         }
+        let state = resource.status.unwrap_or_else(|| "unknown".to_owned());
+        let ip = if state == "running" {
+            discover_lxc_ip(client, node, vmid).with_context(|| {
+                format!(
+                    "discover IPv4 address for box {metadata_id}",
+                    metadata_id = metadata.id
+                )
+            })?
+        } else {
+            None
+        };
         let name = config.hostname.or(resource.name);
         records.push(BoxRecord {
             id: metadata.id,
             vmid,
-            state: resource.status.unwrap_or_else(|| "unknown".to_owned()),
+            state,
             node: node.to_owned(),
+            ip,
             name,
         });
     }
@@ -771,13 +807,17 @@ fn print_box_info(info: &BoxInfo, json: bool, color: ColorChoice) -> Result<()> 
         println!("  vmid:   {}", info.vmid);
         println!("  state:  {}", info.state);
         println!("  node:   {}", info.node);
+        println!("  ip:     {}", info.ip.as_deref().unwrap_or("-"));
         println!("  name:   {}", info.name.as_deref().unwrap_or("-"));
     }
     Ok(())
 }
 
 fn print_box_records(records: &[BoxRecord], colour: bool) {
-    println!("{:<16} {:<10} {:<16} NAME", "ID", "STATE", "NODE");
+    println!(
+        "{:<16} {:<10} {:<16} {:<16} NAME",
+        "ID", "STATE", "NODE", "IP"
+    );
     for record in records {
         let id = if colour {
             format!("\x1b[1;36m{}\x1b[0m", record.id)
@@ -785,9 +825,10 @@ fn print_box_records(records: &[BoxRecord], colour: bool) {
             record.id.to_string()
         };
         println!(
-            "{id:<16} {:<10} {:<16} {}",
+            "{id:<16} {:<10} {:<16} {:<16} {}",
             record.state,
             record.node,
+            record.ip.as_deref().unwrap_or("-"),
             record.name.as_deref().unwrap_or("-")
         );
     }

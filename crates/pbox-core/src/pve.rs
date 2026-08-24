@@ -4,13 +4,14 @@ use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::net::Ipv4Addr;
 use thiserror::Error;
-
 const API_PREFIX: &str = "/api2/json";
 
 pub trait PveApi {
     fn list_cluster_resources(&self) -> Result<Vec<ClusterResource>, PveError>;
     fn get_lxc_config(&self, node: &str, vmid: u64) -> Result<LxcConfig, PveError>;
+    fn list_lxc_interfaces(&self, node: &str, vmid: u64) -> Result<Vec<LxcInterface>, PveError>;
     fn get_task_status(&self, node: &str, upid: &str) -> Result<PveTaskStatus, PveError>;
     fn create_lxc(
         &self,
@@ -155,6 +156,11 @@ impl PveApi for PveClient {
     fn get_lxc_config(&self, node: &str, vmid: u64) -> Result<LxcConfig, PveError> {
         validate_path_segment(node, "node")?;
         self.get(&format!("/nodes/{node}/lxc/{vmid}/config?current=1"))
+    }
+
+    fn list_lxc_interfaces(&self, node: &str, vmid: u64) -> Result<Vec<LxcInterface>, PveError> {
+        validate_path_segment(node, "node")?;
+        self.get(&format!("/nodes/{node}/lxc/{vmid}/interfaces"))
     }
 
     fn get_task_status(&self, node: &str, upid: &str) -> Result<PveTaskStatus, PveError> {
@@ -356,6 +362,49 @@ pub struct LxcConfig {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Runtime interface data returned by the PVE LXC interfaces endpoint.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct LxcInterface {
+    pub name: Option<String>,
+    pub hwaddr: Option<String>,
+    pub inet: Option<String>,
+    pub inet6: Option<String>,
+    pub address: Option<String>,
+    pub netmask: Option<String>,
+    pub gateway: Option<String>,
+    pub gateway6: Option<String>,
+    pub method: Option<String>,
+    #[serde(rename = "type")]
+    pub type_: Option<String>,
+    pub exists: Option<u64>,
+    pub active: Option<u64>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Select a reachable-looking IPv4 address from runtime LXC interfaces.
+pub fn select_lxc_ipv4(interfaces: &[LxcInterface]) -> Option<Ipv4Addr> {
+    interfaces
+        .iter()
+        .filter_map(|interface| {
+            if interface.active == Some(0) || interface.exists == Some(0) {
+                return None;
+            }
+            let address = interface.inet.as_deref()?.split('/').next()?;
+            let address = address.parse::<Ipv4Addr>().ok()?;
+            if address.is_unspecified() || address.is_loopback() || address.is_link_local() {
+                return None;
+            }
+            Some((
+                interface.name.as_deref() != Some("eth0"),
+                address.octets(),
+                address,
+            ))
+        })
+        .min_by_key(|(not_eth0, octets, _)| (*not_eth0, *octets))
+        .map(|(_, _, address)| address)
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PveTaskResponse {
     pub upid: String,
@@ -476,6 +525,20 @@ mod tests {
     }
 
     #[test]
+    fn lxc_interfaces_decode_runtime_addresses_and_extra_fields() {
+        let interfaces: Vec<LxcInterface> = serde_json::from_str(
+            r#"[{"name":"eth0","hwaddr":"02:00:00:00:00:01","inet":"10.0.20.43/24","inet6":"fe80::1/64","type":"eth","active":1,"unexpected":"kept"}]"#,
+        )
+        .unwrap();
+        assert_eq!(interfaces.len(), 1);
+        assert_eq!(interfaces[0].name.as_deref(), Some("eth0"));
+        assert_eq!(interfaces[0].inet.as_deref(), Some("10.0.20.43/24"));
+        assert_eq!(interfaces[0].type_.as_deref(), Some("eth"));
+        assert_eq!(interfaces[0].active, Some(1));
+        assert_eq!(interfaces[0].extra["unexpected"], "kept");
+    }
+
+    #[test]
     fn task_status_maps_type_and_success() {
         let status: PveTaskStatus =
             serde_json::from_str(r#"{"status":"stopped","exitstatus":"OK","type":"vzcreate"}"#)
@@ -528,5 +591,23 @@ mod tests {
         assert_eq!(update_value["digest"], "deadbeef");
         assert_eq!(update_value["description"], "managed by pbox");
         assert!(update_value.get("memory").is_none());
+    }
+    #[test]
+    fn lxc_ipv4_selection_prefers_eth0_and_skips_unusable_addresses() {
+        let interfaces: Vec<LxcInterface> = serde_json::from_str(
+            r#"[{"name":"lo","inet":"127.0.0.1/8"},{"name":"eth1","inet":"192.168.1.20/24"},{"name":"eth0","inet":"10.0.20.43/24"},{"name":"eth2","inet":"10.0.20.2/24","active":0}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            select_lxc_ipv4(&interfaces),
+            Some("10.0.20.43".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn lxc_ipv4_selection_returns_none_without_active_addresses() {
+        let interfaces: Vec<LxcInterface> =
+            serde_json::from_str(r#"[{"name":"eth0","inet":"10.0.20.43/24","active":0}]"#).unwrap();
+        assert_eq!(select_lxc_ipv4(&interfaces), None);
     }
 }
