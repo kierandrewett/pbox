@@ -660,7 +660,13 @@ fn run_recipe(
                 bail!("box {} is not running", record.id);
             }
             let binary = std::env::current_exe().context("locate pbox executable")?;
-            let run = apply_recipe(
+            let planned_run = AnsibleRun {
+                recipe: selected.id.clone(),
+                box_id: box_id.clone(),
+                repository: catalog.repository.clone(),
+                revision: catalog.revision.clone(),
+            };
+            let run = match apply_recipe(
                 store.path(),
                 &binary,
                 repository.cache_dir(),
@@ -668,8 +674,30 @@ fn run_recipe(
                 selected,
                 &box_id,
                 json,
+            ) {
+                Ok(run) => run,
+                Err(error) => {
+                    if let Err(provenance_error) = record_recipe_provenance(
+                        &client,
+                        &record,
+                        &planned_run,
+                        &selected.metadata.capabilities,
+                        "failed",
+                    ) {
+                        return Err(error).context(format!(
+                            "record failed recipe provenance: {provenance_error}"
+                        ));
+                    }
+                    return Err(error);
+                }
+            };
+            record_recipe_provenance(
+                &client,
+                &record,
+                &run,
+                &selected.metadata.capabilities,
+                "success",
             )?;
-            record_recipe_provenance(&client, &record, &run, &selected.metadata.capabilities)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&run)?);
             } else {
@@ -690,13 +718,14 @@ fn record_recipe_provenance(
     record: &BoxRecord,
     run: &AnsibleRun,
     capabilities: &[String],
+    result: &str,
 ) -> Result<()> {
     let provenance = PboxRecipeProvenance {
         id: run.recipe.clone(),
         repository: run.repository.clone(),
         revision: run.revision.clone(),
         applied_at: Some(current_timestamp()?),
-        result: Some("success".to_owned()),
+        result: Some(result.to_owned()),
     };
     let mut last_error = None;
     for _attempt in 0..3 {

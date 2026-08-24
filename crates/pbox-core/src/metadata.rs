@@ -143,7 +143,7 @@ mod tests {
             repository: "https://github.com/kierandrewett/pbox-recipes.git".to_owned(),
             revision: "abc123".to_owned(),
             applied_at: None,
-            result: None,
+            result: Some("failed".to_owned()),
         });
         metadata.capabilities.push("desktop".to_owned());
         metadata.capabilities.push("contains --> safely".to_owned());
