@@ -1,11 +1,16 @@
 use anyhow::{Context, Result, anyhow};
+use base64::Engine;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use pbox_agent_client::{AgentClient, ExecResult};
 use pbox_core::{
     Config, ConfigStore, LxcCreateRequest, PboxId, PboxMetadata, PveApi, PveClient,
     PveClientConfig, PveError, PveTaskResponse, encode_metadata, parse_metadata,
 };
+use pbox_crypto::{
+    CertificatePurpose, client_subject, derive_context_seed, generate_context_ca, issue_certificate,
+};
 use serde::Serialize;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -48,6 +53,8 @@ enum Command {
     Config(ConfigCommand),
     /// Create a pbox-managed LXC container.
     New(NewCommand),
+    /// Execute a non-interactive command through pbox-agent.
+    Exec(ExecCommand),
     /// List pbox-managed containers discovered from PVE metadata.
     List,
     /// Show one pbox discovered from PVE metadata.
@@ -102,6 +109,27 @@ struct NewCommand {
 }
 
 #[derive(Debug, Args)]
+struct ExecCommand {
+    /// Public pbox identifier.
+    id: String,
+    /// Agent endpoint, for example https://10.0.20.43:7443.
+    #[arg(long)]
+    endpoint: String,
+    /// Working directory for the command.
+    #[arg(long, default_value = "/home/pbox")]
+    cwd: String,
+    /// Guest user for the command.
+    #[arg(long, default_value = "pbox")]
+    user: String,
+    /// Environment entry in KEY=VALUE form. May be repeated.
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    env: Vec<String>,
+    /// Command and arguments. Use -- before arguments that start with a hyphen.
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    argv: Vec<String>,
+}
+
+#[derive(Debug, Args)]
 struct ConfigCommand {
     #[command(subcommand)]
     command: ConfigSubcommand,
@@ -150,14 +178,34 @@ struct DeleteOutput {
     deleted: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct ExecOutput {
+    stdout_base64: String,
+    stderr_base64: String,
+    code: i32,
+    signal: i32,
+    exited: bool,
+    exit_code: i32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RunOutcome {
+    Success,
+    Exit(i32),
+}
+
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("error: {error:#}");
-        std::process::exit(1);
+    match run() {
+        Ok(RunOutcome::Success) => {}
+        Ok(RunOutcome::Exit(code)) => std::process::exit(code),
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn run() -> Result<()> {
+fn run() -> Result<RunOutcome> {
     let cli = Cli::parse();
     let store = ConfigStore::new(
         cli.config
@@ -170,14 +218,28 @@ fn run() -> Result<()> {
             },
             cli.json,
             cli.color,
-        ),
-        Command::Config(command) => run_config(command.command, &store, cli.json),
-        Command::New(command) => run_new(&store, command, cli.json, cli.color),
-        Command::List => run_list(&store, cli.json, cli.color),
-        Command::Info { id } => run_info(&store, &id, cli.json, cli.color),
-        Command::Start { id } => run_start(&store, &id, cli.json, cli.color),
-        Command::Stop { id, force } => run_stop(&store, &id, force, cli.json, cli.color),
-        Command::Delete { id, yes } => run_delete(&store, &id, yes, cli.json, cli.color),
+        )
+        .map(|_| RunOutcome::Success),
+        Command::Config(command) => {
+            run_config(command.command, &store, cli.json).map(|_| RunOutcome::Success)
+        }
+        Command::New(command) => {
+            run_new(&store, command, cli.json, cli.color).map(|_| RunOutcome::Success)
+        }
+        Command::Exec(command) => run_exec(&store, command, cli.json),
+        Command::List => run_list(&store, cli.json, cli.color).map(|_| RunOutcome::Success),
+        Command::Info { id } => {
+            run_info(&store, &id, cli.json, cli.color).map(|_| RunOutcome::Success)
+        }
+        Command::Start { id } => {
+            run_start(&store, &id, cli.json, cli.color).map(|_| RunOutcome::Success)
+        }
+        Command::Stop { id, force } => {
+            run_stop(&store, &id, force, cli.json, cli.color).map(|_| RunOutcome::Success)
+        }
+        Command::Delete { id, yes } => {
+            run_delete(&store, &id, yes, cli.json, cli.color).map(|_| RunOutcome::Success)
+        }
     }
 }
 
@@ -254,6 +316,133 @@ fn run_config(command: ConfigSubcommand, store: &ConfigStore, json: bool) -> Res
         }
     }
     Ok(())
+}
+
+fn run_exec(store: &ConfigStore, command: ExecCommand, json: bool) -> Result<RunOutcome> {
+    let config = load_config(store)?;
+    let token_id = config
+        .pve
+        .token_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("pve.token_id is not configured"))?;
+    let token_secret = config
+        .pve
+        .token_secret
+        .as_ref()
+        .map(|secret| secret.expose())
+        .ok_or_else(|| anyhow!("pve.token_secret is not configured"))?;
+    let seed = derive_context_seed(token_id, token_secret);
+    let ca = generate_context_ca(&seed).context("derive pbox agent trust root")?;
+    let client_identity =
+        issue_certificate(&ca, &client_subject(&seed), CertificatePurpose::Client)
+            .context("create short-lived pbox agent client certificate")?;
+    let env = command
+        .env
+        .iter()
+        .map(|entry| parse_env_entry(entry))
+        .collect::<Result<Vec<_>>>()?;
+    validate_exec_arguments(&command)?;
+
+    let endpoint = command.endpoint;
+    let box_id = command.id;
+    let cwd = command.cwd;
+    let user = command.user;
+    let argv = command.argv;
+    let ca_pem = ca.certificate_pem.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create async runtime for pbox-agent")?;
+    let result = runtime.block_on(async move {
+        let mut client = AgentClient::connect(&endpoint, &box_id, &ca_pem, &client_identity)
+            .await
+            .context("connect to pbox-agent")?;
+        client
+            .info()
+            .await
+            .context("validate pbox-agent identity")?;
+        client
+            .exec(argv, cwd, env, user)
+            .await
+            .context("execute command through pbox-agent")
+    })?;
+
+    if json {
+        let output = ExecOutput {
+            stdout_base64: base64::engine::general_purpose::STANDARD.encode(&result.stdout),
+            stderr_base64: base64::engine::general_purpose::STANDARD.encode(&result.stderr),
+            code: result.code,
+            signal: result.signal,
+            exited: result.exited,
+            exit_code: exec_exit_code(&result),
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        write_exec_streams(&result)?;
+    }
+
+    let exit_code = exec_exit_code(&result);
+    if exit_code == 0 {
+        Ok(RunOutcome::Success)
+    } else {
+        Ok(RunOutcome::Exit(exit_code))
+    }
+}
+
+fn parse_env_entry(entry: &str) -> Result<(String, String)> {
+    let (name, value) = entry
+        .split_once('=')
+        .ok_or_else(|| anyhow!("environment entry must use KEY=VALUE form: {entry}"))?;
+    if name.is_empty() {
+        return Err(anyhow!("environment variable name cannot be empty"));
+    }
+    if name.contains('\0') || value.contains('\0') {
+        return Err(anyhow!("environment entries cannot contain NUL bytes"));
+    }
+    Ok((name.to_owned(), value.to_owned()))
+}
+
+fn validate_exec_arguments(command: &ExecCommand) -> Result<()> {
+    for (label, value) in [
+        ("agent endpoint", command.endpoint.as_str()),
+        ("box id", command.id.as_str()),
+        ("working directory", command.cwd.as_str()),
+        ("guest user", command.user.as_str()),
+    ] {
+        if value.contains('\0') {
+            return Err(anyhow!("{label} cannot contain NUL bytes"));
+        }
+    }
+    if command.argv.is_empty() {
+        return Err(anyhow!("exec requires a command"));
+    }
+    if command.argv.iter().any(|argument| argument.contains('\0')) {
+        return Err(anyhow!("command arguments cannot contain NUL bytes"));
+    }
+    Ok(())
+}
+
+fn write_exec_streams(result: &ExecResult) -> Result<()> {
+    let mut stdout = io::stdout();
+    stdout
+        .write_all(&result.stdout)
+        .context("write pbox-agent stdout")?;
+    stdout.flush().context("flush pbox-agent stdout")?;
+    let mut stderr = io::stderr();
+    stderr
+        .write_all(&result.stderr)
+        .context("write pbox-agent stderr")?;
+    stderr.flush().context("flush pbox-agent stderr")?;
+    Ok(())
+}
+
+fn exec_exit_code(result: &ExecResult) -> i32 {
+    let code = if result.signal > 0 {
+        result.signal.saturating_add(128)
+    } else {
+        result.code
+    };
+    if code < 0 { 1 } else { code.min(255) }
 }
 
 fn read_value_from_stdin() -> String {
@@ -640,11 +829,59 @@ fn color_enabled(color: ColorChoice, json: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::{exec_exit_code, parse_env_entry};
+    use pbox_agent_client::ExecResult;
     use pbox_core::ui::ColorMode;
-
     #[test]
     fn colour_is_disabled_for_json_and_no_color() {
         assert!(!ColorMode::Always.enabled(true, false, true));
         assert!(!ColorMode::Auto.enabled(true, true, false));
+    }
+
+    #[test]
+    fn parse_env_entry_splits_on_first_equals() {
+        assert_eq!(
+            parse_env_entry("GREETING=hello=world").unwrap(),
+            ("GREETING".to_owned(), "hello=world".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_env_entry_rejects_invalid_entries() {
+        assert!(parse_env_entry("MISSING_EQUALS").is_err());
+        assert!(parse_env_entry("=missing-name").is_err());
+        assert!(parse_env_entry("BAD\0VALUE=x").is_err());
+    }
+
+    #[test]
+    fn exec_exit_code_maps_signals_and_invalid_codes() {
+        assert_eq!(
+            exec_exit_code(&ExecResult {
+                code: 0,
+                ..Default::default()
+            }),
+            0
+        );
+        assert_eq!(
+            exec_exit_code(&ExecResult {
+                code: 7,
+                ..Default::default()
+            }),
+            7
+        );
+        assert_eq!(
+            exec_exit_code(&ExecResult {
+                signal: 9,
+                ..Default::default()
+            }),
+            137
+        );
+        assert_eq!(
+            exec_exit_code(&ExecResult {
+                code: -1,
+                ..Default::default()
+            }),
+            1
+        );
     }
 }

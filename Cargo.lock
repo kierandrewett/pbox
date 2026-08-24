@@ -1147,10 +1147,14 @@ name = "pbox-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
+ "pbox-agent-client",
  "pbox-core",
+ "pbox-crypto",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
