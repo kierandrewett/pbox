@@ -38,7 +38,7 @@ pem = "3.0"
 sha2 = "0.10"
 tonic = { version = "0.14", features = ["transport", "tls-ring"] }
 tonic-prost = "0.14"
-time = "0.3"
+time = { version = "0.3", features = ["formatting"] }
 nix = { version = "0.31.3", features = ["process", "term"] }
 tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }

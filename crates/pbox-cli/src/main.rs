@@ -1,13 +1,16 @@
+mod ansible;
 mod bootstrap;
 mod recipes;
-use anyhow::{Context, Result, anyhow};
+use ansible::{AnsibleRun, apply_recipe};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use bootstrap::{BootstrapKey, BootstrapRequest, bootstrap_box};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pbox_agent_client::{AgentClient, ExecResult};
 use pbox_core::{
-    Config, ConfigStore, LxcCreateRequest, PboxId, PboxMetadata, PveApi, PveClient,
-    PveClientConfig, PveError, PveTaskResponse, encode_metadata, parse_metadata, select_lxc_ipv4,
+    Config, ConfigStore, LxcConfigUpdateRequest, LxcCreateRequest, PboxId, PboxMetadata,
+    PboxRecipeProvenance, PveApi, PveClient, PveClientConfig, PveError, PveTaskResponse,
+    encode_metadata, parse_duration, parse_metadata, preserve_metadata, select_lxc_ipv4,
 };
 use pbox_crypto::{
     CertificateMaterial, CertificatePurpose, client_subject, derive_context_seed,
@@ -15,14 +18,20 @@ use pbox_crypto::{
 };
 use recipes::{RecipeCatalog, RecipeRepository};
 use serde::Serialize;
+use std::collections::BTreeSet;
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const PVE_TASK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PVE_TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_FILE_TRANSFER_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -61,6 +70,8 @@ enum Command {
     New(NewCommand),
     /// Execute a non-interactive command through pbox-agent.
     Exec(ExecCommand),
+    /// Copy files between the control machine and a pbox.
+    Scp(ScpCommand),
     /// Discover and apply Ansible recipes.
     Recipe(RecipeCommand),
     /// List pbox-managed containers discovered from PVE metadata.
@@ -137,6 +148,13 @@ struct ExecCommand {
     argv: Vec<String>,
 }
 #[derive(Debug, Args)]
+struct ScpCommand {
+    /// Local or remote source path.
+    source: String,
+    /// Local or remote destination path.
+    destination: String,
+}
+#[derive(Debug, Args)]
 struct RecipeCommand {
     #[command(subcommand)]
     command: RecipeSubcommand,
@@ -152,6 +170,17 @@ enum RecipeSubcommand {
     Search { text: String },
     /// Show one recipe and its metadata.
     Info { recipe: String },
+    /// Apply a recipe to a box through the pbox Ansible connection.
+    ///
+    /// Recipe repositories are trusted controller-side code. They can run
+    /// Ansible local actions and use controller file-transfer operations.
+    Apply {
+        /// Recipe identifier from `pbox recipe list`.
+        recipe: String,
+        /// Public pbox identifier.
+        #[arg(long)]
+        box_id: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -176,7 +205,6 @@ enum ConfigSubcommand {
 struct IdOutput {
     id: PboxId,
 }
-
 #[derive(Debug, Serialize)]
 struct BoxRecord {
     id: PboxId,
@@ -185,6 +213,8 @@ struct BoxRecord {
     node: String,
     ip: Option<String>,
     name: Option<String>,
+    recipes: Vec<PboxRecipeProvenance>,
+    capabilities: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,6 +225,8 @@ struct BoxInfo {
     node: String,
     ip: Option<String>,
     name: Option<String>,
+    recipes: Vec<PboxRecipeProvenance>,
+    capabilities: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -254,6 +286,9 @@ fn run() -> Result<RunOutcome> {
             run_new(&store, command, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
         Command::Exec(command) => run_exec(&store, command, cli.json),
+        Command::Scp(command) => {
+            run_scp(&store, command, cli.json, cli.color).map(|_| RunOutcome::Success)
+        }
         Command::Recipe(command) => {
             run_recipe(command.command, &store, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
@@ -348,6 +383,205 @@ fn run_config(command: ConfigSubcommand, store: &ConfigStore, json: bool) -> Res
     Ok(())
 }
 
+#[derive(Debug)]
+struct RemotePath {
+    box_id: String,
+    path: String,
+}
+
+fn run_scp(store: &ConfigStore, command: ScpCommand, json: bool, color: ColorChoice) -> Result<()> {
+    let source_remote = parse_remote_path(&command.source)?;
+    let destination_remote = parse_remote_path(&command.destination)?;
+    let (upload, box_id, local_path, remote_path) = match (source_remote, destination_remote) {
+        (None, Some(destination)) => (true, destination.box_id, command.source, destination.path),
+        (Some(source), None) => (false, source.box_id, command.destination, source.path),
+        (None, None) => {
+            return Err(anyhow!("scp requires one remote path in BOX_ID:/path form"));
+        }
+        (Some(_), Some(_)) => {
+            return Err(anyhow!("scp does not support remote-to-remote copies"));
+        }
+    };
+
+    let config = load_config(store)?;
+    let endpoint_command = ExecCommand {
+        id: box_id.clone(),
+        endpoint: None,
+        cwd: "/".to_owned(),
+        user: "root".to_owned(),
+        env: Vec::new(),
+        argv: vec!["true".to_owned()],
+    };
+    let (resolved_box_id, endpoint) = resolve_agent_target(&config, &endpoint_command)?;
+    let materials = agent_materials(&config, &resolved_box_id)?;
+    let local = PathBuf::from(&local_path);
+    let upload_data = if upload {
+        let metadata = fs::metadata(&local)
+            .with_context(|| format!("read local file metadata {}", local.display()))?;
+        if !metadata.is_file() {
+            bail!("scp source is not a regular file: {}", local.display());
+        }
+        if metadata.len() > MAX_FILE_TRANSFER_BYTES {
+            bail!("scp source exceeds the 64 MiB limit: {}", local.display());
+        }
+        Some(fs::read(&local).with_context(|| format!("read local file {}", local.display()))?)
+    } else {
+        None
+    };
+    let upload_mode = if upload {
+        Some(local_file_mode(&local)?)
+    } else {
+        None
+    };
+    let ca_pem = materials.ca.certificate_pem.clone();
+    let client_identity = materials.client;
+    let remote_path_for_rpc = remote_path.clone();
+    let client_box_id = resolved_box_id.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create async runtime for pbox-agent file transfer")?;
+    let size = runtime.block_on(async move {
+        let mut client = AgentClient::connect(&endpoint, &client_box_id, &ca_pem, &client_identity)
+            .await
+            .context("connect to pbox-agent")?;
+        client
+            .info()
+            .await
+            .context("validate pbox-agent identity")?;
+        if let Some(data) = upload_data {
+            let result = client
+                .put_file(
+                    remote_path_for_rpc.clone(),
+                    data,
+                    upload_mode.unwrap_or(0o600),
+                    true,
+                )
+                .await
+                .context("upload file through pbox-agent")?;
+            Ok::<u64, anyhow::Error>(result.size)
+        } else {
+            let data = client
+                .get_file(remote_path_for_rpc)
+                .await
+                .context("download file through pbox-agent")?;
+            let size = data.len() as u64;
+            write_download(&local, data)?;
+            Ok(size)
+        }
+    })?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "box_id": resolved_box_id,
+                "local": local_path,
+                "remote": remote_path,
+                "direction": if upload { "upload" } else { "download" },
+                "bytes": size,
+            }))?
+        );
+    } else {
+        let _ = color_enabled(color, json);
+        println!(
+            "{} {} {} {} ({} bytes)",
+            if upload { "uploaded" } else { "downloaded" },
+            local_path,
+            if upload { "to" } else { "from" },
+            remote_path,
+            size
+        );
+    }
+    Ok(())
+}
+
+fn local_file_mode(path: &Path) -> Result<u32> {
+    #[cfg(unix)]
+    {
+        fs::metadata(path)
+            .with_context(|| format!("read local file permissions {}", path.display()))
+            .map(|metadata| metadata.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(0o600)
+    }
+}
+
+fn write_download(path: &Path, data: Vec<u8>) -> Result<()> {
+    let existing_mode = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!("refusing to overwrite symlink {}", path.display());
+            }
+            if !metadata.file_type().is_file() {
+                bail!(
+                    "download destination is not a regular file: {}",
+                    path.display()
+                );
+            }
+            #[cfg(unix)]
+            {
+                Some(metadata.permissions().mode() & 0o7777)
+            }
+            #[cfg(not(unix))]
+            {
+                Some(0)
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect local file {}", path.display()));
+        }
+    };
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("read system clock for temporary download")?
+        .as_nanos();
+    let temporary = parent.join(format!(".pbox-download-{}-{stamp}", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| format!("create temporary download {}", temporary.display()))?;
+        file.write_all(&data)
+            .with_context(|| format!("write temporary download {}", temporary.display()))?;
+        #[cfg(unix)]
+        fs::set_permissions(
+            &temporary,
+            fs::Permissions::from_mode(existing_mode.unwrap_or(0o600)),
+        )
+        .with_context(|| format!("set downloaded file permissions {}", path.display()))?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("replace local file {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn parse_remote_path(value: &str) -> Result<Option<RemotePath>> {
+    let Some((box_id, path)) = value.split_once(':') else {
+        return Ok(None);
+    };
+    let parsed: PboxId = box_id.parse().context("parse remote pbox identifier")?;
+    if path.is_empty() {
+        return Err(anyhow!("remote path cannot be empty"));
+    }
+    if path.contains('\0') {
+        return Err(anyhow!("remote path cannot contain NUL bytes"));
+    }
+    Ok(Some(RemotePath {
+        box_id: parsed.to_string(),
+        path: path.to_owned(),
+    }))
+}
+
 fn run_recipe(
     command: RecipeSubcommand,
     store: &ConfigStore,
@@ -364,8 +598,8 @@ fn run_recipe(
                 println!(
                     "synced {} recipes from {} @ {}",
                     catalog.recipes.len(),
-                    catalog.repository,
-                    catalog.revision
+                    safe_terminal_text(&catalog.repository),
+                    safe_terminal_text(&catalog.revision)
                 );
             }
         }
@@ -406,8 +640,111 @@ fn run_recipe(
                 print_recipe_info(result, color_enabled(color, json));
             }
         }
+        RecipeSubcommand::Apply { recipe, box_id } => {
+            let config = load_config(store)?;
+            let repository = recipe_repository(&config)?;
+            let (_recipe_lock, catalog) =
+                repository.prepare_for_apply(if config.recipes.auto_sync {
+                    Some(parse_recipe_sync_ttl(&config.recipes.sync_ttl)?)
+                } else {
+                    None
+                })?;
+            let selected = catalog
+                .recipes
+                .iter()
+                .find(|candidate| candidate.id == recipe)
+                .ok_or_else(|| anyhow!("recipe not found: {recipe}"))?;
+            let client = client_from_config(&config)?;
+            let record = find_box(&client, &box_id)?;
+            if record.state != "running" {
+                bail!("box {} is not running", record.id);
+            }
+            let binary = std::env::current_exe().context("locate pbox executable")?;
+            let run = apply_recipe(
+                store.path(),
+                &binary,
+                repository.cache_dir(),
+                &catalog,
+                selected,
+                &box_id,
+                json,
+            )?;
+            record_recipe_provenance(&client, &record, &run, &selected.metadata.capabilities)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&run)?);
+            } else {
+                println!(
+                    "applied {} to {} @ {}",
+                    safe_terminal_text(&run.recipe),
+                    safe_terminal_text(&run.box_id),
+                    safe_terminal_text(&run.revision)
+                );
+            }
+        }
     }
     Ok(())
+}
+
+fn record_recipe_provenance(
+    client: &impl PveApi,
+    record: &BoxRecord,
+    run: &AnsibleRun,
+    capabilities: &[String],
+) -> Result<()> {
+    let provenance = PboxRecipeProvenance {
+        id: run.recipe.clone(),
+        repository: run.repository.clone(),
+        revision: run.revision.clone(),
+        applied_at: Some(current_timestamp()?),
+        result: Some("success".to_owned()),
+    };
+    let mut last_error = None;
+    for _attempt in 0..3 {
+        let config = client
+            .get_lxc_config(&record.node, record.vmid)
+            .with_context(|| format!("read metadata for box {}", record.id))?;
+        let description = config.description.as_deref().unwrap_or("");
+        let mut metadata = parse_metadata(description)
+            .context("parse pbox metadata before recording recipe provenance")?
+            .ok_or_else(|| anyhow!("box {} has no pbox metadata", record.id))?;
+        if metadata.id != record.id || metadata.vmid != record.vmid {
+            bail!("pbox metadata does not match box {}", record.id);
+        }
+        if let Some(existing) = metadata
+            .recipes
+            .iter_mut()
+            .find(|existing| existing.id == provenance.id)
+        {
+            *existing = provenance.clone();
+        } else {
+            metadata.recipes.push(provenance.clone());
+        }
+        for capability in capabilities {
+            if !metadata.capabilities.contains(capability) {
+                metadata.capabilities.push(capability.clone());
+            }
+        }
+        metadata
+            .recipes
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        metadata.capabilities.sort();
+        let description = preserve_metadata(description, &metadata)
+            .context("preserve pbox metadata while recording recipe provenance")?;
+        let request = LxcConfigUpdateRequest {
+            digest: config.digest,
+            description: Some(description),
+            ..Default::default()
+        };
+        match client.update_lxc_config(&record.node, record.vmid, &request) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    Err(anyhow!(
+        "could not record recipe provenance for {} after configuration retries: {}",
+        record.id,
+        last_error.unwrap_or_else(|| "unknown PVE error".to_owned())
+    ))
 }
 
 fn recipe_repository(config: &Config) -> Result<RecipeRepository> {
@@ -417,11 +754,21 @@ fn recipe_repository(config: &Config) -> Result<RecipeRepository> {
     )
 }
 
+fn current_timestamp() -> Result<String> {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .context("format recipe provenance timestamp")
+}
+
+fn parse_recipe_sync_ttl(value: &str) -> Result<Duration> {
+    parse_duration(value).map_err(|reason| anyhow!("invalid recipe sync TTL {value:?}; {reason}"))
+}
+
 fn load_recipe_catalog(store: &ConfigStore) -> Result<RecipeCatalog> {
     let config = load_config(store)?;
     let repository = recipe_repository(&config)?;
     if config.recipes.auto_sync {
-        repository.sync()
+        repository.sync_if_stale(parse_recipe_sync_ttl(&config.recipes.sync_ttl)?)
     } else {
         repository.discover()
     }
@@ -437,15 +784,16 @@ fn print_recipe_catalog(catalog: &RecipeCatalog, json: bool, color: ColorChoice)
     let reset = if colour { "\x1b[0m" } else { "" };
     println!(
         "{accent}recipes{reset} {} @ {}",
-        catalog.repository, catalog.revision
+        safe_terminal_text(&catalog.repository),
+        safe_terminal_text(&catalog.revision),
     );
     println!("{:<28} {:<10} DESCRIPTION", "ID", "KIND");
     for recipe in &catalog.recipes {
         println!(
             "{:<28} {:<10} {}",
-            recipe.id,
+            safe_terminal_text(&recipe.id),
             recipe.kind.as_str(),
-            recipe.metadata.description.as_deref().unwrap_or("")
+            safe_terminal_text(recipe.metadata.description.as_deref().unwrap_or("")),
         );
     }
     Ok(())
@@ -454,20 +802,29 @@ fn print_recipe_catalog(catalog: &RecipeCatalog, json: bool, color: ColorChoice)
 fn print_recipe_info(recipe: &recipes::Recipe, colour: bool) {
     let accent = if colour { "\x1b[36m" } else { "" };
     let reset = if colour { "\x1b[0m" } else { "" };
-    println!("{accent}{}{reset}", recipe.id);
+    println!("{accent}{}{reset}", safe_terminal_text(&recipe.id));
     println!("kind: {}", recipe.kind.as_str());
-    println!("path: {}", recipe.path);
+    println!("path: {}", safe_terminal_text(&recipe.path));
     if let Some(description) = recipe.metadata.description.as_deref() {
-        println!("description: {description}");
+        println!("description: {}", safe_terminal_text(description));
     }
     if !recipe.metadata.requires.is_empty() {
-        println!("requires: {}", recipe.metadata.requires.join(", "));
+        println!(
+            "requires: {}",
+            safe_terminal_text(&recipe.metadata.requires.join(", ")),
+        );
     }
     if !recipe.metadata.supports.is_empty() {
-        println!("supports: {}", recipe.metadata.supports.join(", "));
+        println!(
+            "supports: {}",
+            safe_terminal_text(&recipe.metadata.supports.join(", ")),
+        );
     }
     if !recipe.metadata.capabilities.is_empty() {
-        println!("capabilities: {}", recipe.metadata.capabilities.join(", "));
+        println!(
+            "capabilities: {}",
+            safe_terminal_text(&recipe.metadata.capabilities.join(", ")),
+        );
     }
     let resources = &recipe.metadata.resources;
     if resources.cores.is_some() || resources.memory.is_some() || resources.disk.is_some() {
@@ -481,9 +838,22 @@ fn print_recipe_info(recipe: &recipes::Recipe, colour: bool) {
                 .memory
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_owned()),
-            resources.disk.as_deref().unwrap_or("-")
+            safe_terminal_text(resources.disk.as_deref().unwrap_or("-"))
         );
     }
+}
+
+fn safe_terminal_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn run_exec(store: &ConfigStore, command: ExecCommand, json: bool) -> Result<RunOutcome> {
@@ -614,6 +984,75 @@ fn read_value_from_stdin() -> String {
         .expect("read configuration value");
     value.trim_end_matches(['\r', '\n']).to_owned()
 }
+const VMID_CREATE_ATTEMPTS: usize = 8;
+
+fn create_lxc_with_retry(
+    client: &PveClient,
+    config: &Config,
+    command: &NewCommand,
+    id: &PboxId,
+    hostname: &str,
+    key: &BootstrapKey,
+) -> Result<(u64, PveTaskResponse)> {
+    let resources = client
+        .list_cluster_resources()
+        .context("list PVE resources for VMID allocation")?;
+    let mut occupied: BTreeSet<u64> = resources
+        .iter()
+        .filter_map(|resource| resource.vmid)
+        .collect();
+    for attempt in 0..VMID_CREATE_ATTEMPTS {
+        let vmid = config
+            .vmid_pattern
+            .allocate_lowest(occupied.iter())
+            .context("allocate a free PVE VMID")?;
+        let metadata = PboxMetadata::new(id.clone(), vmid).with_node(&command.node);
+        let description = format!(
+            "Managed by `pbox`.\n{}",
+            encode_metadata(&metadata).context("encode pbox metadata")?
+        );
+        let request = LxcCreateRequest {
+            ostemplate: Some(command.ostemplate.clone()),
+            hostname: Some(hostname.to_owned()),
+            memory: command.memory,
+            swap: command.swap,
+            cores: command.cores,
+            rootfs: Some(command.rootfs.clone()),
+            net0: Some(command.net0.clone()),
+            unprivileged: Some(true),
+            description: Some(description),
+            ssh_public_keys: Some(key.public_key().to_owned()),
+            start: Some(true),
+        };
+        match client.create_lxc(&command.node, vmid, &request) {
+            Ok(task) => return Ok((vmid, task)),
+            Err(error) if is_vmid_conflict(&error) && attempt + 1 < VMID_CREATE_ATTEMPTS => {
+                occupied.insert(vmid);
+                let resources = client
+                    .list_cluster_resources()
+                    .context("refresh PVE resources after VMID allocation race")?;
+                occupied.extend(resources.iter().filter_map(|resource| resource.vmid));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("create box {id} with VMID {vmid} on {}", command.node)
+                });
+            }
+        }
+    }
+    bail!("could not create box {id}: VMID allocation kept racing")
+}
+
+fn is_vmid_conflict(error: &PveError) -> bool {
+    match error {
+        PveError::Http { status, message } => {
+            let message = message.to_ascii_lowercase();
+            status.as_u16() == 409 || (message.contains("vmid") && message.contains("already"))
+        }
+        _ => false,
+    }
+}
+
 fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorChoice) -> Result<()> {
     let config = load_config(store)?;
     let agent_binary = resolve_agent_binary(&config)?;
@@ -624,46 +1063,21 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         ));
     }
     let client = client_from_config(&config)?;
-    let resources = client
-        .list_cluster_resources()
-        .context("list PVE resources for VMID allocation")?;
-    let used_vmids = resources.iter().filter_map(|resource| resource.vmid);
-    let vmid = config
-        .vmid_pattern
-        .allocate_lowest(used_vmids)
-        .context("allocate a free PVE VMID")?;
     let existing = discover_boxes(&client)?;
     let id = generate_unique_id(&existing)?;
     let id_text = id.to_string();
     let materials = agent_materials(&config, &id_text)?;
     let key = BootstrapKey::generate(&id_text).context("create temporary bootstrap SSH key")?;
-    let metadata = PboxMetadata::new(id.clone(), vmid).with_node(&command.node);
-    let description = format!(
-        "Managed by `pbox`.\n{}",
-        encode_metadata(&metadata).context("encode pbox metadata")?
-    );
     let hostname = command
         .name
+        .clone()
         .unwrap_or_else(|| format!("pbox-{}", id_text.trim_start_matches("pbx_")));
-    let request = LxcCreateRequest {
-        ostemplate: Some(command.ostemplate),
-        hostname: Some(hostname.clone()),
-        memory: command.memory,
-        swap: command.swap,
-        cores: command.cores,
-        rootfs: Some(command.rootfs),
-        net0: Some(command.net0),
-        unprivileged: Some(true),
-        description: Some(description),
-        ssh_public_keys: Some(key.public_key().to_owned()),
-        start: Some(true),
-    };
-    let task = match client.create_lxc(&command.node, vmid, &request) {
-        Ok(task) => task,
+    let (vmid, task) = match create_lxc_with_retry(&client, &config, &command, &id, &hostname, &key)
+    {
+        Ok(result) => result,
         Err(error) => {
-            let _ = key.cleanup();
-            return Err(error)
-                .with_context(|| format!("create box {id} with VMID {vmid} on {}", command.node));
+            let cleanup = key.cleanup().err();
+            return Err(error).context(format_bootstrap_cleanup_failure(&key, cleanup.as_ref()));
         }
     };
     if let Err(error) = wait_for_task(&client, &command.node, task) {
@@ -721,6 +1135,8 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         node: command.node,
         ip: output_ip,
         name: Some(hostname),
+        recipes: Vec::new(),
+        capabilities: Vec::new(),
     };
     print_box_info(&info, json, color)
 }
@@ -806,6 +1222,8 @@ where
         node: record.node,
         ip,
         name: record.name,
+        recipes: record.recipes,
+        capabilities: record.capabilities,
     };
     print_box_info(&info, json, color)
 }
@@ -905,7 +1323,6 @@ fn run_list(store: &ConfigStore, json: bool, color: ColorChoice) -> Result<()> {
     }
     Ok(())
 }
-
 fn run_info(store: &ConfigStore, requested_id: &str, json: bool, color: ColorChoice) -> Result<()> {
     let client = client_from_store(store)?;
     let record = find_box(&client, requested_id)?;
@@ -916,6 +1333,8 @@ fn run_info(store: &ConfigStore, requested_id: &str, json: bool, color: ColorCho
         node: record.node,
         ip: record.ip,
         name: record.name,
+        recipes: record.recipes,
+        capabilities: record.capabilities,
     };
     print_box_info(&info, json, color)
 }
@@ -949,6 +1368,11 @@ fn client_from_config(config: &Config) -> Result<PveClient> {
         .ok_or_else(|| anyhow!("pve.token_secret is not configured"))?;
     let mut client_config = PveClientConfig::new(url, token_id, token_secret);
     client_config.tls_insecure = config.pve.tls_insecure;
+    if config.pve.tls_insecure {
+        eprintln!(
+            "[security] pve.tls_insecure disables PVE certificate verification and exposes the API token to a MITM"
+        );
+    }
     PveClient::new(client_config).context("create PVE client")
 }
 
@@ -1112,6 +1536,8 @@ fn discover_boxes(client: &impl PveApi) -> Result<Vec<BoxRecord>> {
             node: node.to_owned(),
             ip,
             name,
+            recipes: metadata.recipes,
+            capabilities: metadata.capabilities,
         });
     }
     records.sort_by(|left, right| left.id.cmp(&right.id));
@@ -1131,13 +1557,37 @@ fn print_box_info(info: &BoxInfo, json: bool, color: ColorChoice) -> Result<()> 
         println!("{}", serde_json::to_string_pretty(info)?);
     } else {
         let _ = color_enabled(color, json);
-        println!("box");
-        println!("  id:     {}", info.id);
+        println!("  id:     {}", safe_terminal_text(&info.id.to_string()));
         println!("  vmid:   {}", info.vmid);
-        println!("  state:  {}", info.state);
-        println!("  node:   {}", info.node);
-        println!("  ip:     {}", info.ip.as_deref().unwrap_or("-"));
-        println!("  name:   {}", info.name.as_deref().unwrap_or("-"));
+        println!("  state:  {}", safe_terminal_text(&info.state));
+        println!("  node:   {}", safe_terminal_text(&info.node));
+        println!(
+            "  ip:     {}",
+            safe_terminal_text(info.ip.as_deref().unwrap_or("-"))
+        );
+        println!(
+            "  name:   {}",
+            safe_terminal_text(info.name.as_deref().unwrap_or("-"))
+        );
+        let recipes = info
+            .recipes
+            .iter()
+            .map(|recipe| safe_terminal_text(&recipe.id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "  recipes: {}",
+            if recipes.is_empty() { "-" } else { &recipes }
+        );
+        let capabilities = safe_terminal_text(&info.capabilities.join(", "));
+        println!(
+            "  capabilities: {}",
+            if capabilities.is_empty() {
+                "-"
+            } else {
+                &capabilities
+            }
+        );
     }
     Ok(())
 }
@@ -1199,9 +1649,13 @@ fn color_enabled(color: ColorChoice, json: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{exec_exit_code, parse_env_entry};
+    use super::{
+        exec_exit_code, parse_env_entry, parse_recipe_sync_ttl, parse_remote_path, write_download,
+    };
     use pbox_agent_client::ExecResult;
     use pbox_core::ui::ColorMode;
+    use std::fs;
+    use std::time::Duration;
     #[test]
     fn colour_is_disabled_for_json_and_no_color() {
         assert!(!ColorMode::Always.enabled(true, false, true));
@@ -1221,6 +1675,23 @@ mod tests {
         assert!(parse_env_entry("MISSING_EQUALS").is_err());
         assert!(parse_env_entry("=missing-name").is_err());
         assert!(parse_env_entry("BAD\0VALUE=x").is_err());
+    }
+
+    #[test]
+    fn parse_remote_path_accepts_pbox_paths_and_local_paths() {
+        assert!(parse_remote_path("/tmp/file").unwrap().is_none());
+        let remote = parse_remote_path("pbx_t3yzd9y3:/var/tmp/file")
+            .unwrap()
+            .expect("remote path");
+        assert_eq!(remote.box_id, "pbx_t3yzd9y3");
+        assert_eq!(remote.path, "/var/tmp/file");
+    }
+
+    #[test]
+    fn parse_remote_path_rejects_invalid_remote_paths() {
+        assert!(parse_remote_path("pbx_t3yzd9y3:").is_err());
+        assert!(parse_remote_path("not-a-box:/tmp/file").is_err());
+        assert!(parse_remote_path("pbx_t3yzd9y3:/tmp\0file").is_err());
     }
 
     #[test]
@@ -1253,5 +1724,51 @@ mod tests {
             }),
             1
         );
+    }
+
+    #[test]
+    fn recipe_sync_ttl_parses_units() {
+        assert_eq!(
+            parse_recipe_sync_ttl("15m").unwrap(),
+            Duration::from_secs(900)
+        );
+        assert_eq!(
+            parse_recipe_sync_ttl("2h").unwrap(),
+            Duration::from_secs(7_200)
+        );
+        assert_eq!(
+            parse_recipe_sync_ttl("3d").unwrap(),
+            Duration::from_secs(259_200)
+        );
+        assert_eq!(
+            parse_recipe_sync_ttl("30").unwrap(),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn recipe_sync_ttl_rejects_invalid_values() {
+        assert!(parse_recipe_sync_ttl("").is_err());
+        assert!(parse_recipe_sync_ttl("15x").is_err());
+        assert!(parse_recipe_sync_ttl("xm").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_rejects_existing_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let suffix = format!("pbox-download-test-{}", std::process::id());
+        let target = std::env::temp_dir().join(format!("{suffix}-target"));
+        let link = std::env::temp_dir().join(format!("{suffix}-link"));
+        fs::write(&target, b"original").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let result = write_download(&link, b"replacement".to_vec());
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        fs::remove_file(&link).unwrap();
+        fs::remove_file(&target).unwrap();
     }
 }

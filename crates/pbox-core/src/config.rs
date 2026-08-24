@@ -1,9 +1,11 @@
 use crate::VmidPattern;
+use reqwest::Url;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -145,12 +147,80 @@ pub struct RedactedConfig {
     pub recipes: RedactedRecipeConfig,
     pub vmid_pattern: VmidPattern,
 }
+pub fn parse_duration(value: &str) -> Result<Duration, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("duration cannot be empty".to_owned());
+    }
+    let (amount_text, multiplier) = match trimmed.chars().last() {
+        Some('s') => (&trimmed[..trimmed.len() - 1], 1_u64),
+        Some('m') => (&trimmed[..trimmed.len() - 1], 60_u64),
+        Some('h') => (&trimmed[..trimmed.len() - 1], 60_u64 * 60),
+        Some('d') => (&trimmed[..trimmed.len() - 1], 60_u64 * 60 * 24),
+        Some(character) if character.is_ascii_digit() => (trimmed, 1_u64),
+        _ => return Err("use seconds, minutes, hours, or days".to_owned()),
+    };
+    let amount = amount_text
+        .parse::<u64>()
+        .map_err(|_| "duration amount must be an integer".to_owned())?;
+    let seconds = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| "duration is too large".to_owned())?;
+    Ok(Duration::from_secs(seconds))
+}
 
 impl Config {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(url) = &self.pve.url {
+            validate_non_empty("pve.url", url, "URL cannot be empty")?;
+            validate_pve_url("pve.url", url)?;
+        }
+        if let Some(token_id) = &self.pve.token_id {
+            validate_non_empty("pve.token_id", token_id, "token id cannot be empty")?;
+        }
+        if let Some(token_secret) = &self.pve.token_secret
+            && token_secret.expose().is_empty()
+        {
+            return Err(ConfigError::InvalidValue {
+                key: "pve.token_secret".to_owned(),
+                reason: "token secret cannot be empty".to_owned(),
+            });
+        }
+        if let Some(binary) = &self.agent.binary
+            && binary.as_os_str().is_empty()
+        {
+            return Err(ConfigError::InvalidValue {
+                key: "agent.binary".to_owned(),
+                reason: "agent binary path cannot be empty".to_owned(),
+            });
+        }
+        if self.agent.port == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "agent.port".to_owned(),
+                reason: "expected a TCP port from 1 to 65535".to_owned(),
+            });
+        }
+        validate_repository_reference("recipes.repository", &self.recipes.repository)?;
+        validate_non_empty(
+            "recipes.ref",
+            &self.recipes.reference,
+            "recipe reference cannot be empty",
+        )?;
+        parse_duration(&self.recipes.sync_ttl).map_err(|reason| ConfigError::InvalidValue {
+            key: "recipes.sync-ttl".to_owned(),
+            reason,
+        })?;
+        validate_snapshot_policy(
+            "recipes.snapshot-before-apply",
+            &self.recipes.snapshot_before_apply,
+        )?;
+        Ok(())
+    }
+
     pub fn redacted(&self) -> RedactedConfig {
         RedactedConfig {
             pve: RedactedPveConfig {
-                url: self.pve.url.clone(),
+                url: redact_url(&self.pve.url),
                 token_id: self.pve.token_id.clone(),
                 token_secret: self
                     .pve
@@ -177,7 +247,10 @@ impl Config {
 
     pub fn redacted_pairs(&self) -> BTreeMap<String, String> {
         let mut values = BTreeMap::new();
-        values.insert("pve.url".to_owned(), optional_value(&self.pve.url));
+        values.insert(
+            "pve.url".to_owned(),
+            optional_value(&redact_url(&self.pve.url)),
+        );
         values.insert(
             "pve.token_id".to_owned(),
             optional_value(&self.pve.token_id),
@@ -232,13 +305,9 @@ impl Config {
     pub fn set_value(&mut self, key: &str, value: &str) -> Result<(), ConfigError> {
         match key {
             "pve.url" => {
-                if value.trim().is_empty() {
-                    return Err(ConfigError::InvalidValue {
-                        key: key.to_owned(),
-                        reason: "URL cannot be empty".to_owned(),
-                    });
-                }
-                self.pve.url = Some(value.to_owned());
+                validate_non_empty(key, value, "URL cannot be empty")?;
+                validate_pve_url(key, value)?;
+                self.pve.url = Some(value.trim().to_owned());
             }
             "pve.token_id" => {
                 if value.trim().is_empty() {
@@ -274,7 +343,7 @@ impl Config {
                 self.agent.port = parse_port(key, value)?;
             }
             "recipes.repository" => {
-                validate_non_empty(key, value, "recipe repository cannot be empty")?;
+                validate_repository_reference(key, value)?;
                 self.recipes.repository = value.to_owned();
             }
             "recipes.ref" => {
@@ -285,7 +354,10 @@ impl Config {
                 self.recipes.auto_sync = parse_bool(key, value)?;
             }
             "recipes.sync-ttl" => {
-                validate_non_empty(key, value, "recipe sync TTL cannot be empty")?;
+                parse_duration(value).map_err(|reason| ConfigError::InvalidValue {
+                    key: key.to_owned(),
+                    reason,
+                })?;
                 self.recipes.sync_ttl = value.to_owned();
             }
             "recipes.snapshot-before-apply" => {
@@ -379,12 +451,61 @@ impl Config {
 fn optional_value(value: &Option<String>) -> String {
     value.clone().unwrap_or_else(|| "<unset>".to_owned())
 }
+fn redact_url(value: &Option<String>) -> Option<String> {
+    let value = value.as_ref()?;
+    let Ok(mut parsed) = Url::parse(value) else {
+        return Some("<invalid>".to_owned());
+    };
+    if !parsed.username().is_empty() {
+        let _ = parsed.set_username("");
+    }
+    if parsed.password().is_some() {
+        let _ = parsed.set_password(None);
+    }
+    if parsed.query().is_some() {
+        parsed.set_query(None);
+    }
+    if parsed.fragment().is_some() {
+        parsed.set_fragment(None);
+    }
+    Some(parsed.to_string())
+}
 
 fn validate_non_empty(key: &str, value: &str, reason: &str) -> Result<(), ConfigError> {
     if value.trim().is_empty() {
         return Err(ConfigError::InvalidValue {
             key: key.to_owned(),
             reason: reason.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_pve_url(key: &str, value: &str) -> Result<(), ConfigError> {
+    if value != value.trim() {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_owned(),
+            reason: "URL must not have surrounding whitespace".to_owned(),
+        });
+    }
+    let parsed = Url::parse(value.trim()).map_err(|_| ConfigError::InvalidValue {
+        key: key.to_owned(),
+        reason: "URL must be a valid HTTPS URL".to_owned(),
+    })?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_owned(),
+            reason: "URL must use HTTPS and include a host".to_owned(),
+        });
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_owned(),
+            reason: "URL must not contain credentials, query, or fragment data".to_owned(),
         });
     }
     Ok(())
@@ -423,6 +544,42 @@ fn parse_port(key: &str, value: &str) -> Result<u16, ConfigError> {
         });
     }
     Ok(port)
+}
+
+fn validate_repository_reference(key: &str, value: &str) -> Result<(), ConfigError> {
+    validate_non_empty(key, value, "recipe repository cannot be empty")?;
+    if value.contains('?') || value.contains('#') {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_owned(),
+            reason: "recipe repository must not contain query or fragment data".to_owned(),
+        });
+    }
+    if let Some((scheme, authority_and_path)) = value.split_once("://") {
+        let scheme = scheme.to_ascii_lowercase();
+        if !matches!(scheme.as_str(), "https" | "ssh" | "file") {
+            return Err(ConfigError::InvalidValue {
+                key: key.to_owned(),
+                reason: "recipe repository URLs must use HTTPS, SSH, or file transport".to_owned(),
+            });
+        }
+        let authority = authority_and_path
+            .split(['/', '\\'])
+            .next()
+            .unwrap_or_default();
+        if authority.contains('@') {
+            return Err(ConfigError::InvalidValue {
+                key: key.to_owned(),
+                reason: "recipe repository URLs must not contain embedded credentials".to_owned(),
+            });
+        }
+        if scheme != "file" && authority.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                key: key.to_owned(),
+                reason: "recipe repository URL must include a host".to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -493,6 +650,7 @@ impl ConfigStore {
         let mut config = self.load_file()?;
         apply_environment(&mut config)?;
         config.apply_overrides(overrides)?;
+        config.validate()?;
         Ok(config)
     }
 
@@ -509,7 +667,11 @@ impl Default for ConfigStore {
 
 pub fn load_file(path: &Path) -> Result<Config, ConfigError> {
     match fs::read_to_string(path) {
-        Ok(contents) => Ok(toml::from_str(&contents)?),
+        Ok(contents) => {
+            let config: Config = toml::from_str(&contents)?;
+            config.validate()?;
+            Ok(config)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(source) => Err(ConfigError::Read {
             path: path.to_owned(),
@@ -519,11 +681,23 @@ pub fn load_file(path: &Path) -> Result<Config, ConfigError> {
 }
 
 pub fn save_file(path: &Path, config: &Config) -> Result<(), ConfigError> {
+    config.validate()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
             path: path.to_owned(),
             source,
         })?;
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(ConfigError::Write {
+            path: path.to_owned(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to write through a symbolic link",
+            ),
+        });
     }
     let contents = toml::to_string_pretty(config)?;
     fs::write(path, format!("{contents}\n")).map_err(|source| ConfigError::Write {
@@ -619,5 +793,65 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.pve.url.as_deref(), Some("https://cli.example"));
         let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn url_and_repository_transports_reject_credential_leaks_and_plain_http() {
+        let mut config = Config::default();
+        assert!(
+            config
+                .set_value("pve.url", "https://user:secret@pve.example")
+                .is_err()
+        );
+        assert!(
+            config
+                .set_value("recipes.repository", "http://example.test/recipes.git")
+                .is_err()
+        );
+        config.pve.url = Some("https://user:secret@pve.example".to_owned());
+        assert!(config.validate().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_rejects_symlinked_config_path() {
+        use std::os::unix::fs::symlink;
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let target = std::env::temp_dir().join(format!("pbox-config-target-{suffix}.toml"));
+        let link = std::env::temp_dir().join(format!("pbox-config-link-{suffix}.toml"));
+        fs::write(&target, "original\n").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let result = save_file(&link, &Config::default());
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original\n");
+        fs::remove_file(&link).unwrap();
+        fs::remove_file(&target).unwrap();
+    }
+
+    #[test]
+    fn duration_parser_accepts_units_and_rejects_invalid_values() {
+        assert_eq!(parse_duration("15m").unwrap(), Duration::from_secs(900));
+        assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7_200));
+        assert_eq!(parse_duration("3d").unwrap(), Duration::from_secs(259_200));
+        assert_eq!(parse_duration("30").unwrap(), Duration::from_secs(30));
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("15x").is_err());
+        assert!(parse_duration("xm").is_err());
+    }
+
+    #[test]
+    fn invalid_recipe_sync_ttl_is_rejected_when_setting_or_loading() {
+        let mut config = Config::default();
+        assert!(config.set_value("recipes.sync-ttl", "15x").is_err());
+
+        let path = temporary_path();
+        fs::write(&path, "[recipes]\nsync_ttl = \"15x\"\n").unwrap();
+        assert!(load_file(&path).is_err());
+        fs::remove_file(path).unwrap();
     }
 }

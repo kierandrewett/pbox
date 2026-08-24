@@ -7,11 +7,12 @@ pub mod vmid;
 
 pub use config::{
     AgentConfig, Config, ConfigError, ConfigOverrides, ConfigStore, PveConfig, RedactedConfig,
-    Secret,
+    Secret, parse_duration,
 };
 pub use id::{PboxId, PboxIdError};
 pub use metadata::{
-    MetadataError, PboxMetadata, encode_metadata, parse_metadata, preserve_metadata,
+    MetadataError, PboxMetadata, PboxRecipeProvenance, encode_metadata, parse_metadata,
+    preserve_metadata,
 };
 pub use pve::{
     ClusterResource, LxcConfig, LxcConfigUpdateRequest, LxcCreateRequest, LxcInterface, PveApi,

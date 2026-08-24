@@ -1157,6 +1157,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "time",
  "tokio",
 ]
 
@@ -1164,6 +1165,7 @@ dependencies = [
 name = "pbox-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "dirs",
  "rand 0.8.7",
  "reqwest",

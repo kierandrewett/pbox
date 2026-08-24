@@ -1,4 +1,5 @@
 use crate::PboxId;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -11,6 +12,21 @@ pub struct PboxMetadata {
     pub vmid: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recipes: Vec<PboxRecipeProvenance>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PboxRecipeProvenance {
+    pub id: String,
+    pub repository: String,
+    pub revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
 }
 
 impl PboxMetadata {
@@ -19,6 +35,8 @@ impl PboxMetadata {
             id,
             vmid,
             node: None,
+            recipes: Vec::new(),
+            capabilities: Vec::new(),
         }
     }
 
@@ -39,8 +57,9 @@ pub enum MetadataError {
 }
 
 pub fn encode_metadata(metadata: &PboxMetadata) -> Result<String, MetadataError> {
-    let json = serde_json::to_string(metadata)?;
-    Ok(format!("{MARKER_PREFIX} {json} {MARKER_SUFFIX}"))
+    let json = serde_json::to_vec(metadata)?;
+    let payload = URL_SAFE_NO_PAD.encode(json);
+    Ok(format!("{MARKER_PREFIX} {payload} {MARKER_SUFFIX}"))
 }
 
 pub fn parse_metadata(markdown: &str) -> Result<Option<PboxMetadata>, MetadataError> {
@@ -100,12 +119,15 @@ fn marker_spans(markdown: &str) -> Result<Vec<(usize, usize)>, MetadataError> {
 
 fn parse_span(markdown: &str, (start, end): (usize, usize)) -> Result<PboxMetadata, MetadataError> {
     let marker = &markdown[start..end];
-    let json = marker
+    let payload = marker
         .strip_prefix(MARKER_PREFIX)
         .and_then(|value| value.strip_suffix(MARKER_SUFFIX))
         .map(str::trim)
         .unwrap_or_default();
-    Ok(serde_json::from_str(json)?)
+    if let Ok(decoded) = URL_SAFE_NO_PAD.decode(payload) {
+        return Ok(serde_json::from_slice(&decoded)?);
+    }
+    Ok(serde_json::from_str(payload)?)
 }
 
 #[cfg(test)]
@@ -114,10 +136,20 @@ mod tests {
 
     #[test]
     fn metadata_round_trips_and_preserves_notes() {
-        let metadata =
+        let mut metadata =
             PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9000).with_node("pve-a");
+        metadata.recipes.push(PboxRecipeProvenance {
+            id: "desktop/xfce".to_owned(),
+            repository: "https://github.com/kierandrewett/pbox-recipes.git".to_owned(),
+            revision: "abc123".to_owned(),
+            applied_at: None,
+            result: None,
+        });
+        metadata.capabilities.push("desktop".to_owned());
+        metadata.capabilities.push("contains --> safely".to_owned());
         let markdown = "User note\n\nKeep this text.";
         let encoded = preserve_metadata(markdown, &metadata).unwrap();
+        assert_eq!(encoded.matches(MARKER_SUFFIX).count(), 1);
         assert!(encoded.contains("User note"));
         assert_eq!(parse_metadata(&encoded).unwrap(), Some(metadata));
     }

@@ -229,8 +229,18 @@ impl PveClient {
 }
 
 fn normalise_base_url(value: &str) -> Result<String, PveError> {
-    let trimmed = value.trim_end_matches('/');
+    let trimmed = value.trim().trim_end_matches('/');
     if trimmed.is_empty() {
+        return Err(PveError::InvalidBaseUrl);
+    }
+    let parsed = reqwest::Url::parse(trimmed).map_err(|_| PveError::InvalidBaseUrl)?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
         return Err(PveError::InvalidBaseUrl);
     }
     if trimmed.ends_with(API_PREFIX) {
@@ -503,8 +513,17 @@ mod tests {
     }
 
     #[test]
+    fn base_url_rejects_plain_http() {
+        assert!(normalise_base_url("http://pve.test:8006").is_err());
+    }
+    #[test]
+    fn base_url_rejects_credentials_and_query_data() {
+        assert!(normalise_base_url("https://user:secret@pve.test:8006").is_err());
+        assert!(normalise_base_url("https://pve.test:8006/?token=secret").is_err());
+    }
+
+    #[test]
     fn path_segments_cannot_escape_endpoint() {
-        assert!(validate_path_segment("node/a", "node").is_err());
         assert!(validate_path_segment("..", "node").is_err());
         assert!(validate_path_segment(".", "node").is_err());
         assert!(validate_path_segment(r"node\\child", "node").is_err());

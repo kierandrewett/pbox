@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use pbox_agent_client::AgentClient;
 use pbox_crypto::{CertificateMaterial, CertificatePurpose, issue_certificate};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -18,23 +18,27 @@ pub struct BootstrapKey {
     private_key: PathBuf,
     known_hosts: PathBuf,
     public_key: String,
+    host_key_alias: String,
 }
 
 impl BootstrapKey {
     pub fn generate(box_id: &str) -> Result<Self> {
         let state_root = dirs::state_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("pbox")
-            .join("operations");
-        fs::create_dir_all(&state_root).context("create pbox operation state directory")?;
-        set_mode(&state_root, 0o700).context("restrict pbox operation state directory")?;
+            .join("pbox");
+        let operations_root = state_root.join("operations");
+        fs::create_dir_all(&operations_root).context("create pbox operation state directory")?;
+        set_mode(&state_root, 0o700).context("restrict pbox state directory")?;
+        set_mode(&operations_root, 0o700).context("restrict pbox operation state directory")?;
+        let known_hosts = state_root.join("known_hosts");
+        ensure_known_hosts_file(&known_hosts)?;
 
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("read system clock")?
             .as_nanos();
         let directory =
-            state_root.join(format!("bootstrap-{box_id}-{}-{stamp}", std::process::id()));
+            operations_root.join(format!("bootstrap-{box_id}-{}-{stamp}", std::process::id()));
         fs::create_dir(&directory).with_context(|| {
             format!(
                 "create bootstrap operation directory {}",
@@ -80,12 +84,12 @@ impl BootstrapKey {
             let _ = fs::remove_dir_all(&directory);
             bail!("ssh-keygen returned an unexpected public key format");
         }
-        let known_hosts = directory.join("known_hosts");
         Ok(Self {
             directory,
             private_key,
             known_hosts,
             public_key,
+            host_key_alias: format!("pbox-{box_id}"),
         })
     }
 
@@ -330,6 +334,8 @@ impl<'a> SshSession<'a> {
             "-o".to_owned(),
             format!("UserKnownHostsFile={}", self.key.known_hosts.display()),
             "-o".to_owned(),
+            format!("HostKeyAlias={}", self.key.host_key_alias),
+            "-o".to_owned(),
             format!("ConnectTimeout={SSH_CONNECT_TIMEOUT}"),
             "-o".to_owned(),
             "LogLevel=ERROR".to_owned(),
@@ -351,6 +357,37 @@ fn ensure_success(output: Output, operation: &str) -> Result<Output> {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn ensure_known_hosts_file(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!(
+                "pbox known-hosts file must not be a symbolic link: {}",
+                path.display()
+            );
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            bail!(
+                "pbox known-hosts path is not a regular file: {}",
+                path.display()
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .with_context(|| format!("create pbox known-hosts file {}", path.display()))?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect pbox known-hosts file {}", path.display()));
+        }
+    }
+    set_mode(path, 0o600)
+        .with_context(|| format!("restrict pbox known-hosts file {}", path.display()))
 }
 
 fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
