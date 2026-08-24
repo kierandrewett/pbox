@@ -70,9 +70,35 @@ impl Default for AgentConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct RecipeConfig {
+    pub repository: String,
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub auto_sync: bool,
+    pub sync_ttl: String,
+    pub snapshot_before_apply: String,
+    pub rollback_on_failure: bool,
+}
+
+impl Default for RecipeConfig {
+    fn default() -> Self {
+        Self {
+            repository: "https://github.com/kierandrewett/pbox-recipes.git".to_owned(),
+            reference: "main".to_owned(),
+            auto_sync: true,
+            sync_ttl: "15m".to_owned(),
+            snapshot_before_apply: "auto".to_owned(),
+            rollback_on_failure: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Config {
     pub pve: PveConfig,
     pub agent: AgentConfig,
+    pub recipes: RecipeConfig,
     pub vmid_pattern: VmidPattern,
 }
 
@@ -81,6 +107,7 @@ impl Default for Config {
         Self {
             pve: PveConfig::default(),
             agent: AgentConfig::default(),
+            recipes: RecipeConfig::default(),
             vmid_pattern: VmidPattern::parse("9xxx").expect("default VMID pattern is valid"),
         }
     }
@@ -101,9 +128,21 @@ pub struct RedactedAgentConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RedactedRecipeConfig {
+    pub repository: String,
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub auto_sync: bool,
+    pub sync_ttl: String,
+    pub snapshot_before_apply: String,
+    pub rollback_on_failure: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RedactedConfig {
     pub pve: RedactedPveConfig,
     pub agent: RedactedAgentConfig,
+    pub recipes: RedactedRecipeConfig,
     pub vmid_pattern: VmidPattern,
 }
 
@@ -123,6 +162,14 @@ impl Config {
             agent: RedactedAgentConfig {
                 binary: self.agent.binary.clone(),
                 port: self.agent.port,
+            },
+            recipes: RedactedRecipeConfig {
+                repository: self.recipes.repository.clone(),
+                reference: self.recipes.reference.clone(),
+                auto_sync: self.recipes.auto_sync,
+                sync_ttl: self.recipes.sync_ttl.clone(),
+                snapshot_before_apply: self.recipes.snapshot_before_apply.clone(),
+                rollback_on_failure: self.recipes.rollback_on_failure,
             },
             vmid_pattern: self.vmid_pattern.clone(),
         }
@@ -156,6 +203,24 @@ impl Config {
                 .unwrap_or_else(|| "<unset>".to_owned()),
         );
         values.insert("agent.port".to_owned(), self.agent.port.to_string());
+        values.insert(
+            "recipes.repository".to_owned(),
+            self.recipes.repository.clone(),
+        );
+        values.insert("recipes.ref".to_owned(), self.recipes.reference.clone());
+        values.insert(
+            "recipes.auto-sync".to_owned(),
+            self.recipes.auto_sync.to_string(),
+        );
+        values.insert("recipes.sync-ttl".to_owned(), self.recipes.sync_ttl.clone());
+        values.insert(
+            "recipes.snapshot-before-apply".to_owned(),
+            self.recipes.snapshot_before_apply.clone(),
+        );
+        values.insert(
+            "recipes.rollback-on-failure".to_owned(),
+            self.recipes.rollback_on_failure.to_string(),
+        );
         values.insert("vmid_pattern".to_owned(), self.vmid_pattern.to_string());
         values
     }
@@ -208,6 +273,28 @@ impl Config {
             "agent.port" => {
                 self.agent.port = parse_port(key, value)?;
             }
+            "recipes.repository" => {
+                validate_non_empty(key, value, "recipe repository cannot be empty")?;
+                self.recipes.repository = value.to_owned();
+            }
+            "recipes.ref" => {
+                validate_non_empty(key, value, "recipe reference cannot be empty")?;
+                self.recipes.reference = value.to_owned();
+            }
+            "recipes.auto-sync" => {
+                self.recipes.auto_sync = parse_bool(key, value)?;
+            }
+            "recipes.sync-ttl" => {
+                validate_non_empty(key, value, "recipe sync TTL cannot be empty")?;
+                self.recipes.sync_ttl = value.to_owned();
+            }
+            "recipes.snapshot-before-apply" => {
+                validate_snapshot_policy(key, value)?;
+                self.recipes.snapshot_before_apply = value.to_owned();
+            }
+            "recipes.rollback-on-failure" => {
+                self.recipes.rollback_on_failure = parse_bool(key, value)?;
+            }
             "vmid_pattern" => {
                 self.vmid_pattern =
                     value
@@ -229,6 +316,16 @@ impl Config {
             "pve.tls_insecure" => self.pve.tls_insecure = false,
             "agent.binary" => self.agent.binary = None,
             "agent.port" => self.agent.port = AgentConfig::default().port,
+            "recipes.repository" => self.recipes.repository = RecipeConfig::default().repository,
+            "recipes.ref" => self.recipes.reference = RecipeConfig::default().reference,
+            "recipes.auto-sync" => self.recipes.auto_sync = RecipeConfig::default().auto_sync,
+            "recipes.sync-ttl" => self.recipes.sync_ttl = RecipeConfig::default().sync_ttl,
+            "recipes.snapshot-before-apply" => {
+                self.recipes.snapshot_before_apply = RecipeConfig::default().snapshot_before_apply
+            }
+            "recipes.rollback-on-failure" => {
+                self.recipes.rollback_on_failure = RecipeConfig::default().rollback_on_failure
+            }
             "vmid_pattern" => self.vmid_pattern = Config::default().vmid_pattern,
             _ => return Err(ConfigError::UnknownKey(key.to_owned())),
         }
@@ -254,6 +351,24 @@ impl Config {
         if let Some(value) = &overrides.agent_port {
             self.set_value("agent.port", value)?;
         }
+        if let Some(value) = &overrides.recipes_repository {
+            self.set_value("recipes.repository", value)?;
+        }
+        if let Some(value) = &overrides.recipes_reference {
+            self.set_value("recipes.ref", value)?;
+        }
+        if let Some(value) = &overrides.recipes_auto_sync {
+            self.recipes.auto_sync = *value;
+        }
+        if let Some(value) = &overrides.recipes_sync_ttl {
+            self.set_value("recipes.sync-ttl", value)?;
+        }
+        if let Some(value) = &overrides.recipes_snapshot_before_apply {
+            self.set_value("recipes.snapshot-before-apply", value)?;
+        }
+        if let Some(value) = &overrides.recipes_rollback_on_failure {
+            self.recipes.rollback_on_failure = *value;
+        }
         if let Some(value) = &overrides.vmid_pattern {
             self.set_value("vmid_pattern", value)?;
         }
@@ -263,6 +378,26 @@ impl Config {
 
 fn optional_value(value: &Option<String>) -> String {
     value.clone().unwrap_or_else(|| "<unset>".to_owned())
+}
+
+fn validate_non_empty(key: &str, value: &str, reason: &str) -> Result<(), ConfigError> {
+    if value.trim().is_empty() {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_owned(),
+            reason: reason.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_snapshot_policy(key: &str, value: &str) -> Result<(), ConfigError> {
+    if matches!(value, "auto" | "always" | "never") {
+        return Ok(());
+    }
+    Err(ConfigError::InvalidValue {
+        key: key.to_owned(),
+        reason: "expected auto, always, or never".to_owned(),
+    })
 }
 
 fn parse_bool(key: &str, value: &str) -> Result<bool, ConfigError> {
@@ -298,6 +433,12 @@ pub struct ConfigOverrides {
     pub pve_tls_insecure: Option<bool>,
     pub agent_binary: Option<String>,
     pub agent_port: Option<String>,
+    pub recipes_repository: Option<String>,
+    pub recipes_reference: Option<String>,
+    pub recipes_auto_sync: Option<bool>,
+    pub recipes_sync_ttl: Option<String>,
+    pub recipes_snapshot_before_apply: Option<String>,
+    pub recipes_rollback_on_failure: Option<bool>,
     pub vmid_pattern: Option<String>,
 }
 
@@ -413,6 +554,19 @@ fn apply_environment(config: &mut Config) -> Result<(), ConfigError> {
             }
             "PBOX_AGENT_BINARY" => overrides.agent_binary = Some(value),
             "PBOX_AGENT_PORT" => overrides.agent_port = Some(value),
+            "PBOX_RECIPES_REPOSITORY" => overrides.recipes_repository = Some(value),
+            "PBOX_RECIPES_REF" => overrides.recipes_reference = Some(value),
+            "PBOX_RECIPES_AUTO_SYNC" => {
+                overrides.recipes_auto_sync = Some(parse_bool("PBOX_RECIPES_AUTO_SYNC", &value)?)
+            }
+            "PBOX_RECIPES_SYNC_TTL" => overrides.recipes_sync_ttl = Some(value),
+            "PBOX_RECIPES_SNAPSHOT_BEFORE_APPLY" => {
+                overrides.recipes_snapshot_before_apply = Some(value)
+            }
+            "PBOX_RECIPES_ROLLBACK_ON_FAILURE" => {
+                overrides.recipes_rollback_on_failure =
+                    Some(parse_bool("PBOX_RECIPES_ROLLBACK_ON_FAILURE", &value)?)
+            }
             "PBOX_VMID_PATTERN" => overrides.vmid_pattern = Some(value),
             _ => {}
         }
