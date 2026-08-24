@@ -169,6 +169,10 @@ pub fn server_subject(box_id: &str) -> Result<String, CryptoError> {
 pub fn server_dns_name(box_id: &str) -> Result<String, CryptoError> {
     server_subject(box_id).map(|_| format!("pbox-{box_id}"))
 }
+/// Build the URI subject used for short-lived client certificates.
+pub fn client_subject(seed: &ContextSeed) -> String {
+    format!("pbox.cwd.dev/context/{}/client", context_fingerprint(seed))
+}
 
 /// Check that a PEM certificate contains the expected DNS subject alternative name.
 pub fn certificate_has_dns_name(
@@ -238,6 +242,14 @@ mod tests {
         assert_eq!(first, second);
         assert_ne!(first, other);
         assert_eq!(context_fingerprint(&first), context_fingerprint(&second));
+    }
+    #[test]
+    fn client_subject_is_bound_to_context_seed() {
+        let seed = derive_context_seed("pbox@pve!cli", "secret");
+        assert_eq!(
+            client_subject(&seed),
+            format!("pbox.cwd.dev/context/{}/client", context_fingerprint(&seed))
+        );
     }
 
     #[test]
