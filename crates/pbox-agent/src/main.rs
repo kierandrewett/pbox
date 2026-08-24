@@ -402,11 +402,13 @@ async fn run_piped_command(
         false,
         output_failure.clone(),
     ));
-    let (status, input_error) =
+    let (status, input_error, input_finished) =
         wait_for_child_with_input(&mut child, &sender, &mut input_task, true, &output_failure)
             .await;
-    input_task.abort();
-    let _ = input_task.await;
+    if !input_finished {
+        input_task.abort();
+        let _ = input_task.await;
+    }
     await_output_task(stdout_task).await;
     await_output_task(stderr_task).await;
     if let Some(error) = input_error {
@@ -494,11 +496,13 @@ async fn run_pty_command(
         true,
         output_failure.clone(),
     ));
-    let (status, input_error) =
+    let (status, input_error, input_finished) =
         wait_for_child_with_input(&mut child, &sender, &mut input_task, true, &output_failure)
             .await;
-    input_task.abort();
-    let _ = input_task.await;
+    if !input_finished {
+        input_task.abort();
+        let _ = input_task.await;
+    }
     await_output_task(output_task).await;
     if let Some(error) = input_error {
         let _ = tokio::time::timeout(EXEC_OUTPUT_DRAIN_TIMEOUT, sender.send(Err(error))).await;
@@ -653,24 +657,30 @@ async fn wait_for_child_with_input(
     input_task: &mut tokio::task::JoinHandle<Result<(), Status>>,
     process_group: bool,
     output_failure: &Notify,
-) -> (std::io::Result<std::process::ExitStatus>, Option<Status>) {
+) -> (
+    std::io::Result<std::process::ExitStatus>,
+    Option<Status>,
+    bool,
+) {
     tokio::select! {
-        status = wait_for_child(child, sender, process_group, output_failure) => (status, None),
+        status = wait_for_child(child, sender, process_group, output_failure) => (status, None, false),
         input_result = &mut *input_task => {
             match input_result {
                 Ok(Ok(())) => (
                     wait_for_child(child, sender, process_group, output_failure).await,
                     None,
+                    true,
                 ),
                 Ok(Err(error)) => {
                     terminate_child(child, process_group).await;
-                    (child.wait().await, Some(error))
+                    (child.wait().await, Some(error), true)
                 }
                 Err(error) => {
                     terminate_child(child, process_group).await;
                     (
                         child.wait().await,
                         Some(Status::internal(format!("stdin task failed: {error}"))),
+                        true,
                     )
                 }
             }
@@ -756,9 +766,13 @@ async fn send_output<R>(
     }
 }
 async fn await_output_task(mut task: tokio::task::JoinHandle<()>) {
-    let _ = tokio::time::timeout(EXEC_OUTPUT_DRAIN_TIMEOUT, &mut task).await;
-    task.abort();
-    let _ = task.await;
+    if tokio::time::timeout(EXEC_OUTPUT_DRAIN_TIMEOUT, &mut task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 struct TemporaryFileCleanup {
@@ -1140,5 +1154,10 @@ mod tests {
     fn safe_mode_strips_special_permission_bits() {
         assert_eq!(safe_mode(0o10755), 0o755);
         assert_eq!(safe_mode(0o100644), 0o644);
+    }
+
+    #[tokio::test]
+    async fn completed_output_task_cleanup_does_not_poll_handle_twice() {
+        await_output_task(tokio::spawn(async {})).await;
     }
 }
