@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package pbox.cwd.dev.agent.v1;
+
+service Agent {
+  rpc Info(InfoRequest) returns (InfoResponse);
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc Exec(ExecRequest) returns (stream ExecEvent);
+  rpc PutFile(stream FileChunk) returns (FileResult);
+  rpc GetFile(GetFileRequest) returns (stream FileChunk);
+  rpc Forward(stream ForwardEvent) returns (stream ForwardEvent);
+}
+
+message InfoRequest {}
+
+message InfoResponse {
+  uint32 protocol_version = 1;
+  string agent_version = 2;
+  string box_id = 3;
+  string os_id = 4;
+  string os_version = 5;
+  string architecture = 6;
+  repeated string capabilities = 7;
+}
+
+message PingRequest {
+  uint32 protocol_version = 1;
+}
+
+message PingResponse {
+  uint32 protocol_version = 1;
+  string box_id = 2;
+}
+
+message ExecRequest {
+  uint32 protocol_version = 1;
+  repeated string argv = 2;
+  string cwd = 3;
+  map<string, string> env = 4;
+  string user = 5;
+  bool allocate_pty = 6;
+}
+
+message ExecEvent {
+  oneof event {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    ExecExit exit = 3;
+  }
+}
+
+message ExecExit {
+  int32 code = 1;
+  int32 signal = 2;
+}
+
+message FileChunk {
+  string path = 1;
+  uint32 mode = 2;
+  uint32 uid = 3;
+  uint32 gid = 4;
+  bool atomic_write = 5;
+  bytes data = 6;
+  bool eof = 7;
+}
+
+message GetFileRequest {
+  uint32 protocol_version = 1;
+  string path = 2;
+}
+
+message FileResult {
+  uint64 size = 1;
+  string digest = 2;
+}
+
+message ForwardEvent {
+  oneof event {
+    ForwardOpen open = 1;
+    bytes data = 2;
+    ForwardClose close = 3;
+  }
+}
+
+message ForwardOpen {
+  uint32 protocol_version = 1;
+  string host = 2;
+  uint32 port = 3;
+}
+
+message ForwardClose {
+  uint32 code = 1;
+}
