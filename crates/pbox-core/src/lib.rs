@@ -13,7 +13,7 @@ pub use metadata::{
     MetadataError, PboxMetadata, encode_metadata, parse_metadata, preserve_metadata,
 };
 pub use pve::{
-    ClusterResource, LxcConfig, PveApi, PveClient, PveClientConfig, PveError, PveTaskResponse,
-    PveTaskStatus,
+    ClusterResource, LxcConfig, LxcConfigUpdateRequest, LxcCreateRequest, PveApi, PveClient,
+    PveClientConfig, PveError, PveTaskResponse, PveTaskStatus,
 };
 pub use vmid::{VmidError, VmidPattern};
