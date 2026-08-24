@@ -12,8 +12,11 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 anyhow.workspace = true
+ipnet.workspace = true
 pbox-proto = { path = "../pbox-proto" }
+pbox-crypto = { path = "../pbox-crypto" }
 sha2.workspace = true
+nix.workspace = true
 tonic.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true

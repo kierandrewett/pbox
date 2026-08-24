@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use ipnet::IpNet;
+use nix::libc;
 use pbox_proto::PROTOCOL_VERSION as PROTOCOL;
 use pbox_proto::agent::agent_server::{Agent, AgentServer};
 use pbox_proto::agent::{
@@ -8,17 +10,29 @@ use pbox_proto::agent::{
     forward_event,
 };
 use sha2::{Digest, Sha256};
+use std::net::IpAddr;
+use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
+const MAX_FILE_SIZE: u64 = 64 * 1024 * 1024;
+const FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const FORWARD_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const FORWARD_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const EXEC_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_UPLOAD_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Parser)]
@@ -34,13 +48,22 @@ struct Args {
     private_key: PathBuf,
     #[arg(long)]
     client_ca: PathBuf,
+    #[arg(
+        long = "forward-allow",
+        value_delimiter = ',',
+        default_value = "127.0.0.0/8,::1/128"
+    )]
+    forward_allow: Vec<IpNet>,
+    #[arg(long, default_value_t = 32)]
+    max_exec: usize,
 }
 
 #[derive(Clone)]
 struct AgentService {
     box_id: String,
+    forward_allow: Vec<IpNet>,
+    exec_slots: Arc<Semaphore>,
 }
-
 #[tonic::async_trait]
 impl Agent for AgentService {
     type ExecStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<ExecEvent, Status>> + Send>>;
@@ -75,21 +98,21 @@ impl Agent for AgentService {
 
     async fn exec(
         &self,
-        request: Request<ExecRequest>,
+        request: Request<Streaming<ExecRequest>>,
     ) -> Result<Response<Self::ExecStream>, Status> {
-        let request = request.into_inner();
-        if request.protocol_version != PROTOCOL {
-            return Err(Status::failed_precondition(
-                "unsupported agent protocol version",
-            ));
-        }
-        if request.argv.is_empty() || request.argv[0].is_empty() {
-            return Err(Status::invalid_argument(
-                "argv must contain at least one command",
-            ));
-        }
+        let mut requests = request.into_inner();
+        let first = requests
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("exec stream is empty"))?;
+        validate_exec_request(&first)?;
+        let permit = self
+            .exec_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("too many concurrent exec requests"))?;
         let (sender, receiver) = mpsc::channel(16);
-        tokio::spawn(run_command(request, sender));
+        tokio::spawn(run_command(first, requests, sender, permit));
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 
@@ -102,42 +125,16 @@ impl Agent for AgentService {
             .message()
             .await?
             .ok_or_else(|| Status::invalid_argument("file stream is empty"))?;
+        if first.protocol_version != PROTOCOL {
+            return Err(Status::failed_precondition(
+                "unsupported agent protocol version",
+            ));
+        }
         let path = safe_path(&first.path)?;
         let temporary_path = temporary_path(&path);
-        let mut file = tokio::fs::File::create(&temporary_path)
+        receive_upload(&mut stream, first, &temporary_path, &path)
             .await
-            .map_err(internal_io)?;
-        let mut size = 0u64;
-        let mut hasher = Sha256::new();
-        write_chunk(&mut file, &first, &mut size, &mut hasher).await?;
-        while let Some(chunk) = stream.message().await? {
-            write_chunk(&mut file, &chunk, &mut size, &mut hasher).await?;
-            if chunk.eof {
-                break;
-            }
-        }
-        file.flush().await.map_err(internal_io)?;
-        drop(file);
-        if first.atomic_write {
-            tokio::fs::rename(&temporary_path, &path)
-                .await
-                .map_err(internal_io)?;
-        } else {
-            tokio::fs::copy(&temporary_path, &path)
-                .await
-                .map_err(internal_io)?;
-            let _ = tokio::fs::remove_file(&temporary_path).await;
-        }
-        if first.mode != 0 {
-            let mode = first.mode;
-            tokio::task::spawn_blocking(move || set_mode(&path, mode))
-                .await
-                .map_err(|error| Status::internal(error.to_string()))??;
-        }
-        Ok(Response::new(FileResult {
-            size,
-            digest: hex_digest(hasher.finalize()),
-        }))
+            .map(Response::new)
     }
 
     async fn get_file(
@@ -173,60 +170,108 @@ impl Agent for AgentService {
                 "forward stream must start with open",
             ));
         };
-        if open.protocol_version != PROTOCOL
-            || open.host.is_empty()
-            || open.port == 0
-            || open.port > u16::MAX as u32
-        {
+        if open.protocol_version != PROTOCOL {
+            return Err(Status::failed_precondition(
+                "unsupported agent protocol version",
+            ));
+        }
+        if open.host.is_empty() || open.port == 0 || open.port > u16::MAX as u32 {
             return Err(Status::invalid_argument("invalid forward target"));
         }
-        let socket = TcpStream::connect((open.host.as_str(), open.port as u16))
+        let port = open.port as u16;
+        let addresses = tokio::time::timeout(
+            FORWARD_CONNECT_TIMEOUT,
+            tokio::net::lookup_host((open.host.as_str(), port)),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("forward target lookup timed out"))?
+        .map_err(|error| Status::unavailable(format!("resolve forward target: {error}")))?
+        .collect::<Vec<_>>();
+        let target = addresses
+            .into_iter()
+            .find(|address| is_forward_address_allowed(&self.forward_allow, address.ip()))
+            .ok_or_else(|| Status::permission_denied("forward target is not allowed"))?;
+        let socket = tokio::time::timeout(FORWARD_CONNECT_TIMEOUT, TcpStream::connect(target))
             .await
+            .map_err(|_| Status::deadline_exceeded("connect forward target timed out"))?
             .map_err(|error| Status::unavailable(format!("connect forward target: {error}")))?;
         let (mut reader, mut writer) = socket.into_split();
         let (sender, receiver) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut buffer = [0u8; 8192];
+            let mut close_code = 0;
             loop {
                 tokio::select! {
-                    message = inbound.message() => {
-                        match message {
-                            Ok(Some(event)) => match event.event {
-                                Some(forward_event::Event::Data(data)) => {
-                                    if writer.write_all(&data).await.is_err() {
+                    message = tokio::time::timeout(FORWARD_IDLE_TIMEOUT, inbound.message()) => {
+                        let message = match message {
+                            Ok(Ok(Some(message))) => message,
+                            Ok(Ok(None)) => {
+                                close_code = 1;
+                                break;
+                            }
+                            Ok(Err(_)) => {
+                                close_code = 1;
+                                break;
+                            }
+                            Err(_) => {
+                                close_code = 2;
+                                break;
+                            }
+                        };
+                        match message.event {
+                            Some(forward_event::Event::Data(data)) => {
+                                match tokio::time::timeout(FORWARD_WRITE_TIMEOUT, writer.write_all(&data)).await {
+                                    Ok(Ok(())) => {}
+                                    _ => {
+                                        close_code = 1;
                                         break;
                                     }
                                 }
-                                Some(forward_event::Event::Close(_)) | None => break,
-                                Some(forward_event::Event::Open(_)) => {}
-                            },
-                            _ => break,
+                            }
+                            Some(forward_event::Event::Close(close)) => {
+                                close_code = close.code;
+                                break;
+                            }
+                            Some(forward_event::Event::Open(_)) | None => {
+                                close_code = 1;
+                                break;
+                            }
                         }
                     }
-                    result = reader.read(&mut buffer) => {
+                    result = tokio::time::timeout(FORWARD_IDLE_TIMEOUT, reader.read(&mut buffer)) => {
                         match result {
-                            Ok(0) => break,
-                            Ok(size) => {
-                                if sender
-                                    .send(Ok(ForwardEvent {
-                                        event: Some(forward_event::Event::Data(
-                                            buffer[..size].to_vec(),
-                                        )),
-                                    }))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
+                            Ok(Ok(0)) => break,
+                            Ok(Ok(size)) => {
+                                let event = Ok(ForwardEvent {
+                                    event: Some(forward_event::Event::Data(
+                                        buffer[..size].to_vec(),
+                                    )),
+                                });
+                                if !matches!(
+                                    tokio::time::timeout(FORWARD_IDLE_TIMEOUT, sender.send(event))
+                                        .await,
+                                    Ok(Ok(()))
+                                ) {
+                                    return;
                                 }
                             }
-                            Err(_) => break,
+                            Ok(Err(_)) => {
+                                close_code = 1;
+                                break;
+                            }
+                            Err(_) => {
+                                close_code = 2;
+                                break;
+                            }
                         }
                     }
                 }
             }
             let _ = sender
                 .send(Ok(ForwardEvent {
-                    event: Some(forward_event::Event::Close(ForwardClose { code: 0 })),
+                    event: Some(forward_event::Event::Close(ForwardClose {
+                        code: close_code,
+                    })),
                 }))
                 .await;
         });
@@ -234,27 +279,44 @@ impl Agent for AgentService {
     }
 }
 
-async fn run_command(request: ExecRequest, sender: mpsc::Sender<Result<ExecEvent, Status>>) {
-    let mut command = if request.user.is_empty() || request.user == "root" {
-        let mut command = Command::new(&request.argv[0]);
-        command.args(&request.argv[1..]);
-        command
-    } else {
-        let mut command = Command::new("sudo");
-        command
-            .arg("-n")
-            .arg("-u")
-            .arg(&request.user)
-            .arg("--")
-            .arg(&request.argv[0]);
-        command.args(&request.argv[1..]);
-        command
-    };
-    if !request.cwd.is_empty() {
-        command.current_dir(request.cwd);
+fn validate_exec_request(request: &ExecRequest) -> Result<(), Status> {
+    if request.protocol_version != PROTOCOL {
+        return Err(Status::failed_precondition(
+            "unsupported agent protocol version",
+        ));
     }
-    command.envs(request.env);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if request.argv.is_empty() || request.argv[0].is_empty() {
+        return Err(Status::invalid_argument(
+            "argv must contain at least one command",
+        ));
+    }
+    Ok(())
+}
+
+async fn run_command(
+    request: ExecRequest,
+    requests: Streaming<ExecRequest>,
+    sender: mpsc::Sender<Result<ExecEvent, Status>>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    if request.allocate_pty {
+        run_pty_command(request, requests, sender).await;
+    } else {
+        run_piped_command(request, requests, sender).await;
+    }
+}
+
+async fn run_piped_command(
+    request: ExecRequest,
+    requests: Streaming<ExecRequest>,
+    sender: mpsc::Sender<Result<ExecEvent, Status>>,
+) {
+    let mut command = command_for_request(&request);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    set_process_group(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -264,20 +326,271 @@ async fn run_command(request: ExecRequest, sender: mpsc::Sender<Result<ExecEvent
             return;
         }
     };
+    let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let stdout_task = tokio::spawn(send_output(stdout, sender.clone(), true));
-    let stderr_task = tokio::spawn(send_output(stderr, sender.clone(), false));
-    let status = child.wait().await;
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
+    let mut input_task = tokio::spawn(forward_stdin(
+        requests,
+        stdin,
+        request.stdin,
+        request.stdin_eof,
+    ));
+    let stdout_task = tokio::spawn(send_output(stdout, sender.clone(), true, false));
+    let stderr_task = tokio::spawn(send_output(stderr, sender.clone(), false, false));
+    let (status, input_error) =
+        wait_for_child_with_input(&mut child, &sender, &mut input_task, true).await;
+    input_task.abort();
+    let _ = input_task.await;
+    await_output_task(stdout_task).await;
+    await_output_task(stderr_task).await;
+    if let Some(error) = input_error {
+        let _ = tokio::time::timeout(EXEC_OUTPUT_DRAIN_TIMEOUT, sender.send(Err(error))).await;
+    } else {
+        let _ = tokio::time::timeout(EXEC_OUTPUT_DRAIN_TIMEOUT, send_exit(status, sender)).await;
+    }
+}
+
+async fn run_pty_command(
+    request: ExecRequest,
+    requests: Streaming<ExecRequest>,
+    sender: mpsc::Sender<Result<ExecEvent, Status>>,
+) {
+    let pty = match nix::pty::openpty(None, None) {
+        Ok(pty) => pty,
+        Err(error) => {
+            let _ = sender
+                .send(Err(Status::internal(format!("create PTY: {error}"))))
+                .await;
+            return;
+        }
+    };
+    let slave = std::fs::File::from(pty.slave);
+    let slave_fd = slave.as_raw_fd();
+    let slave_stdout = match slave.try_clone() {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = sender.send(Err(internal_io(error))).await;
+            return;
+        }
+    };
+    let slave_stderr = match slave.try_clone() {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = sender.send(Err(internal_io(error))).await;
+            return;
+        }
+    };
+    let mut command = command_for_request(&request);
+    command
+        .stdin(Stdio::from(slave))
+        .stdout(Stdio::from(slave_stdout))
+        .stderr(Stdio::from(slave_stderr));
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let master = std::fs::File::from(pty.master);
+    let master_reader = match master.try_clone() {
+        Ok(file) => tokio::fs::File::from_std(file),
+        Err(error) => {
+            let _ = sender.send(Err(internal_io(error))).await;
+            return;
+        }
+    };
+    let master_writer = tokio::fs::File::from_std(master);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = sender
+                .send(Err(Status::internal(format!("spawn PTY command: {error}"))))
+                .await;
+            return;
+        }
+    };
+    let mut input_task = tokio::spawn(forward_stdin(
+        requests,
+        Some(master_writer),
+        request.stdin,
+        request.stdin_eof,
+    ));
+    let output_task = tokio::spawn(send_output(Some(master_reader), sender.clone(), true, true));
+    let (status, input_error) =
+        wait_for_child_with_input(&mut child, &sender, &mut input_task, true).await;
+    input_task.abort();
+    let _ = input_task.await;
+    await_output_task(output_task).await;
+    if let Some(error) = input_error {
+        let _ = tokio::time::timeout(EXEC_OUTPUT_DRAIN_TIMEOUT, sender.send(Err(error))).await;
+    } else {
+        let _ = tokio::time::timeout(EXEC_OUTPUT_DRAIN_TIMEOUT, send_exit(status, sender)).await;
+    }
+}
+
+fn command_for_request(request: &ExecRequest) -> Command {
+    let requested_user = if request.user.is_empty() {
+        "pbox"
+    } else {
+        request.user.as_str()
+    };
+    let mut command = if requested_user == "root" {
+        let mut command = Command::new(&request.argv[0]);
+        command.args(&request.argv[1..]);
+        command
+    } else {
+        let mut command = Command::new("/usr/bin/sudo");
+        command
+            .arg("-n")
+            .arg("-u")
+            .arg(requested_user)
+            .arg("--")
+            .arg(&request.argv[0]);
+        command.args(&request.argv[1..]);
+        command
+    };
+    if !request.cwd.is_empty() {
+        command.current_dir(&request.cwd);
+    }
+    command.envs(&request.env);
+    if requested_user != "root" {
+        command.env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
+    }
+    command
+}
+fn set_process_group(command: &mut Command) {
+    unsafe {
+        command.as_std_mut().pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+async fn forward_stdin<W>(
+    mut requests: Streaming<ExecRequest>,
+    mut writer: Option<W>,
+    initial_data: Vec<u8>,
+    initial_eof: bool,
+) -> Result<(), Status>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let Some(mut writer) = writer.take() else {
+        return Ok(());
+    };
+    if !initial_data.is_empty() {
+        writer.write_all(&initial_data).await.map_err(internal_io)?;
+    }
+    if initial_eof {
+        writer.shutdown().await.map_err(internal_io)?;
+        return Ok(());
+    }
+    while let Some(request) = requests.message().await? {
+        if request.protocol_version != PROTOCOL {
+            return Err(Status::failed_precondition(
+                "unsupported agent protocol version",
+            ));
+        }
+        if !request.stdin.is_empty() {
+            writer
+                .write_all(&request.stdin)
+                .await
+                .map_err(internal_io)?;
+        }
+        if request.stdin_eof {
+            writer.shutdown().await.map_err(internal_io)?;
+            return Ok(());
+        }
+    }
+    writer.shutdown().await.map_err(internal_io)?;
+    Ok(())
+}
+
+async fn wait_for_child(
+    child: &mut tokio::process::Child,
+    sender: &mpsc::Sender<Result<ExecEvent, Status>>,
+    process_group: bool,
+) -> std::io::Result<std::process::ExitStatus> {
+    let process_group_id = child.id();
+    tokio::select! {
+        status = child.wait() => {
+            if process_group && let Some(process_group_id) = process_group_id {
+                kill_process_group(process_group_id);
+            }
+            status
+        }
+        _ = sender.closed() => {
+            terminate_child(child, process_group).await;
+            child.wait().await
+        }
+    }
+}
+
+fn kill_process_group(process_group_id: u32) -> bool {
+    let Ok(process_group_id) = i32::try_from(process_group_id) else {
+        return false;
+    };
+    unsafe { libc::kill(-process_group_id, libc::SIGKILL) == 0 }
+}
+
+async fn terminate_child(child: &mut tokio::process::Child, process_group: bool) {
+    if process_group
+        && let Some(process_group_id) = child.id()
+        && kill_process_group(process_group_id)
+    {
+        return;
+    }
+    let _ = child.kill().await;
+}
+
+async fn wait_for_child_with_input(
+    child: &mut tokio::process::Child,
+    sender: &mpsc::Sender<Result<ExecEvent, Status>>,
+    input_task: &mut tokio::task::JoinHandle<Result<(), Status>>,
+    process_group: bool,
+) -> (std::io::Result<std::process::ExitStatus>, Option<Status>) {
+    tokio::select! {
+        status = wait_for_child(child, sender, process_group) => (status, None),
+        input_result = &mut *input_task => {
+            match input_result {
+                Ok(Ok(())) => (wait_for_child(child, sender, process_group).await, None),
+                Ok(Err(error)) => {
+                    terminate_child(child, process_group).await;
+                    (child.wait().await, Some(error))
+                }
+                Err(error) => {
+                    terminate_child(child, process_group).await;
+                    (
+                        child.wait().await,
+                        Some(Status::internal(format!("stdin task failed: {error}"))),
+                    )
+                }
+            }
+        }
+    }
+}
+
+async fn send_exit(
+    status: std::io::Result<std::process::ExitStatus>,
+    sender: mpsc::Sender<Result<ExecEvent, Status>>,
+) {
     match status {
         Ok(status) => {
             let _ = sender
                 .send(Ok(ExecEvent {
                     event: Some(exec_event::Event::Exit(ExecExit {
                         code: status.code().unwrap_or(-1),
-                        signal: 0,
+                        signal: exit_signal(&status),
                     })),
                 }))
                 .await;
@@ -290,10 +603,23 @@ async fn run_command(request: ExecRequest, sender: mpsc::Sender<Result<ExecEvent
     }
 }
 
+fn exit_signal(status: &std::process::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().unwrap_or(0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        0
+    }
+}
 async fn send_output<R>(
     reader: Option<R>,
     sender: mpsc::Sender<Result<ExecEvent, Status>>,
     stdout: bool,
+    pty: bool,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -303,6 +629,7 @@ async fn send_output<R>(
         let size = match reader.read(&mut buffer).await {
             Ok(0) => return,
             Ok(size) => size,
+            Err(error) if pty && error.raw_os_error() == Some(libc::EIO) => return,
             Err(error) => {
                 let _ = sender.send(Err(Status::internal(error.to_string()))).await;
                 return;
@@ -322,6 +649,108 @@ async fn send_output<R>(
         }
     }
 }
+async fn await_output_task(mut task: tokio::task::JoinHandle<()>) {
+    let _ = tokio::time::timeout(EXEC_OUTPUT_DRAIN_TIMEOUT, &mut task).await;
+    task.abort();
+    let _ = task.await;
+}
+
+struct TemporaryFileCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TemporaryFileCleanup {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_owned(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TemporaryFileCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+async fn receive_upload(
+    stream: &mut Streaming<FileChunk>,
+    first: FileChunk,
+    temporary_path: &Path,
+    destination: &Path,
+) -> Result<FileResult, Status> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options.open(temporary_path).await.map_err(internal_io)?;
+    let mut cleanup = TemporaryFileCleanup::new(temporary_path);
+    let mut size = 0u64;
+    let mut hasher = Sha256::new();
+    if first.uid != 0 || first.gid != 0 {
+        return Err(Status::invalid_argument(
+            "file ownership metadata is not supported",
+        ));
+    }
+    write_chunk(&mut file, &first, &mut size, &mut hasher).await?;
+    let mut complete = first.eof;
+    while !complete {
+        let Some(chunk) = stream.message().await? else {
+            return Err(Status::invalid_argument(
+                "file stream ended before EOF marker",
+            ));
+        };
+        if chunk.protocol_version != 0 && chunk.protocol_version != PROTOCOL {
+            return Err(Status::failed_precondition(
+                "unsupported agent protocol version",
+            ));
+        }
+        if chunk.uid != 0 || chunk.gid != 0 {
+            return Err(Status::invalid_argument(
+                "file ownership metadata is not supported",
+            ));
+        }
+        write_chunk(&mut file, &chunk, &mut size, &mut hasher).await?;
+        complete = chunk.eof;
+    }
+    if stream.message().await?.is_some() {
+        return Err(Status::invalid_argument(
+            "file stream sent data after EOF marker",
+        ));
+    }
+    file.flush().await.map_err(internal_io)?;
+    drop(file);
+    if first.mode != 0 {
+        set_mode(temporary_path, first.mode).map_err(internal_io)?;
+    }
+    if first.atomic_write {
+        tokio::fs::rename(temporary_path, destination)
+            .await
+            .map_err(internal_io)?;
+    } else {
+        tokio::fs::copy(temporary_path, destination)
+            .await
+            .map_err(internal_io)?;
+        tokio::fs::remove_file(temporary_path)
+            .await
+            .map_err(internal_io)?;
+    }
+    cleanup.disarm();
+    Ok(FileResult {
+        size,
+        digest: hex_digest(hasher.finalize()),
+    })
+}
 
 async fn write_chunk(
     file: &mut tokio::fs::File,
@@ -329,36 +758,60 @@ async fn write_chunk(
     size: &mut u64,
     hasher: &mut Sha256,
 ) -> Result<(), Status> {
+    let chunk_size = chunk.data.len() as u64;
+    if chunk_size > MAX_FILE_SIZE.saturating_sub(*size) {
+        return Err(Status::resource_exhausted("file exceeds the 64 MiB limit"));
+    }
     file.write_all(&chunk.data).await.map_err(internal_io)?;
-    *size += chunk.data.len() as u64;
+    *size += chunk_size;
     hasher.update(&chunk.data);
     Ok(())
 }
 
 async fn read_file(path: PathBuf, sender: mpsc::Sender<Result<FileChunk, Status>>) {
-    let metadata = match tokio::fs::metadata(&path).await {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            let _ = sender.send(Err(internal_io(error))).await;
-            return;
-        }
-    };
-    let mut file = match tokio::fs::File::open(&path).await {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = match options.open(&path).await {
         Ok(file) => file,
         Err(error) => {
             let _ = sender.send(Err(internal_io(error))).await;
             return;
         }
     };
+    let metadata = match file.metadata().await {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let _ = sender.send(Err(internal_io(error))).await;
+            return;
+        }
+    };
+    if !metadata.is_file() {
+        let _ = sender
+            .send(Err(Status::failed_precondition(
+                "agent file reads require a regular file",
+            )))
+            .await;
+        return;
+    }
     let mut buffer = [0u8; 8192];
     let mut first = true;
+    let mut total = 0u64;
     loop {
         match file.read(&mut buffer).await {
             Ok(0) => {
                 let _ = sender
                     .send(Ok(FileChunk {
-                        path: path.to_string_lossy().into_owned(),
-                        mode: metadata_mode(&metadata),
+                        path: if first {
+                            path.to_string_lossy().into_owned()
+                        } else {
+                            String::new()
+                        },
+                        mode: if first { metadata_mode(&metadata) } else { 0 },
+                        protocol_version: if first { PROTOCOL } else { 0 },
                         eof: true,
                         ..Default::default()
                     }))
@@ -366,6 +819,16 @@ async fn read_file(path: PathBuf, sender: mpsc::Sender<Result<FileChunk, Status>
                 return;
             }
             Ok(size) => {
+                let chunk_size = size as u64;
+                if chunk_size > MAX_FILE_SIZE.saturating_sub(total) {
+                    let _ = sender
+                        .send(Err(Status::resource_exhausted(
+                            "file exceeds the 64 MiB limit",
+                        )))
+                        .await;
+                    return;
+                }
+                total += chunk_size;
                 let chunk = FileChunk {
                     path: if first {
                         path.to_string_lossy().into_owned()
@@ -373,6 +836,7 @@ async fn read_file(path: PathBuf, sender: mpsc::Sender<Result<FileChunk, Status>
                         String::new()
                     },
                     mode: if first { metadata_mode(&metadata) } else { 0 },
+                    protocol_version: if first { PROTOCOL } else { 0 },
                     data: buffer[..size].to_vec(),
                     eof: false,
                     ..Default::default()
@@ -388,6 +852,10 @@ async fn read_file(path: PathBuf, sender: mpsc::Sender<Result<FileChunk, Status>
             }
         }
     }
+}
+
+fn is_forward_address_allowed(networks: &[IpNet], address: IpAddr) -> bool {
+    networks.iter().any(|network| network.contains(&address))
 }
 
 fn safe_path(value: &str) -> Result<PathBuf, Status> {
@@ -451,6 +919,10 @@ fn internal_io(error: std::io::Error) -> Status {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if args.max_exec == 0 {
+        anyhow::bail!("max-exec must be greater than zero");
+    }
+    pbox_crypto::server_subject(&args.box_id).context("validate box id")?;
     let certificate = tokio::fs::read_to_string(&args.certificate)
         .await
         .with_context(|| format!("read certificate {}", args.certificate.display()))?;
@@ -463,7 +935,11 @@ async fn main() -> Result<()> {
     let identity = Identity::from_pem(certificate, private_key);
     let tls = ServerTlsConfig::new()
         .identity(identity)
+        // The context CA is the authorization boundary shared by all boxes.
+        // Every client that can derive it from the dedicated PVE token can
+        // control the corresponding pbox estate.
         .client_ca_root(Certificate::from_pem(client_ca));
+    let exec_slots = Arc::new(Semaphore::new(args.max_exec));
     let address = args.listen.parse().context("parse agent listen address")?;
     println!("pbox-agent listening on {}", args.listen);
     Server::builder()
@@ -471,9 +947,43 @@ async fn main() -> Result<()> {
         .context("configure agent TLS")?
         .add_service(AgentServer::new(AgentService {
             box_id: args.box_id,
+            forward_allow: args.forward_allow,
+            exec_slots,
         }))
         .serve(address)
         .await
         .context("run pbox-agent server")?;
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_forward_policy_allows_only_loopback() {
+        let networks = vec![
+            "127.0.0.0/8".parse::<IpNet>().unwrap(),
+            "::1/128".parse::<IpNet>().unwrap(),
+        ];
+
+        assert!(is_forward_address_allowed(
+            &networks,
+            "127.0.0.1".parse().unwrap(),
+        ));
+        assert!(is_forward_address_allowed(
+            &networks,
+            "::1".parse().unwrap(),
+        ));
+        assert!(!is_forward_address_allowed(
+            &networks,
+            "10.0.0.1".parse().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn safe_path_rejects_empty_and_nul_values() {
+        assert!(safe_path("").is_err());
+        assert!(safe_path("tmp\0file").is_err());
+        assert!(safe_path("/tmp/file").is_ok());
+    }
 }

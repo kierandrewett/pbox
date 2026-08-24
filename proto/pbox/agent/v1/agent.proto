@@ -5,7 +5,7 @@ package pbox.cwd.dev.agent.v1;
 service Agent {
   rpc Info(InfoRequest) returns (InfoResponse);
   rpc Ping(PingRequest) returns (PingResponse);
-  rpc Exec(ExecRequest) returns (stream ExecEvent);
+  rpc Exec(stream ExecRequest) returns (stream ExecEvent);
   rpc PutFile(stream FileChunk) returns (FileResult);
   rpc GetFile(GetFileRequest) returns (stream FileChunk);
   rpc Forward(stream ForwardEvent) returns (stream ForwardEvent);
@@ -39,6 +39,8 @@ message ExecRequest {
   map<string, string> env = 4;
   string user = 5;
   bool allocate_pty = 6;
+  bytes stdin = 7;
+  bool stdin_eof = 8;
 }
 
 message ExecEvent {
@@ -62,8 +64,8 @@ message FileChunk {
   bool atomic_write = 5;
   bytes data = 6;
   bool eof = 7;
+  uint32 protocol_version = 8;
 }
-
 message GetFileRequest {
   uint32 protocol_version = 1;
   string path = 2;

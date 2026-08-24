@@ -29,11 +29,13 @@ base64 = "0.22"
 rustls-pki-types = "1.12"
 ed25519-dalek = { version = "2.2", features = ["pkcs8"] }
 hkdf = "0.12"
+ipnet = "2.12"
 prost = "0.14"
 rcgen = "0.14"
 sha2 = "0.10"
 tonic = { version = "0.14", features = ["transport", "tls-ring"] }
 tonic-prost = "0.14"
 time = "0.3"
-tokio-stream = "0.1"
-tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync"] }
+nix = { version = "0.31.3", features = ["process", "term"] }
+tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
