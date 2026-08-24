@@ -23,7 +23,7 @@ pub trait PveApi {
         node: &str,
         vmid: u64,
         request: &LxcConfigUpdateRequest,
-    ) -> Result<PveTaskResponse, PveError>;
+    ) -> Result<(), PveError>;
     fn start_lxc(&self, node: &str, vmid: u64) -> Result<PveTaskResponse, PveError>;
     fn shutdown_lxc(&self, node: &str, vmid: u64) -> Result<PveTaskResponse, PveError>;
     fn stop_lxc(&self, node: &str, vmid: u64) -> Result<PveTaskResponse, PveError>;
@@ -115,13 +115,27 @@ impl PveClient {
         decode_response(response)
     }
 
-    fn task<T: Serialize>(&self, method: Method, path: &str, form: &T) -> Result<PveTaskResponse, PveError> {
+    fn task<T: Serialize>(
+        &self,
+        method: Method,
+        path: &str,
+        form: &T,
+    ) -> Result<PveTaskResponse, PveError> {
         let response = self
             .request(method, path)
             .form(form)
             .send()
             .map_err(PveError::Request)?;
         decode_task_response(response)
+    }
+    fn empty<T: Serialize>(&self, method: Method, path: &str, form: &T) -> Result<(), PveError> {
+        let response = self
+            .request(method, path)
+            .form(form)
+            .send()
+            .map_err(PveError::Request)?;
+        let _: serde_json::Value = decode_response(response)?;
+        Ok(())
     }
 
     fn task_without_form(&self, method: Method, path: &str) -> Result<PveTaskResponse, PveError> {
@@ -165,9 +179,9 @@ impl PveApi for PveClient {
         node: &str,
         vmid: u64,
         request: &LxcConfigUpdateRequest,
-    ) -> Result<PveTaskResponse, PveError> {
+    ) -> Result<(), PveError> {
         validate_path_segment(node, "node")?;
-        self.task(
+        self.empty(
             Method::PUT,
             &format!("/nodes/{node}/lxc/{vmid}/config"),
             request,
@@ -221,7 +235,12 @@ fn normalise_base_url(value: &str) -> Result<String, PveError> {
 }
 
 fn validate_path_segment(value: &str, field: &str) -> Result<(), PveError> {
-    if value.is_empty() || value.contains('/') || value.contains('?') || value.contains('#') {
+    if value.is_empty()
+        || matches!(value, "." | "..")
+        || value
+            .chars()
+            .any(|character| matches!(character, '/' | '\\' | '?' | '#' | '%'))
+    {
         return Err(PveError::InvalidPathSegment {
             field: field.to_owned(),
         });
@@ -435,6 +454,10 @@ mod tests {
     #[test]
     fn path_segments_cannot_escape_endpoint() {
         assert!(validate_path_segment("node/a", "node").is_err());
+        assert!(validate_path_segment("..", "node").is_err());
+        assert!(validate_path_segment(".", "node").is_err());
+        assert!(validate_path_segment(r"node\\child", "node").is_err());
+        assert!(validate_path_segment("%2e%2e", "node").is_err());
         assert!(validate_path_segment("UPID:pve:1:2:3", "UPID").is_ok());
     }
 
@@ -446,11 +469,17 @@ mod tests {
     }
 
     #[test]
+    fn null_response_decodes_for_config_updates() {
+        let response: PveResponse<serde_json::Value> =
+            serde_json::from_str(r#"{"data":null}"#).unwrap();
+        assert!(response.data.is_null());
+    }
+
+    #[test]
     fn task_status_maps_type_and_success() {
-        let status: PveTaskStatus = serde_json::from_str(
-            r#"{"status":"stopped","exitstatus":"OK","type":"vzcreate"}"#,
-        )
-        .unwrap();
+        let status: PveTaskStatus =
+            serde_json::from_str(r#"{"status":"stopped","exitstatus":"OK","type":"vzcreate"}"#)
+                .unwrap();
         assert_eq!(status.type_.as_deref(), Some("vzcreate"));
         assert!(status.is_successful());
     }
@@ -478,7 +507,10 @@ mod tests {
             start: Some(true),
             ..Default::default()
         };
-        let form = LxcCreateForm { vmid: 100, request: &request };
+        let form = LxcCreateForm {
+            vmid: 100,
+            request: &request,
+        };
         let value = serde_json::to_value(form).unwrap();
         assert_eq!(value["vmid"], 100);
         assert_eq!(value["ostemplate"], "local:vztmpl/debian-12.tar.zst");
