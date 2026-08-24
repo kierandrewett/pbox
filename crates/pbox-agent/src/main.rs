@@ -24,14 +24,16 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::Command;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 const MAX_FILE_SIZE: u64 = 64 * 1024 * 1024;
 const FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const FILE_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const FORWARD_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const FORWARD_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const EXEC_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const EXEC_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_UPLOAD_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -101,9 +103,9 @@ impl Agent for AgentService {
         request: Request<Streaming<ExecRequest>>,
     ) -> Result<Response<Self::ExecStream>, Status> {
         let mut requests = request.into_inner();
-        let first = requests
-            .message()
-            .await?
+        let first = tokio::time::timeout(EXEC_STREAM_IDLE_TIMEOUT, requests.message())
+            .await
+            .map_err(|_| Status::deadline_exceeded("exec stream idle timeout"))??
             .ok_or_else(|| Status::invalid_argument("exec stream is empty"))?;
         validate_exec_request(&first)?;
         let permit = self
@@ -121,9 +123,9 @@ impl Agent for AgentService {
         request: Request<Streaming<FileChunk>>,
     ) -> Result<Response<FileResult>, Status> {
         let mut stream = request.into_inner();
-        let first = stream
-            .message()
-            .await?
+        let first = tokio::time::timeout(FILE_STREAM_IDLE_TIMEOUT, stream.message())
+            .await
+            .map_err(|_| Status::deadline_exceeded("file stream idle timeout"))??
             .ok_or_else(|| Status::invalid_argument("file stream is empty"))?;
         if first.protocol_version != PROTOCOL {
             return Err(Status::failed_precondition(
@@ -267,13 +269,15 @@ impl Agent for AgentService {
                     }
                 }
             }
-            let _ = sender
-                .send(Ok(ForwardEvent {
+            let _ = tokio::time::timeout(
+                FORWARD_IDLE_TIMEOUT,
+                sender.send(Ok(ForwardEvent {
                     event: Some(forward_event::Event::Close(ForwardClose {
                         code: close_code,
                     })),
-                }))
-                .await;
+                })),
+            )
+            .await;
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
@@ -335,10 +339,24 @@ async fn run_piped_command(
         request.stdin,
         request.stdin_eof,
     ));
-    let stdout_task = tokio::spawn(send_output(stdout, sender.clone(), true, false));
-    let stderr_task = tokio::spawn(send_output(stderr, sender.clone(), false, false));
+    let output_failure = Arc::new(Notify::new());
+    let stdout_task = tokio::spawn(send_output(
+        stdout,
+        sender.clone(),
+        true,
+        false,
+        output_failure.clone(),
+    ));
+    let stderr_task = tokio::spawn(send_output(
+        stderr,
+        sender.clone(),
+        false,
+        false,
+        output_failure.clone(),
+    ));
     let (status, input_error) =
-        wait_for_child_with_input(&mut child, &sender, &mut input_task, true).await;
+        wait_for_child_with_input(&mut child, &sender, &mut input_task, true, &output_failure)
+            .await;
     input_task.abort();
     let _ = input_task.await;
     await_output_task(stdout_task).await;
@@ -420,9 +438,17 @@ async fn run_pty_command(
         request.stdin,
         request.stdin_eof,
     ));
-    let output_task = tokio::spawn(send_output(Some(master_reader), sender.clone(), true, true));
+    let output_failure = Arc::new(Notify::new());
+    let output_task = tokio::spawn(send_output(
+        Some(master_reader),
+        sender.clone(),
+        true,
+        true,
+        output_failure.clone(),
+    ));
     let (status, input_error) =
-        wait_for_child_with_input(&mut child, &sender, &mut input_task, true).await;
+        wait_for_child_with_input(&mut child, &sender, &mut input_task, true, &output_failure)
+            .await;
     input_task.abort();
     let _ = input_task.await;
     await_output_task(output_task).await;
@@ -520,6 +546,7 @@ async fn wait_for_child(
     child: &mut tokio::process::Child,
     sender: &mpsc::Sender<Result<ExecEvent, Status>>,
     process_group: bool,
+    output_failure: &Notify,
 ) -> std::io::Result<std::process::ExitStatus> {
     let process_group_id = child.id();
     tokio::select! {
@@ -530,6 +557,10 @@ async fn wait_for_child(
             status
         }
         _ = sender.closed() => {
+            terminate_child(child, process_group).await;
+            child.wait().await
+        }
+        _ = output_failure.notified() => {
             terminate_child(child, process_group).await;
             child.wait().await
         }
@@ -558,12 +589,16 @@ async fn wait_for_child_with_input(
     sender: &mpsc::Sender<Result<ExecEvent, Status>>,
     input_task: &mut tokio::task::JoinHandle<Result<(), Status>>,
     process_group: bool,
+    output_failure: &Notify,
 ) -> (std::io::Result<std::process::ExitStatus>, Option<Status>) {
     tokio::select! {
-        status = wait_for_child(child, sender, process_group) => (status, None),
+        status = wait_for_child(child, sender, process_group, output_failure) => (status, None),
         input_result = &mut *input_task => {
             match input_result {
-                Ok(Ok(())) => (wait_for_child(child, sender, process_group).await, None),
+                Ok(Ok(())) => (
+                    wait_for_child(child, sender, process_group, output_failure).await,
+                    None,
+                ),
                 Ok(Err(error)) => {
                     terminate_child(child, process_group).await;
                     (child.wait().await, Some(error))
@@ -620,6 +655,7 @@ async fn send_output<R>(
     sender: mpsc::Sender<Result<ExecEvent, Status>>,
     stdout: bool,
     pty: bool,
+    output_failure: Arc<Notify>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -631,7 +667,14 @@ async fn send_output<R>(
             Ok(size) => size,
             Err(error) if pty && error.raw_os_error() == Some(libc::EIO) => return,
             Err(error) => {
-                let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                let sent = tokio::time::timeout(
+                    EXEC_STREAM_IDLE_TIMEOUT,
+                    sender.send(Err(Status::internal(error.to_string()))),
+                )
+                .await;
+                if !matches!(sent, Ok(Ok(()))) {
+                    output_failure.notify_one();
+                }
                 return;
             }
         };
@@ -640,11 +683,13 @@ async fn send_output<R>(
         } else {
             exec_event::Event::Stderr(buffer[..size].to_vec())
         };
-        if sender
-            .send(Ok(ExecEvent { event: Some(event) }))
-            .await
-            .is_err()
-        {
+        let sent = tokio::time::timeout(
+            EXEC_STREAM_IDLE_TIMEOUT,
+            sender.send(Ok(ExecEvent { event: Some(event) })),
+        )
+        .await;
+        if !matches!(sent, Ok(Ok(()))) {
+            output_failure.notify_one();
             return;
         }
     }
@@ -705,7 +750,10 @@ async fn receive_upload(
     write_chunk(&mut file, &first, &mut size, &mut hasher).await?;
     let mut complete = first.eof;
     while !complete {
-        let Some(chunk) = stream.message().await? else {
+        let Some(chunk) = tokio::time::timeout(FILE_STREAM_IDLE_TIMEOUT, stream.message())
+            .await
+            .map_err(|_| Status::deadline_exceeded("file stream idle timeout"))??
+        else {
             return Err(Status::invalid_argument(
                 "file stream ended before EOF marker",
             ));
@@ -723,7 +771,11 @@ async fn receive_upload(
         write_chunk(&mut file, &chunk, &mut size, &mut hasher).await?;
         complete = chunk.eof;
     }
-    if stream.message().await?.is_some() {
+    if tokio::time::timeout(FILE_STREAM_IDLE_TIMEOUT, stream.message())
+        .await
+        .map_err(|_| Status::deadline_exceeded("file stream idle timeout"))??
+        .is_some()
+    {
         return Err(Status::invalid_argument(
             "file stream sent data after EOF marker",
         ));
@@ -768,6 +820,16 @@ async fn write_chunk(
     Ok(())
 }
 
+async fn send_file_event(
+    sender: &mpsc::Sender<Result<FileChunk, Status>>,
+    event: Result<FileChunk, Status>,
+) -> bool {
+    matches!(
+        tokio::time::timeout(FILE_STREAM_IDLE_TIMEOUT, sender.send(event)).await,
+        Ok(Ok(()))
+    )
+}
+
 async fn read_file(path: PathBuf, sender: mpsc::Sender<Result<FileChunk, Status>>) {
     let mut options = tokio::fs::OpenOptions::new();
     options.read(true);
@@ -778,23 +840,25 @@ async fn read_file(path: PathBuf, sender: mpsc::Sender<Result<FileChunk, Status>
     let mut file = match options.open(&path).await {
         Ok(file) => file,
         Err(error) => {
-            let _ = sender.send(Err(internal_io(error))).await;
+            let _ = send_file_event(&sender, Err(internal_io(error))).await;
             return;
         }
     };
     let metadata = match file.metadata().await {
         Ok(metadata) => metadata,
         Err(error) => {
-            let _ = sender.send(Err(internal_io(error))).await;
+            let _ = send_file_event(&sender, Err(internal_io(error))).await;
             return;
         }
     };
     if !metadata.is_file() {
-        let _ = sender
-            .send(Err(Status::failed_precondition(
+        let _ = send_file_event(
+            &sender,
+            Err(Status::failed_precondition(
                 "agent file reads require a regular file",
-            )))
-            .await;
+            )),
+        )
+        .await;
         return;
     }
     let mut buffer = [0u8; 8192];
@@ -803,29 +867,28 @@ async fn read_file(path: PathBuf, sender: mpsc::Sender<Result<FileChunk, Status>
     loop {
         match file.read(&mut buffer).await {
             Ok(0) => {
-                let _ = sender
-                    .send(Ok(FileChunk {
-                        path: if first {
-                            path.to_string_lossy().into_owned()
-                        } else {
-                            String::new()
-                        },
-                        mode: if first { metadata_mode(&metadata) } else { 0 },
-                        protocol_version: if first { PROTOCOL } else { 0 },
-                        eof: true,
-                        ..Default::default()
-                    }))
-                    .await;
+                let event = Ok(FileChunk {
+                    path: if first {
+                        path.to_string_lossy().into_owned()
+                    } else {
+                        String::new()
+                    },
+                    mode: if first { metadata_mode(&metadata) } else { 0 },
+                    protocol_version: if first { PROTOCOL } else { 0 },
+                    eof: true,
+                    ..Default::default()
+                });
+                let _ = send_file_event(&sender, event).await;
                 return;
             }
             Ok(size) => {
                 let chunk_size = size as u64;
                 if chunk_size > MAX_FILE_SIZE.saturating_sub(total) {
-                    let _ = sender
-                        .send(Err(Status::resource_exhausted(
-                            "file exceeds the 64 MiB limit",
-                        )))
-                        .await;
+                    let _ = send_file_event(
+                        &sender,
+                        Err(Status::resource_exhausted("file exceeds the 64 MiB limit")),
+                    )
+                    .await;
                     return;
                 }
                 total += chunk_size;
@@ -842,12 +905,12 @@ async fn read_file(path: PathBuf, sender: mpsc::Sender<Result<FileChunk, Status>
                     ..Default::default()
                 };
                 first = false;
-                if sender.send(Ok(chunk)).await.is_err() {
+                if !send_file_event(&sender, Ok(chunk)).await {
                     return;
                 }
             }
             Err(error) => {
-                let _ = sender.send(Err(internal_io(error))).await;
+                let _ = send_file_event(&sender, Err(internal_io(error))).await;
                 return;
             }
         }
