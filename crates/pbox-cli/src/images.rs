@@ -257,6 +257,28 @@ pub fn upload_local_oci_template(
     })
 }
 
+const OCI_GUEST_PREPARATION: &str = r#"set -eu
+if [ -x /sbin/init ] && command -v sshd >/dev/null 2>&1; then
+    exit 0
+fi
+if command -v apt-get >/dev/null 2>&1; then
+    printf '%s\n' '#!/bin/sh' 'exit 101' > /usr/sbin/policy-rc.d
+    chmod 755 /usr/sbin/policy-rc.d
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends systemd-sysv openssh-server sudo python3 ca-certificates
+    rm -rf /var/lib/apt/lists/* /usr/sbin/policy-rc.d
+elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y systemd openssh-server sudo python3 ca-certificates
+    dnf clean all
+elif [ -x /sbin/init ] && command -v sshd >/dev/null 2>&1; then
+    exit 0
+else
+    echo 'pbox needs a systemd init and OpenSSH server in the OCI image' >&2
+    exit 1
+fi
+"#;
+
 fn build_local_oci_archive(reference: &str, filename: &str) -> Result<PathBuf> {
     let workspace = create_local_oci_workspace(filename)?;
     let result = (|| {
@@ -268,8 +290,22 @@ fn build_local_oci_archive(reference: &str, filename: &str) -> Result<PathBuf> {
         )?;
         let container = run_local_command_output(
             "podman",
-            &["create", "--quiet", image.as_str()],
+            &[
+                "create",
+                "--quiet",
+                "--network",
+                "host",
+                image.as_str(),
+                "/bin/sh",
+                "-c",
+                OCI_GUEST_PREPARATION,
+            ],
             "create temporary OCI container",
+        )?;
+        run_local_command(
+            "podman",
+            &["start", "--attach", container.as_str()],
+            "install pbox guest prerequisites in OCI container",
         )?;
         let tar = workspace.join(format!("{filename}.tar"));
         let compressed = workspace.join(format!("{filename}.tar.zst"));
