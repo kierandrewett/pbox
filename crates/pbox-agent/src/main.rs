@@ -46,6 +46,7 @@ const FORWARD_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const EXEC_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const EXEC_STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const EXEC_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const PTY_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const EXEC_COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const CONNECTION_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 const CONNECTION_MAX_AGE_GRACE: Duration = Duration::from_secs(30);
@@ -568,7 +569,41 @@ fn validate_exec_request(request: &ExecRequest) -> Result<(), Status> {
             "argv must contain at least one command",
         ));
     }
+    for (name, value) in &request.env {
+        validate_environment_entry(name, value, request.user.as_str() == "root")?;
+    }
     Ok(())
+}
+
+fn validate_environment_entry(name: &str, value: &str, root: bool) -> Result<(), Status> {
+    let mut characters = name.chars();
+    let valid_start = characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic());
+    if !valid_start
+        || !characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+    {
+        return Err(Status::invalid_argument(
+            "environment variable names must use shell identifier syntax",
+        ));
+    }
+    if value.contains('\0') {
+        return Err(Status::invalid_argument(
+            "environment variable values cannot contain NUL bytes",
+        ));
+    }
+    if !root && is_privileged_loader_environment(name) {
+        return Err(Status::permission_denied(
+            "loader environment variables are not allowed for non-root commands",
+        ));
+    }
+    Ok(())
+}
+
+fn is_privileged_loader_environment(name: &str) -> bool {
+    name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+        || matches!(name, "GCONV_PATH" | "GLIBC_TUNABLES" | "LOCPATH")
 }
 
 async fn run_command(
@@ -611,6 +646,7 @@ async fn run_piped_command(
     let mut input_task = tokio::spawn(forward_stdin(
         requests,
         stdin,
+        false,
         request.stdin,
         request.stdin_eof,
     ));
@@ -642,8 +678,8 @@ async fn run_piped_command(
         input_task.abort();
         let _ = input_task.await;
     }
-    await_output_task(stdout_task).await;
-    await_output_task(stderr_task).await;
+    await_output_task(stdout_task, EXEC_OUTPUT_DRAIN_TIMEOUT).await;
+    await_output_task(stderr_task, EXEC_OUTPUT_DRAIN_TIMEOUT).await;
     if let Some(error) = input_error {
         let _ = tokio::time::timeout(EXEC_OUTPUT_DRAIN_TIMEOUT, sender.send(Err(error))).await;
     } else {
@@ -719,6 +755,7 @@ async fn run_pty_command(
     let mut input_task = tokio::spawn(forward_stdin(
         requests,
         Some(master_writer),
+        true,
         request.stdin,
         request.stdin_eof,
     ));
@@ -743,7 +780,7 @@ async fn run_pty_command(
         input_task.abort();
         let _ = input_task.await;
     }
-    await_output_task(output_task).await;
+    await_output_task(output_task, PTY_OUTPUT_DRAIN_TIMEOUT).await;
     if let Some(error) = input_error {
         let _ = tokio::time::timeout(EXEC_OUTPUT_DRAIN_TIMEOUT, sender.send(Err(error))).await;
     } else {
@@ -760,27 +797,32 @@ fn command_for_request(request: &ExecRequest) -> Command {
     let mut command = if requested_user == "root" {
         let mut command = Command::new(&request.argv[0]);
         command.args(&request.argv[1..]);
+        command.envs(&request.env);
         command
     } else {
+        // Keep values out of sudo's argv. The validator rejects loader hooks before
+        // this root process starts sudo, and --preserve-env applies the values after
+        // sudo changes to the requested user.
         let mut command = Command::new("/usr/bin/sudo");
-        command
-            .arg("-n")
-            .arg("-u")
-            .arg(requested_user)
-            .arg("--")
-            .arg(&request.argv[0]);
-        command.args(&request.argv[1..]);
+        command.arg("-n").arg("-u").arg(requested_user);
+        let mut environment_names = request.env.keys().cloned().collect::<Vec<_>>();
+        if !request.env.contains_key("PATH") {
+            command.env(
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            );
+            environment_names.push("PATH".to_owned());
+        }
+        environment_names.sort_unstable();
+        if !environment_names.is_empty() {
+            command.arg(format!("--preserve-env={}", environment_names.join(",")));
+        }
+        command.arg("--").args(&request.argv);
+        command.envs(&request.env);
         command
     };
     if !request.cwd.is_empty() {
         command.current_dir(&request.cwd);
-    }
-    command.envs(&request.env);
-    if requested_user != "root" {
-        command.env(
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        );
     }
     command
 }
@@ -794,9 +836,36 @@ fn set_process_group(command: &mut Command) {
         });
     }
 }
+async fn write_stdin<W>(writer: &mut W, data: &[u8], pty: bool) -> Result<(), Status>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let result = tokio::time::timeout(EXEC_STDIN_WRITE_TIMEOUT, writer.write_all(data))
+        .await
+        .map_err(|_| Status::deadline_exceeded("stdin write timed out"))?;
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if pty && is_pty_eof_error(&error) => Ok(()),
+        Err(error) => Err(internal_io(error)),
+    }
+}
+
+fn is_pty_eof_error(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EIO)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 async fn forward_stdin<W>(
     mut requests: Streaming<ExecRequest>,
     mut writer: Option<W>,
+    pty: bool,
     initial_data: Vec<u8>,
     initial_eof: bool,
 ) -> Result<(), Status>
@@ -807,16 +876,10 @@ where
         return Ok(());
     };
     if !initial_data.is_empty() {
-        tokio::time::timeout(EXEC_STDIN_WRITE_TIMEOUT, writer.write_all(&initial_data))
-            .await
-            .map_err(|_| Status::deadline_exceeded("stdin write timed out"))?
-            .map_err(internal_io)?;
+        write_stdin(&mut writer, &initial_data, pty).await?;
     }
     if initial_eof {
-        tokio::time::timeout(EXEC_STDIN_WRITE_TIMEOUT, writer.shutdown())
-            .await
-            .map_err(|_| Status::deadline_exceeded("stdin shutdown timed out"))?
-            .map_err(internal_io)?;
+        finish_stdin(&mut writer, pty).await?;
         return Ok(());
     }
     while let Some(request) = tokio::time::timeout(EXEC_STREAM_IDLE_TIMEOUT, requests.message())
@@ -829,24 +892,36 @@ where
             ));
         }
         if !request.stdin.is_empty() {
-            tokio::time::timeout(EXEC_STDIN_WRITE_TIMEOUT, writer.write_all(&request.stdin))
-                .await
-                .map_err(|_| Status::deadline_exceeded("stdin write timed out"))?
-                .map_err(internal_io)?;
+            write_stdin(&mut writer, &request.stdin, pty).await?;
         }
         if request.stdin_eof {
-            tokio::time::timeout(EXEC_STDIN_WRITE_TIMEOUT, writer.shutdown())
-                .await
-                .map_err(|_| Status::deadline_exceeded("stdin shutdown timed out"))?
-                .map_err(internal_io)?;
+            finish_stdin(&mut writer, pty).await?;
             return Ok(());
         }
     }
-    tokio::time::timeout(EXEC_STDIN_WRITE_TIMEOUT, writer.shutdown())
-        .await
-        .map_err(|_| Status::deadline_exceeded("stdin shutdown timed out"))?
-        .map_err(internal_io)?;
+    finish_stdin(&mut writer, pty).await?;
     Ok(())
+}
+
+async fn finish_stdin<W>(writer: &mut W, pty: bool) -> Result<(), Status>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let result = tokio::time::timeout(EXEC_STDIN_WRITE_TIMEOUT, async {
+        if pty {
+            // A PTY has no half-close. Use the terminal's conventional VEOF byte.
+            writer.write_all(&[4]).await
+        } else {
+            writer.shutdown().await
+        }
+    })
+    .await
+    .map_err(|_| Status::deadline_exceeded("stdin shutdown timed out"))?;
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if pty && is_pty_eof_error(&error) => Ok(()),
+        Err(error) => Err(internal_io(error)),
+    }
 }
 
 async fn wait_for_child(
@@ -1020,11 +1095,8 @@ async fn send_output<R>(
         }
     }
 }
-async fn await_output_task(mut task: tokio::task::JoinHandle<()>) {
-    if tokio::time::timeout(EXEC_OUTPUT_DRAIN_TIMEOUT, &mut task)
-        .await
-        .is_err()
-    {
+async fn await_output_task(mut task: tokio::task::JoinHandle<()>, timeout: Duration) {
+    if tokio::time::timeout(timeout, &mut task).await.is_err() {
         task.abort();
         let _ = task.await;
     }
@@ -1603,6 +1675,56 @@ mod tests {
         stop_test_agent(task).await;
     }
     #[tokio::test]
+    async fn local_agent_delivers_pty_eof_to_waiting_command() {
+        let box_id = "pbx_t3yzd9y3";
+        let seed = derive_context_seed("pbox@pve!cli", "secret");
+        let ca = generate_context_ca(&seed).unwrap();
+        let server = issue_certificate(
+            &ca,
+            &server_subject(box_id).unwrap(),
+            CertificatePurpose::Server,
+        )
+        .unwrap();
+        let client = issue_certificate(
+            &ca,
+            "pbox.cwd.dev/context/test-client",
+            CertificatePurpose::Client,
+        )
+        .unwrap();
+        let (endpoint, task) = spawn_test_agent(box_id, server, &ca).await;
+        let mut agent = AgentClient::connect(&endpoint, box_id, &ca.certificate_pem, &client)
+            .await
+            .unwrap();
+        let mut session = agent
+            .exec_pty_session(vec!["/bin/cat".to_owned()], "/tmp", [], "root")
+            .await
+            .unwrap();
+        session.input.send(ExecInput::Eof).await.unwrap();
+
+        let (output, exit) = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut output = Vec::new();
+            let mut exit = None;
+            while let Some(event) = session.output.message().await.unwrap() {
+                match event.event {
+                    Some(exec_event::Event::Stdout(data))
+                    | Some(exec_event::Event::Stderr(data)) => output.extend(data),
+                    Some(exec_event::Event::Exit(status)) => {
+                        exit = Some((status.code, status.signal));
+                    }
+                    None => panic!("agent returned an empty exec event"),
+                }
+            }
+            (output, exit)
+        })
+        .await
+        .expect("PTY command should exit after stdin EOF");
+
+        assert!(output.is_empty());
+        assert_eq!(exit, Some((0, 0)));
+        stop_test_agent(task).await;
+    }
+
+    #[tokio::test]
     async fn forward_tunnels_data_and_closes_after_remote_eof() {
         let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_port = target_listener.local_addr().unwrap().port();
@@ -1744,6 +1866,14 @@ mod tests {
         assert!(safe_path("tmp\0file").is_err());
         assert!(safe_path("/tmp/file").is_ok());
     }
+    #[test]
+    fn non_root_environment_rejects_loader_overrides() {
+        assert!(validate_environment_entry("RUST_LOG", "debug", false).is_ok());
+        assert!(validate_environment_entry("LD_PRELOAD", "/tmp/hook.so", false).is_err());
+        assert!(validate_environment_entry("GCONV_PATH", "/tmp", false).is_err());
+        assert!(validate_environment_entry("LD_PRELOAD", "/tmp/hook.so", true).is_ok());
+        assert!(validate_environment_entry("BAD-NAME", "value", false).is_err());
+    }
 
     #[test]
     fn safe_mode_strips_special_permission_bits() {
@@ -1753,7 +1883,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_output_task_cleanup_does_not_poll_handle_twice() {
-        await_output_task(tokio::spawn(async {})).await;
+        await_output_task(tokio::spawn(async {}), EXEC_OUTPUT_DRAIN_TIMEOUT).await;
     }
     #[tokio::test]
     async fn long_running_exec_is_terminated_by_deadline() {

@@ -10,8 +10,8 @@ use bootstrap::{
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(unix)]
-use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
-use pbox_agent_client::{AgentClient, ExecResult};
+use nix::sys::termios::{LocalFlags, SetArg, cfmakeraw, tcgetattr, tcsetattr};
+use pbox_agent_client::{AgentClient, ExecInput, ExecResult, exec_event};
 use pbox_core::{
     Config, ConfigStore, LxcConfigUpdateRequest, LxcCreateRequest, LxcSnapshotRequest, PboxId,
     PboxMetadata, PboxRecipeProvenance, PveApi, PveClient, PveClientConfig, PveError,
@@ -26,7 +26,7 @@ use recipes::{RecipeCatalog, RecipeRepository};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::net::Ipv4Addr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -42,6 +42,7 @@ const PVE_TASK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_FORWARD_CONNECTIONS: usize = 64;
 const PVE_TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_FILE_TRANSFER_BYTES: u64 = 64 * 1024 * 1024;
+const SSH_POST_EXIT_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -80,6 +81,8 @@ enum Command {
     New(NewCommand),
     /// Resume an interrupted guest-agent bootstrap.
     Repair { id: String },
+    /// Open an interactive shell through pbox-agent.
+    Ssh(SshCommand),
     /// Execute a non-interactive command through pbox-agent.
     Exec(ExecCommand),
     /// Copy files between the control machine and a pbox.
@@ -141,6 +144,26 @@ struct NewCommand {
     stopped: bool,
 }
 
+#[derive(Debug, Args)]
+struct SshCommand {
+    /// Public pbox identifier.
+    id: String,
+    /// Agent endpoint override. By default pbox resolves the guest address from PVE.
+    #[arg(long)]
+    endpoint: Option<String>,
+    /// Working directory for the shell.
+    #[arg(long, default_value = "/home/pbox")]
+    cwd: String,
+    /// Guest user for the shell.
+    #[arg(long, default_value = "pbox")]
+    user: String,
+    /// Environment entry in KEY=VALUE form. May be repeated.
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    env: Vec<String>,
+    /// Shell command and arguments. Defaults to /bin/sh -il.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    argv: Vec<String>,
+}
 #[derive(Debug, Args)]
 struct ExecCommand {
     /// Public pbox identifier.
@@ -329,6 +352,7 @@ fn run() -> Result<RunOutcome> {
         Command::Repair { id } => {
             run_repair(&store, &id, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
+        Command::Ssh(command) => run_ssh(&store, command, cli.json),
         Command::Exec(command) => run_exec(&store, command, cli.json),
         Command::Scp(command) => {
             run_scp(&store, command, cli.json, cli.color).map(|_| RunOutcome::Success)
@@ -1345,11 +1369,69 @@ fn run_exec(store: &ConfigStore, command: ExecCommand, json: bool) -> Result<Run
         Ok(RunOutcome::Exit(exit_code))
     }
 }
+fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOutcome> {
+    if json {
+        bail!("pbox ssh does not support --json");
+    }
+    validate_ssh_arguments(&command)?;
+    let config = load_config(store)?;
+    let (box_id, endpoint) =
+        resolve_agent_endpoint(&config, &command.id, command.endpoint.as_deref())?;
+    let materials = agent_materials(&config, &box_id)?;
+    let env = command
+        .env
+        .iter()
+        .map(|entry| parse_env_entry(entry))
+        .collect::<Result<Vec<_>>>()?;
+    let argv = ssh_command_argv(&command.argv);
+    let ca_pem = materials.ca.certificate_pem.clone();
+    let client_identity = materials.client;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create async runtime for pbox-agent shell")?;
+    let (mut client, info) = runtime.block_on(async move {
+        let mut client = AgentClient::connect(&endpoint, &box_id, &ca_pem, &client_identity)
+            .await
+            .context("connect to pbox-agent")?;
+        let info = client
+            .info()
+            .await
+            .context("validate pbox-agent identity")?;
+        Ok::<_, anyhow::Error>((client, info))
+    })?;
+    if !info
+        .capabilities
+        .iter()
+        .any(|capability| capability == "pty")
+    {
+        bail!("pbox-agent does not advertise PTY support; upgrade the guest agent");
+    }
+    let signals = runtime.block_on(install_terminal_signals())?;
+    let terminal = TerminalModeGuard::enter()?;
+    let result = runtime.block_on(run_ssh_session_with_signals(
+        &mut client,
+        argv,
+        command.cwd,
+        env,
+        command.user,
+        terminal.as_ref(),
+        signals,
+    ));
+    drop(terminal);
+    let result = result?;
+    let exit_code = exec_exit_code(&result);
+    if exit_code == 0 {
+        Ok(RunOutcome::Success)
+    } else {
+        Ok(RunOutcome::Exit(exit_code))
+    }
+}
 
 fn parse_env_entry(entry: &str) -> Result<(String, String)> {
     let (name, value) = entry
         .split_once('=')
-        .ok_or_else(|| anyhow!("environment entry must use KEY=VALUE form: {entry}"))?;
+        .ok_or_else(|| anyhow!("environment entry must use KEY=VALUE form"))?;
     if name.is_empty() {
         return Err(anyhow!("environment variable name cannot be empty"));
     }
@@ -1384,6 +1466,248 @@ fn validate_exec_arguments(command: &ExecCommand) -> Result<()> {
         return Err(anyhow!("command arguments cannot contain NUL bytes"));
     }
     Ok(())
+}
+fn ssh_command_argv(argv: &[String]) -> Vec<String> {
+    if argv.is_empty() {
+        vec!["/bin/sh".to_owned(), "-il".to_owned()]
+    } else {
+        argv.to_owned()
+    }
+}
+
+fn validate_ssh_arguments(command: &SshCommand) -> Result<()> {
+    for (label, value) in [
+        ("box id", command.id.as_str()),
+        ("working directory", command.cwd.as_str()),
+        ("guest user", command.user.as_str()),
+    ] {
+        if value.contains('\0') {
+            bail!("{label} cannot contain NUL bytes");
+        }
+    }
+    if let Some(endpoint) = command.endpoint.as_deref() {
+        if endpoint.is_empty() {
+            bail!("agent endpoint cannot be empty");
+        }
+        if endpoint.contains('\0') {
+            bail!("agent endpoint cannot contain NUL bytes");
+        }
+    }
+    if command.argv.iter().any(|argument| argument.contains('\0')) {
+        bail!("command arguments cannot contain NUL bytes");
+    }
+    for entry in &command.env {
+        parse_env_entry(entry)?;
+    }
+    Ok(())
+}
+#[cfg(unix)]
+struct TerminalSignals {
+    interrupt: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(not(unix))]
+struct TerminalSignals;
+
+async fn install_terminal_signals() -> Result<TerminalSignals> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(TerminalSignals {
+            interrupt: signal(SignalKind::interrupt()).context("register SIGINT handler")?,
+            hangup: signal(SignalKind::hangup()).context("register SIGHUP handler")?,
+            quit: signal(SignalKind::quit()).context("register SIGQUIT handler")?,
+            terminate: signal(SignalKind::terminate()).context("register SIGTERM handler")?,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(TerminalSignals)
+    }
+}
+
+async fn run_ssh_session_with_signals(
+    client: &mut AgentClient,
+    argv: Vec<String>,
+    cwd: String,
+    env: Vec<(String, String)>,
+    user: String,
+    terminal: Option<&TerminalModeGuard>,
+    signals: TerminalSignals,
+) -> Result<ExecResult> {
+    #[cfg(unix)]
+    {
+        let TerminalSignals {
+            mut interrupt,
+            mut hangup,
+            mut quit,
+            mut terminate,
+        } = signals;
+        tokio::select! {
+            result = run_ssh_session(client, argv, cwd, env, user) => result,
+            _ = interrupt.recv() => terminate_after_signal(terminal, 128 + 2),
+            _ = hangup.recv() => terminate_after_signal(terminal, 128 + 1),
+            _ = quit.recv() => terminate_after_signal(terminal, 128 + 3),
+            _ = terminate.recv() => terminate_after_signal(terminal, 128 + 15),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (terminal, signals);
+        run_ssh_session(client, argv, cwd, env, user).await
+    }
+}
+
+#[cfg(unix)]
+fn terminate_after_signal(
+    terminal: Option<&TerminalModeGuard>,
+    exit_code: i32,
+) -> Result<ExecResult> {
+    if let Some(terminal) = terminal {
+        terminal.restore();
+    }
+    std::process::exit(exit_code);
+}
+
+async fn run_ssh_session(
+    client: &mut AgentClient,
+    argv: Vec<String>,
+    cwd: String,
+    env: Vec<(String, String)>,
+    user: String,
+) -> Result<ExecResult> {
+    let mut session = client
+        .exec_pty_session(argv, cwd, env, user)
+        .await
+        .context("start pbox-agent PTY session")?;
+    let input_sender = session.input.clone();
+    let _input_thread = thread::spawn(move || pump_terminal_input(input_sender));
+    let mut result = ExecResult::default();
+    while let Some(event) = session
+        .output
+        .message()
+        .await
+        .context("read pbox-agent PTY output")?
+    {
+        match event.event {
+            Some(exec_event::Event::Stdout(data)) => {
+                write_pty_output(data, false)
+                    .await
+                    .context("write pbox-agent PTY output")?;
+            }
+            Some(exec_event::Event::Stderr(data)) => {
+                write_pty_output(data, true)
+                    .await
+                    .context("write pbox-agent PTY error output")?;
+            }
+            Some(exec_event::Event::Exit(exit)) => {
+                result.code = exit.code;
+                result.signal = exit.signal;
+                result.exited = true;
+                break;
+            }
+            None => bail!("pbox-agent PTY stream sent an empty event"),
+        }
+    }
+    if !result.exited {
+        bail!("pbox-agent PTY stream ended without exit status");
+    }
+    match tokio::time::timeout(SSH_POST_EXIT_TIMEOUT, session.output.message()).await {
+        Ok(Ok(None)) => {}
+        Ok(Ok(Some(_))) => bail!("pbox-agent PTY stream sent data after exit"),
+        Ok(Err(error)) => return Err(error).context("close pbox-agent PTY output"),
+        Err(_) => bail!("pbox-agent PTY stream did not close after exit"),
+    }
+    Ok(result)
+}
+
+async fn write_pty_output(data: Vec<u8>, stderr: bool) -> Result<()> {
+    let result = tokio::task::spawn_blocking(move || {
+        if stderr {
+            let mut output = io::stderr();
+            output.write_all(&data)?;
+            output.flush()
+        } else {
+            let mut output = io::stdout();
+            output.write_all(&data)?;
+            output.flush()
+        }
+    })
+    .await
+    .context("join PTY output writer")?;
+    result.context("write PTY output")
+}
+
+fn pump_terminal_input(sender: tokio::sync::mpsc::Sender<ExecInput>) {
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = match stdin.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) => {
+                eprintln!("[ssh] read terminal input: {error}");
+                break;
+            }
+        };
+        if count == 0 {
+            let _ = sender.blocking_send(ExecInput::Eof);
+            break;
+        }
+        if sender
+            .blocking_send(ExecInput::Data(buffer[..count].to_vec()))
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+#[cfg(unix)]
+struct TerminalModeGuard {
+    original: nix::sys::termios::Termios,
+}
+
+#[cfg(unix)]
+impl TerminalModeGuard {
+    fn enter() -> Result<Option<Self>> {
+        let stdin = io::stdin();
+        if !stdin.is_terminal() {
+            return Ok(None);
+        }
+        let original = tcgetattr(&stdin).context("read terminal settings")?;
+        let mut raw = original.clone();
+        cfmakeraw(&mut raw);
+        tcsetattr(&stdin, SetArg::TCSAFLUSH, &raw).context("enable raw terminal mode")?;
+        Ok(Some(Self { original }))
+    }
+
+    fn restore(&self) {
+        let stdin = io::stdin();
+        if let Err(error) = tcsetattr(&stdin, SetArg::TCSAFLUSH, &self.original) {
+            eprintln!("[ssh] restore terminal settings: {error}");
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalModeGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+#[cfg(not(unix))]
+struct TerminalModeGuard;
+
+#[cfg(not(unix))]
+impl TerminalModeGuard {
+    fn enter() -> Result<Option<Self>> {
+        Ok(None)
+    }
 }
 
 fn write_exec_streams(result: &ExecResult) -> Result<()> {
@@ -1443,7 +1767,7 @@ fn read_secret_from_stdin() -> Result<String> {
     let stdin = io::stdin();
     let mut terminal = match tcgetattr(&stdin) {
         Ok(terminal) => Some(terminal),
-        Err(error) if error == nix::errno::Errno::ENOTTY => None,
+        Err(nix::errno::Errno::ENOTTY) => None,
         Err(error) => return Err(error).context("read terminal settings"),
     };
     if let Some(settings) = terminal.as_mut() {
@@ -2389,10 +2713,10 @@ fn color_enabled(color: ColorChoice, json: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnsibleRun, BoxRecord, ForwardCommand, RecipeSnapshot, create_recipe_snapshot,
+        AnsibleRun, BoxRecord, ForwardCommand, RecipeSnapshot, SshCommand, create_recipe_snapshot,
         delete_recipe_snapshot, exec_exit_code, finish_recipe_failure, finish_recipe_success,
         parse_env_entry, parse_recipe_sync_ttl, parse_remote_path, record_recipe_provenance,
-        validate_forward_arguments, write_download,
+        ssh_command_argv, validate_forward_arguments, validate_ssh_arguments, write_download,
     };
     use anyhow::anyhow;
     use pbox_agent_client::ExecResult;
@@ -2889,8 +3213,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_env_entry_rejects_invalid_entries() {
-        assert!(parse_env_entry("MISSING_EQUALS").is_err());
+    fn parse_env_entry_rejects_invalid_entries_without_echoing_input() {
+        let error = parse_env_entry("TOP_SECRET_VALUE").unwrap_err().to_string();
+        assert!(!error.contains("TOP_SECRET_VALUE"));
+        assert!(error.contains("KEY=VALUE"));
         assert!(parse_env_entry("=missing-name").is_err());
         assert!(parse_env_entry("BAD\0VALUE=x").is_err());
     }
@@ -2988,5 +3314,32 @@ mod tests {
         assert_eq!(fs::read(&target).unwrap(), b"original");
         fs::remove_file(&link).unwrap();
         fs::remove_file(&target).unwrap();
+    }
+    #[test]
+    fn ssh_defaults_to_a_login_shell() {
+        assert_eq!(
+            ssh_command_argv(&[]),
+            vec!["/bin/sh".to_owned(), "-il".to_owned()]
+        );
+    }
+
+    #[test]
+    fn ssh_rejects_nul_bytes_in_command_arguments() {
+        let command = SshCommand {
+            id: "pbx_t3yzd9y3".to_owned(),
+            endpoint: Some("https://127.0.0.1:7443".to_owned()),
+            cwd: "/home/pbox".to_owned(),
+            user: "pbox".to_owned(),
+            env: Vec::new(),
+            argv: vec!["/bin/sh\0".to_owned()],
+        };
+
+        let error = validate_ssh_arguments(&command).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("command arguments cannot contain NUL bytes")
+        );
     }
 }

@@ -27,6 +27,7 @@ use tonic::{Status, Streaming};
 const AGENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_RPC_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_COLLECTED_BYTES: usize = 64 * 1024 * 1024;
+const EXEC_INPUT_KEEPALIVE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentClientError {
@@ -270,26 +271,48 @@ impl AgentClient {
         let (input_sender, mut input_receiver) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut sent_eof = false;
-            while let Some(input) = input_receiver.recv().await {
-                let (stdin, stdin_eof) = match input {
-                    ExecInput::Data(data) => (data, false),
-                    ExecInput::Eof => (Vec::new(), true),
-                };
-                if request_sender
-                    .send(ExecRequest {
-                        protocol_version: PROTOCOL_VERSION,
-                        stdin,
-                        stdin_eof,
-                        ..Default::default()
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                if stdin_eof {
-                    sent_eof = true;
-                    break;
+            let mut keepalive = tokio::time::interval(EXEC_INPUT_KEEPALIVE);
+            keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            keepalive.tick().await;
+            loop {
+                tokio::select! {
+                    input = input_receiver.recv() => {
+                        let Some(input) = input else {
+                            break;
+                        };
+                        let (stdin, stdin_eof) = match input {
+                            ExecInput::Data(data) => (data, false),
+                            ExecInput::Eof => (Vec::new(), true),
+                        };
+                        if request_sender
+                            .send(ExecRequest {
+                                protocol_version: PROTOCOL_VERSION,
+                                stdin,
+                                stdin_eof,
+                                ..Default::default()
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if stdin_eof {
+                            sent_eof = true;
+                            break;
+                        }
+                    }
+                    _ = keepalive.tick() => {
+                        if request_sender
+                            .send(ExecRequest {
+                                protocol_version: PROTOCOL_VERSION,
+                                ..Default::default()
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                 }
             }
             if !sent_eof {
