@@ -10,7 +10,7 @@ use bootstrap::{
     cleanup_bootstrap_with_fallback, wait_for_agent,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use images::{is_oci_reference, prepare_oci_template, search_oci_repository};
+use images::{is_oci_reference, oci_template_present, prepare_oci_template, search_oci_repository};
 #[cfg(unix)]
 use nix::sys::signal::Signal;
 #[cfg(unix)]
@@ -613,28 +613,41 @@ fn run_image(
                 } else {
                     println!("tags:");
                     for tag in result.tags {
-                        println!("  {tag}");
+                        println!("  {}", safe_terminal_text(&tag));
                     }
                 }
             }
         }
         ImageSubcommand::Pull(command) => {
-            let node = resolve_pve_node(&client, &config.pve.node, command.node.as_deref())?;
-            let storages = client
-                .list_node_storages(&node)
-                .with_context(|| format!("discover PVE storage on node {node}"))?;
             let configured_storage = command
                 .storage
                 .as_deref()
                 .unwrap_or(config.pve.template_storage.as_str());
+            let node = resolve_pve_node_with_storage(
+                &client,
+                &config.pve.node,
+                command.node.as_deref(),
+                configured_storage,
+                "vztmpl",
+                "OCI templates",
+            )?;
+            let storages = client
+                .list_node_storages(&node)
+                .with_context(|| format!("discover PVE storage on node {node}"))?;
             let storage =
                 select_pve_storage(&storages, configured_storage, "vztmpl", "OCI templates")?
                     .to_owned();
-            let prepared = prepare_oci_template(&client, &node, &storage, &command.reference)?;
+            let mut prepared = prepare_oci_template(&client, &node, &storage, &command.reference)?;
             let downloaded = prepared.task.is_some();
-            if let Some(task) = prepared.task {
-                wait_for_task(&client, &node, task)
-                    .with_context(|| format!("wait for OCI image {}", prepared.reference))?;
+            if let Some(task) = prepared.task.take() {
+                wait_for_oci_template_task(
+                    &client,
+                    &node,
+                    &storage,
+                    &prepared.reference,
+                    &prepared.volume,
+                    task,
+                )?;
             }
             let output = ImagePullOutput {
                 reference: prepared.reference,
@@ -2710,6 +2723,35 @@ fn resolve_pve_node(
         .ok_or_else(|| anyhow!("no online PVE node found; pass --node or set pve.node"))
 }
 
+fn resolve_pve_node_with_storage(
+    client: &impl PveApi,
+    configured: &str,
+    requested: Option<&str>,
+    storage: &str,
+    content: &str,
+    role: &str,
+) -> Result<String> {
+    let requested = requested.unwrap_or(configured);
+    if requested != "auto" {
+        return non_empty_new_value("PVE node", requested);
+    }
+
+    let mut nodes = client.list_nodes().context("discover PVE nodes")?;
+    nodes.retain(|node| node.status.as_deref() == Some("online"));
+    nodes.sort_by(|left, right| left.node.cmp(&right.node));
+    for node in nodes {
+        let storages = client
+            .list_node_storages(&node.node)
+            .with_context(|| format!("discover PVE storage on node {}", node.node))?;
+        if storage_matches_requirement(&storages, storage, content) {
+            return Ok(node.node);
+        }
+    }
+    bail!(
+        "no online PVE node has active storage for {role}; pass --node or adjust the storage setting"
+    )
+}
+
 fn resolve_new_node(
     client: &impl PveApi,
     config: &Config,
@@ -2966,10 +3008,16 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
                 "vztmpl",
                 "OCI templates",
             )?;
-            let prepared = prepare_oci_template(&client, &node, storage, image)?;
-            if let Some(task) = prepared.task {
-                wait_for_task(&client, &node, task)
-                    .with_context(|| format!("wait for OCI image {}", prepared.reference))?;
+            let mut prepared = prepare_oci_template(&client, &node, storage, image)?;
+            if let Some(task) = prepared.task.take() {
+                wait_for_oci_template_task(
+                    &client,
+                    &node,
+                    storage,
+                    &prepared.reference,
+                    &prepared.volume,
+                    task,
+                )?;
             }
             (Some(node), Some(prepared.volume))
         } else {
@@ -3691,6 +3739,25 @@ fn generate_unique_id(existing: &[BoxRecord]) -> Result<PboxId> {
     Err(anyhow!("could not allocate a unique pbox identifier"))
 }
 
+fn wait_for_oci_template_task(
+    client: &impl PveApi,
+    node: &str,
+    storage: &str,
+    reference: &str,
+    volume: &str,
+    task: PveTaskResponse,
+) -> Result<()> {
+    if let Err(task_error) = wait_for_task(client, node, task) {
+        if oci_template_present(client, node, storage, volume)
+            .with_context(|| format!("recheck OCI template {volume}"))?
+        {
+            return Ok(());
+        }
+        return Err(task_error).with_context(|| format!("wait for OCI image {reference}"));
+    }
+    Ok(())
+}
+
 fn wait_for_task(client: &impl PveApi, node: &str, task: PveTaskResponse) -> Result<()> {
     let started = Instant::now();
     loop {
@@ -4080,9 +4147,10 @@ mod tests {
         create_recipe_snapshot, delete_box_snapshot, delete_recipe_snapshot, exec_exit_code,
         finish_recipe_failure, finish_recipe_success, format_snapshot_time, parse_env_entry,
         parse_recipe_sync_ttl, parse_remote_path, parse_setup_bool, record_recipe_provenance,
-        resolve_new_command, rollback_box_snapshot, safe_terminal_text, setup_pve_error_message,
-        ssh_command_argv, template_matches, validate_forward_arguments,
-        validate_snapshot_arguments, validate_ssh_arguments, write_download,
+        resolve_new_command, resolve_pve_node_with_storage, rollback_box_snapshot,
+        safe_terminal_text, setup_pve_error_message, ssh_command_argv, template_matches,
+        validate_forward_arguments, validate_snapshot_arguments, validate_ssh_arguments,
+        wait_for_oci_template_task, write_download,
     };
     use anyhow::anyhow;
     use clap::Parser;
@@ -4461,6 +4529,22 @@ mod tests {
         assert_eq!(resolved.swap, 256);
         assert_eq!(resolved.cores, 2);
         assert!(resolved.unprivileged);
+    }
+    #[test]
+    fn image_pull_node_selection_requires_template_storage() {
+        let metadata = PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007);
+        let fake = FakePve::new(&metadata, "user note");
+        fake.storages.borrow_mut()[0].content = Some("rootdir".to_owned());
+
+        let error =
+            resolve_pve_node_with_storage(&fake, "auto", None, "local", "vztmpl", "OCI templates")
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no online PVE node has active storage")
+        );
     }
     #[test]
     fn new_resolution_rejects_nodes_without_required_storage() {
@@ -5427,6 +5511,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_pull_task_is_accepted_when_template_exists() {
+        let fake = FakePve::new(
+            &PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007),
+            "user note",
+        );
+        let prepared =
+            super::prepare_oci_template(&fake, "pve01", "local", "ghcr.io/example/base:latest")
+                .unwrap();
+        let task = prepared.task.clone().unwrap();
+        fake.storage_content.borrow_mut().push(PveStorageContent {
+            volid: prepared.volume.clone(),
+            content: Some("vztmpl".to_owned()),
+            format: Some("tar".to_owned()),
+            is_base: None,
+            extra: serde_json::Map::new(),
+        });
+        fake.fail_next_task();
+
+        wait_for_oci_template_task(
+            &fake,
+            "pve01",
+            "local",
+            &prepared.reference,
+            &prepared.volume,
+            task,
+        )
+        .unwrap();
+    }
     #[test]
     fn prepared_template_is_preserved_and_explicit_template_wins() {
         let fake = FakePve::new(

@@ -150,7 +150,7 @@ pub fn prepare_oci_template(
     let canonical = reference.canonical();
     let filename = reference.filename();
     let volume = format!("{storage}:vztmpl/{filename}.tar");
-    if storage_contains_template(client, node, storage, &volume)? {
+    if oci_template_present(client, node, storage, &volume)? {
         return Ok(OciTemplate {
             reference: canonical,
             filename,
@@ -161,7 +161,7 @@ pub fn prepare_oci_template(
     let task = match client.pull_oci_registry(node, storage, &canonical, &filename) {
         Ok(task) => Some(task),
         Err(error) if is_existing_oci_template_error(&error) => {
-            if storage_contains_template(client, node, storage, &volume)? {
+            if oci_template_present(client, node, storage, &volume)? {
                 None
             } else {
                 return Err(error).with_context(|| {
@@ -182,7 +182,7 @@ pub fn prepare_oci_template(
     })
 }
 
-fn storage_contains_template(
+pub fn oci_template_present(
     client: &impl PveApi,
     node: &str,
     storage: &str,
