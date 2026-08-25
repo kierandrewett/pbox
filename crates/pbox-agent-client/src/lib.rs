@@ -1,10 +1,11 @@
 use hyper_util::rt::TokioIo;
 use pbox_crypto::{CertificateMaterial, server_dns_name};
 use pbox_proto::PROTOCOL_VERSION;
+pub use pbox_proto::agent::{ExecEvent, exec_event};
 use pbox_proto::agent::{
-    ExecEvent, ExecRequest, FileChunk, FileResult, ForwardClose, ForwardEvent, ForwardOpen,
-    GetFileRequest, InfoRequest, InfoResponse, PingRequest, PingResponse,
-    agent_client::AgentClient as GeneratedAgentClient, exec_event, forward_event,
+    ExecRequest, FileChunk, FileResult, ForwardClose, ForwardEvent, ForwardOpen, GetFileRequest,
+    InfoRequest, InfoResponse, PingRequest, PingResponse,
+    agent_client::AgentClient as GeneratedAgentClient, forward_event,
 };
 use rustls::ClientConfig;
 use rustls::RootCertStore;
@@ -35,6 +36,8 @@ pub enum AgentClientError {
     Transport(#[from] tonic::transport::Error),
     #[error("local forwarding I/O failed: {0}")]
     Io(#[from] io::Error),
+    #[error("agent exec request stream closed")]
+    ExecRequestClosed,
     #[error("agent forward request stream closed")]
     ForwardRequestClosed,
     #[error("agent RPC failed: {0}")]
@@ -56,6 +59,17 @@ pub struct ExecResult {
     pub code: i32,
     pub signal: i32,
     pub exited: bool,
+}
+
+#[derive(Debug)]
+pub enum ExecInput {
+    Data(Vec<u8>),
+    Eof,
+}
+
+pub struct ExecPtySession {
+    pub input: mpsc::Sender<ExecInput>,
+    pub output: Streaming<ExecEvent>,
 }
 
 #[derive(Clone)]
@@ -225,6 +239,73 @@ impl AgentClient {
         S: tonic::IntoStreamingRequest<Message = ExecRequest>,
     {
         Ok(self.inner.exec(requests).await?.into_inner())
+    }
+
+    pub async fn exec_pty_session(
+        &mut self,
+        argv: Vec<String>,
+        cwd: impl Into<String>,
+        env: impl IntoIterator<Item = (String, String)>,
+        user: impl Into<String>,
+    ) -> Result<ExecPtySession, AgentClientError> {
+        let (request_sender, request_receiver) = mpsc::channel(32);
+        request_sender
+            .send(ExecRequest {
+                protocol_version: PROTOCOL_VERSION,
+                argv,
+                cwd: cwd.into(),
+                env: env.into_iter().collect(),
+                user: user.into(),
+                allocate_pty: true,
+                stdin_eof: false,
+                ..Default::default()
+            })
+            .await
+            .map_err(|_| AgentClientError::ExecRequestClosed)?;
+        let output = self
+            .inner
+            .exec(ReceiverStream::new(request_receiver))
+            .await?
+            .into_inner();
+        let (input_sender, mut input_receiver) = mpsc::channel(32);
+        tokio::spawn(async move {
+            let mut sent_eof = false;
+            while let Some(input) = input_receiver.recv().await {
+                let (stdin, stdin_eof) = match input {
+                    ExecInput::Data(data) => (data, false),
+                    ExecInput::Eof => (Vec::new(), true),
+                };
+                if request_sender
+                    .send(ExecRequest {
+                        protocol_version: PROTOCOL_VERSION,
+                        stdin,
+                        stdin_eof,
+                        ..Default::default()
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if stdin_eof {
+                    sent_eof = true;
+                    break;
+                }
+            }
+            if !sent_eof {
+                let _ = request_sender
+                    .send(ExecRequest {
+                        protocol_version: PROTOCOL_VERSION,
+                        stdin_eof: true,
+                        ..Default::default()
+                    })
+                    .await;
+            }
+        });
+        Ok(ExecPtySession {
+            input: input_sender,
+            output,
+        })
     }
 
     pub async fn exec_with_mode(

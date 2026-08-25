@@ -258,7 +258,12 @@ impl Agent for AgentService {
             os_id: std::env::consts::OS.to_owned(),
             os_version: String::new(),
             architecture: std::env::consts::ARCH.to_owned(),
-            capabilities: vec!["exec".to_owned(), "files".to_owned(), "forward".to_owned()],
+            capabilities: vec![
+                "exec".to_owned(),
+                "pty".to_owned(),
+                "files".to_owned(),
+                "forward".to_owned(),
+            ],
         }))
     }
 
@@ -1431,7 +1436,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pbox_agent_client::AgentClient;
+    use pbox_agent_client::{AgentClient, ExecInput};
     use pbox_crypto::{
         CertificatePurpose, derive_context_seed, generate_context_ca, issue_certificate,
         server_subject,
@@ -1505,6 +1510,11 @@ mod tests {
                 .iter()
                 .any(|capability| capability == "exec")
         );
+        assert!(
+            info.capabilities
+                .iter()
+                .any(|capability| capability == "pty")
+        );
 
         let result = agent
             .exec(
@@ -1523,6 +1533,72 @@ mod tests {
         assert!(result.stderr.is_empty());
         assert_eq!(result.code, 0);
         assert!(result.exited);
+
+        stop_test_agent(task).await;
+    }
+
+    #[tokio::test]
+    async fn local_agent_supports_streamed_pty_input_and_output() {
+        let box_id = "pbx_t3yzd9y3";
+        let seed = derive_context_seed("pbox@pve!cli", "secret");
+        let ca = generate_context_ca(&seed).unwrap();
+        let server = issue_certificate(
+            &ca,
+            &server_subject(box_id).unwrap(),
+            CertificatePurpose::Server,
+        )
+        .unwrap();
+        let client = issue_certificate(
+            &ca,
+            "pbox.cwd.dev/context/test-client",
+            CertificatePurpose::Client,
+        )
+        .unwrap();
+        let (endpoint, task) = spawn_test_agent(box_id, server, &ca).await;
+        let mut agent = AgentClient::connect(&endpoint, box_id, &ca.certificate_pem, &client)
+            .await
+            .unwrap();
+
+        let mut session = agent
+            .exec_pty_session(
+                vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "read value; printf 'received:%s' \"$value\"".to_owned(),
+                ],
+                "/tmp",
+                [],
+                "root",
+            )
+            .await
+            .unwrap();
+        session
+            .input
+            .send(ExecInput::Data(b"streamed-input\n".to_vec()))
+            .await
+            .unwrap();
+        session.input.send(ExecInput::Eof).await.unwrap();
+
+        let mut output = Vec::new();
+        let mut exited = false;
+        while let Some(event) = session.output.message().await.unwrap() {
+            match event.event {
+                Some(exec_event::Event::Stdout(data)) | Some(exec_event::Event::Stderr(data)) => {
+                    output.extend(data)
+                }
+                Some(exec_event::Event::Exit(exit)) => {
+                    assert_eq!(exit.code, 0);
+                    exited = true;
+                }
+                None => panic!("agent returned an empty exec event"),
+            }
+        }
+        assert!(exited);
+        assert!(
+            output
+                .windows(b"received:streamed-input".len())
+                .any(|window| { window == b"received:streamed-input" })
+        );
 
         stop_test_agent(task).await;
     }
