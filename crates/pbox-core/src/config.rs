@@ -3,9 +3,10 @@ use reqwest::Url;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -294,7 +295,7 @@ impl Config {
             "recipes.rollback-on-failure".to_owned(),
             self.recipes.rollback_on_failure.to_string(),
         );
-        values.insert("vmid_pattern".to_owned(), self.vmid_pattern.to_string());
+        values.insert("pve.vmid-pattern".to_owned(), self.vmid_pattern.to_string());
         values
     }
 
@@ -367,7 +368,7 @@ impl Config {
             "recipes.rollback-on-failure" => {
                 self.recipes.rollback_on_failure = parse_bool(key, value)?;
             }
-            "vmid_pattern" => {
+            "pve.vmid-pattern" => {
                 self.vmid_pattern =
                     value
                         .parse()
@@ -398,7 +399,7 @@ impl Config {
             "recipes.rollback-on-failure" => {
                 self.recipes.rollback_on_failure = RecipeConfig::default().rollback_on_failure
             }
-            "vmid_pattern" => self.vmid_pattern = Config::default().vmid_pattern,
+            "pve.vmid-pattern" => self.vmid_pattern = Config::default().vmid_pattern,
             _ => return Err(ConfigError::UnknownKey(key.to_owned())),
         }
         Ok(())
@@ -442,7 +443,7 @@ impl Config {
             self.recipes.rollback_on_failure = *value;
         }
         if let Some(value) = &overrides.vmid_pattern {
-            self.set_value("vmid_pattern", value)?;
+            self.set_value("pve.vmid-pattern", value)?;
         }
         Ok(())
     }
@@ -705,21 +706,46 @@ pub fn save_file(path: &Path, config: &Config) -> Result<(), ConfigError> {
             ),
         });
     }
-    let contents = toml::to_string_pretty(config)?;
-    fs::write(path, format!("{contents}\n")).map_err(|source| ConfigError::Write {
-        path: path.to_owned(),
-        source,
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(path, permissions).map_err(|source| ConfigError::Write {
+    let contents = toml::to_string_pretty(config)? + "\n";
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = path.with_file_name(format!(".{file_name}.tmp-{}-{stamp}", std::process::id()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|source| ConfigError::Write {
+                path: temporary.clone(),
+                source,
+            })?;
+        file.write_all(contents.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|source| ConfigError::Write {
+                path: temporary.clone(),
+                source,
+            })?;
+        fs::rename(&temporary, path).map_err(|source| ConfigError::Write {
             path: path.to_owned(),
             source,
         })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    Ok(())
+    result
 }
 
 fn apply_environment(config: &mut Config) -> Result<(), ConfigError> {
@@ -888,5 +914,18 @@ mod tests {
         config.unset_value("recipes.rollback-on-failure").unwrap();
         assert_eq!(config.recipes.snapshot_before_apply, "auto");
         assert!(!config.recipes.rollback_on_failure);
+    }
+    #[test]
+    fn vmid_pattern_uses_the_public_pve_key() {
+        let mut config = Config::default();
+        config.set_value("pve.vmid-pattern", "95xx").unwrap();
+        assert_eq!(config.vmid_pattern.to_string(), "95xx");
+        assert_eq!(
+            config.get_redacted("pve.vmid-pattern").as_deref(),
+            Some("95xx"),
+        );
+        config.unset_value("pve.vmid-pattern").unwrap();
+        assert_eq!(config.vmid_pattern.to_string(), "9xxx");
+        assert!(config.set_value("vmid_pattern", "95xx").is_err());
     }
 }

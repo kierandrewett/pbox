@@ -9,6 +9,8 @@ use bootstrap::{
     cleanup_bootstrap, cleanup_bootstrap_authenticated, wait_for_agent,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
+#[cfg(unix)]
+use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
 use pbox_agent_client::{AgentClient, ExecResult};
 use pbox_core::{
     Config, ConfigStore, LxcConfigUpdateRequest, LxcCreateRequest, LxcSnapshotRequest, PboxId,
@@ -24,7 +26,7 @@ use recipes::{RecipeCatalog, RecipeRepository};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::Ipv4Addr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -344,7 +346,7 @@ fn run_config(command: ConfigSubcommand, store: &ConfigStore, json: bool) -> Res
             }
         }
         ConfigSubcommand::Set { key, value } => {
-            let value = value.unwrap_or_else(read_value_from_stdin);
+            let value = read_config_value(&key, value)?;
             let mut config = store.load_file().context("load pbox configuration")?;
             config
                 .set_value(&key, &value)
@@ -1244,14 +1246,57 @@ fn exec_exit_code(result: &ExecResult) -> i32 {
     if code < 0 { 1 } else { code.min(255) }
 }
 
-fn read_value_from_stdin() -> String {
+fn read_config_value(key: &str, value: Option<String>) -> Result<String> {
+    if is_secret_config_key(key) {
+        if value.is_some() {
+            bail!("do not pass secret values as arguments; pipe the value on stdin instead");
+        }
+        return read_secret_from_stdin();
+    }
+    match value {
+        Some(value) => Ok(value),
+        None => read_value_from_stdin(),
+    }
+}
+
+fn is_secret_config_key(key: &str) -> bool {
+    matches!(
+        key,
+        "pve.token_secret" | "pve.token-secret" | "pve.api-token-secret"
+    )
+}
+
+fn read_value_from_stdin() -> Result<String> {
     eprint!("value: ");
-    let _ = io::Write::flush(&mut io::stderr());
+    io::stderr().flush().context("flush configuration prompt")?;
     let mut value = String::new();
     io::stdin()
         .read_line(&mut value)
-        .expect("read configuration value");
-    value.trim_end_matches(['\r', '\n']).to_owned()
+        .context("read configuration value")?;
+    Ok(value.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+fn read_secret_from_stdin() -> Result<String> {
+    let stdin = io::stdin();
+    let mut terminal = match tcgetattr(&stdin) {
+        Ok(terminal) => Some(terminal),
+        Err(error) if error == nix::errno::Errno::ENOTTY => None,
+        Err(error) => return Err(error).context("read terminal settings"),
+    };
+    if let Some(settings) = terminal.as_mut() {
+        settings.local_flags.remove(LocalFlags::ECHO);
+        tcsetattr(&stdin, SetArg::TCSANOW, settings).context("disable terminal echo")?;
+    }
+    eprint!("secret: ");
+    io::stderr().flush().context("flush secret prompt")?;
+    let mut value = String::new();
+    let read_result = stdin.lock().read_line(&mut value);
+    if let Some(settings) = terminal.as_ref() {
+        tcsetattr(&stdin, SetArg::TCSANOW, settings).context("restore terminal echo")?;
+        eprintln!();
+    }
+    read_result.context("read configuration secret")?;
+    Ok(value.trim_end_matches(['\r', '\n']).to_owned())
 }
 const VMID_CREATE_ATTEMPTS: usize = 8;
 
@@ -1484,6 +1529,17 @@ fn run_repair(
             }
         }
     };
+    if let Some(recorded_vmid) = operation.vmid
+        && (record.vmid != recorded_vmid || record.node != operation.node)
+    {
+        bail!(
+            "bootstrap operation for {id_text} targets node {} VMID {}, but PVE metadata resolves it to node {} VMID {}",
+            operation.node,
+            recorded_vmid,
+            record.node,
+            record.vmid,
+        );
+    }
     if record.state != "running" {
         bail!(
             "box {id_text} is {}; start it before running `pbox repair {id_text}`",
@@ -1503,6 +1559,10 @@ fn run_repair(
 
     if operation.phase == "guest-cleaned" {
         wait_for_agent(&probe).context("verify the guest agent after bootstrap cleanup")?;
+        if let Err(ssh_error) = cleanup_bootstrap(ip, &key) {
+            cleanup_bootstrap_authenticated(&probe, &key)
+                .with_context(|| format!("SSH bootstrap cleanup failed: {ssh_error}"))?;
+        }
     } else {
         let agent_ready = operation.phase == "agent-ready" && wait_for_agent(&probe).is_ok();
         if agent_ready {
@@ -2033,6 +2093,18 @@ fn discover_boxes(client: &impl PveApi) -> Result<Vec<BoxRecord>> {
         });
     }
     records.sort_by(|left, right| left.id.cmp(&right.id));
+    for pair in records.windows(2) {
+        if pair[0].id == pair[1].id {
+            bail!(
+                "duplicate pbox id {} in PVE metadata for node {} VMID {} and node {} VMID {}",
+                pair[0].id,
+                pair[0].node,
+                pair[0].vmid,
+                pair[1].node,
+                pair[1].vmid,
+            );
+        }
+    }
     Ok(records)
 }
 

@@ -5,8 +5,11 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::Ipv4Addr;
+use std::time::Duration;
 use thiserror::Error;
 const API_PREFIX: &str = "/api2/json";
+const PVE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const PVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub trait PveApi {
     fn list_cluster_resources(&self) -> Result<Vec<ClusterResource>, PveError>;
@@ -100,10 +103,11 @@ impl fmt::Debug for PveClient {
             .finish()
     }
 }
-
 impl PveClient {
     pub fn new(config: PveClientConfig) -> Result<Self, PveError> {
         let http = Client::builder()
+            .connect_timeout(PVE_CONNECT_TIMEOUT)
+            .timeout(PVE_REQUEST_TIMEOUT)
             .danger_accept_invalid_certs(config.tls_insecure)
             .build()
             .map_err(PveError::Client)?;

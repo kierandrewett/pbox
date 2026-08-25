@@ -139,6 +139,21 @@ impl BootstrapKey {
             bail!("bootstrap operation is missing its box identity or staging path");
         }
         validate_stage(&operation.stage)?;
+        if !matches!(
+            operation.phase.as_str(),
+            "created"
+                | "container-create-task"
+                | "container-created"
+                | "container-running"
+                | "ip-discovery"
+                | "ip-discovered"
+                | "bootstrapping"
+                | "repairing"
+                | "agent-ready"
+                | "guest-cleaned"
+        ) {
+            bail!("unsupported bootstrap operation phase {}", operation.phase);
+        }
         let directory = directory.to_owned();
         let private_key = directory.join("ssh-key");
         let public_key_path = directory.join("ssh-key.pub");
