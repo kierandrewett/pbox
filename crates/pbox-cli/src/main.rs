@@ -10,6 +10,8 @@ use bootstrap::{
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(unix)]
+use nix::sys::signal::Signal;
+#[cfg(unix)]
 use nix::sys::termios::{LocalFlags, SetArg, cfmakeraw, tcgetattr, tcsetattr};
 use pbox_agent_client::{AgentClient, ExecInput, ExecResult, exec_event};
 use pbox_core::{
@@ -63,6 +65,12 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+#[derive(Debug, Args)]
+struct SetupCommand {
+    /// Save the configuration without checking the PVE connection.
+    #[arg(long)]
+    skip_verify: bool,
+}
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ColorChoice {
@@ -75,6 +83,9 @@ enum ColorChoice {
 enum Command {
     /// Generate a public pbox identifier.
     Id,
+    /// Configure pbox for first use.
+    #[command(alias = "onboard")]
+    Setup(SetupCommand),
     /// Manage local pbox configuration.
     Config(ConfigCommand),
     /// Create a pbox-managed LXC container.
@@ -306,6 +317,12 @@ enum ConfigSubcommand {
 }
 
 #[derive(Debug, Serialize)]
+struct SetupOutput {
+    config_path: String,
+    verified: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct IdOutput {
     id: PboxId,
 }
@@ -402,6 +419,9 @@ fn run() -> Result<RunOutcome> {
         .map(|_| RunOutcome::Success),
         Command::Config(command) => {
             run_config(command.command, &store, cli.json).map(|_| RunOutcome::Success)
+        }
+        Command::Setup(command) => {
+            run_setup(&store, command, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
         Command::New(command) => {
             run_new(&store, command, cli.json, cli.color).map(|_| RunOutcome::Success)
@@ -512,6 +532,270 @@ fn run_config(command: ConfigSubcommand, store: &ConfigStore, json: bool) -> Res
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct SetupAnswers {
+    pve_url: String,
+    token_id: String,
+    token_secret: Option<String>,
+    tls_insecure: bool,
+    vmid_pattern: String,
+    agent_port: String,
+    recipes_repository: String,
+    recipes_reference: String,
+}
+
+fn apply_setup_values(config: &mut Config, answers: &SetupAnswers) -> Result<()> {
+    let mut updated = config.clone();
+    updated
+        .set_value("pve.url", &answers.pve_url)
+        .context("validate PVE API URL")?;
+    updated
+        .set_value("pve.token_id", &answers.token_id)
+        .context("validate PVE API token ID")?;
+    if let Some(secret) = &answers.token_secret {
+        updated
+            .set_value("pve.token_secret", secret)
+            .context("validate PVE API token secret")?;
+    }
+    if updated.pve.token_secret.is_none() {
+        bail!("PVE API token secret is required");
+    }
+    updated
+        .set_value("pve.tls_insecure", &answers.tls_insecure.to_string())
+        .context("validate TLS setting")?;
+    updated
+        .set_value("pve.vmid-pattern", &answers.vmid_pattern)
+        .context("validate VMID pattern")?;
+    updated
+        .set_value("agent.port", &answers.agent_port)
+        .context("validate agent port")?;
+    updated
+        .set_value("recipes.repository", &answers.recipes_repository)
+        .context("validate recipe repository")?;
+    updated
+        .set_value("recipes.ref", &answers.recipes_reference)
+        .context("validate recipe reference")?;
+    updated.validate().context("validate pbox configuration")?;
+    *config = updated;
+    Ok(())
+}
+
+fn agent_identity_changes(config: &Config, answers: &SetupAnswers) -> bool {
+    let has_existing_identity = config.pve.token_id.is_some() || config.pve.token_secret.is_some();
+    has_existing_identity
+        && (config.pve.token_id.as_deref() != Some(answers.token_id.as_str())
+            || answers.token_secret.is_some())
+}
+
+fn setup_pve_error_message(error: &PveError) -> String {
+    match error {
+        PveError::Client(_) => "could not build the PVE HTTP client".to_owned(),
+        PveError::Request(_) => "could not reach the PVE API".to_owned(),
+        PveError::Decode(_) => "PVE returned an invalid response".to_owned(),
+        PveError::Http { status, .. } => format!("PVE returned HTTP status {status}"),
+        PveError::InvalidBaseUrl => "the PVE URL is invalid".to_owned(),
+        PveError::InvalidPathSegment { .. } => "the PVE request path is invalid".to_owned(),
+        PveError::InvalidSnapshotName { .. } => "the PVE snapshot name is invalid".to_owned(),
+    }
+}
+
+fn run_setup(
+    store: &ConfigStore,
+    command: SetupCommand,
+    json: bool,
+    color: ColorChoice,
+) -> Result<()> {
+    let mut config = store.load_file().context("load pbox configuration")?;
+    eprintln!("pbox setup");
+    eprintln!(
+        "Configure the PVE connection and local defaults. Press Enter to keep a shown default."
+    );
+    let config_path = store.path().display().to_string();
+    eprintln!("Configuration file: {}", safe_terminal_text(&config_path));
+
+    let pve_url =
+        prompt_setup_config_value(&config, "pve.url", "PVE API URL", config.pve.url.as_deref())?;
+    let token_id = prompt_setup_config_value(
+        &config,
+        "pve.token_id",
+        "PVE API token ID",
+        config.pve.token_id.as_deref(),
+    )?;
+    let token_secret = prompt_setup_secret(config.pve.token_secret.is_some())?;
+    let tls_insecure = prompt_setup_bool(
+        "Disable PVE TLS certificate verification (not recommended)",
+        config.pve.tls_insecure,
+    )?;
+    let vmid_pattern_default = config.vmid_pattern.to_string();
+    let vmid_pattern = prompt_setup_config_value(
+        &config,
+        "pve.vmid-pattern",
+        "PVE VMID pattern",
+        Some(&vmid_pattern_default),
+    )?;
+    let agent_port_default = config.agent.port.to_string();
+    let agent_port = prompt_setup_config_value(
+        &config,
+        "agent.port",
+        "Guest agent port",
+        Some(&agent_port_default),
+    )?;
+    let recipes_repository = prompt_setup_config_value(
+        &config,
+        "recipes.repository",
+        "Recipe repository",
+        Some(config.recipes.repository.as_str()),
+    )?;
+    let recipes_reference = prompt_setup_config_value(
+        &config,
+        "recipes.ref",
+        "Recipe repository ref",
+        Some(config.recipes.reference.as_str()),
+    )?;
+    let answers = SetupAnswers {
+        pve_url,
+        token_id,
+        token_secret,
+        tls_insecure,
+        vmid_pattern,
+        agent_port,
+        recipes_repository,
+        recipes_reference,
+    };
+
+    if agent_identity_changes(&config, &answers) {
+        eprintln!(
+            "warning: changing the PVE token ID or secret changes the agent trust root \
+             and can disconnect existing boxes."
+        );
+        if !prompt_setup_bool("Continue with the token change", false)? {
+            bail!("setup cancelled");
+        }
+    }
+    apply_setup_values(&mut config, &answers)?;
+
+    let verified = if command.skip_verify {
+        false
+    } else {
+        let client = client_from_config(&config)?;
+        client.list_cluster_resources().map_err(|error| {
+            anyhow!(
+                "PVE connection verification failed: {}; configuration was not saved",
+                setup_pve_error_message(&error)
+            )
+        })?;
+        true
+    };
+    store.save(&config).context("save pbox configuration")?;
+    let output = SetupOutput {
+        config_path: store.path().display().to_string(),
+        verified,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        let status = if verified {
+            "PVE connection verified"
+        } else {
+            "configuration saved; PVE connection check skipped"
+        };
+        if color_enabled(color, false) {
+            println!(
+                "\x1b[1;32mConfiguration saved\x1b[0m to {}",
+                safe_terminal_text(&output.config_path)
+            );
+            println!("\x1b[1;32m{status}\x1b[0m");
+        } else {
+            println!(
+                "Configuration saved to {}",
+                safe_terminal_text(&output.config_path)
+            );
+            println!("{status}");
+        }
+        println!("Next: pbox list");
+    }
+    Ok(())
+}
+
+fn prompt_setup_config_value(
+    config: &Config,
+    key: &str,
+    label: &str,
+    default: Option<&str>,
+) -> Result<String> {
+    loop {
+        let value = prompt_setup_text(label, default)?;
+        let mut candidate = config.clone();
+        match candidate.set_value(key, &value) {
+            Ok(()) => return Ok(value),
+            Err(error) => eprintln!(
+                "invalid {label}: {}",
+                safe_terminal_text(&error.to_string())
+            ),
+        }
+    }
+}
+
+fn prompt_setup_secret(existing: bool) -> Result<Option<String>> {
+    let label = if existing {
+        "PVE API token secret (leave blank to keep current)"
+    } else {
+        "PVE API token secret"
+    };
+    loop {
+        let value = read_secret_with_prompt(label)?;
+        if value.is_empty() {
+            if existing {
+                return Ok(None);
+            }
+            eprintln!("PVE API token secret is required.");
+            continue;
+        }
+        return Ok(Some(value));
+    }
+}
+
+fn prompt_setup_bool(label: &str, default: bool) -> Result<bool> {
+    let default_text = if default { "yes" } else { "no" };
+    loop {
+        let value = prompt_setup_text(label, Some(default_text))?;
+        match parse_setup_bool(&value) {
+            Ok(value) => return Ok(value),
+            Err(error) => eprintln!("invalid {label}: {error}"),
+        }
+    }
+}
+
+fn parse_setup_bool(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" => Ok(true),
+        "0" | "false" | "no" | "n" => Ok(false),
+        _ => bail!("expected yes or no"),
+    }
+}
+
+fn prompt_setup_text(label: &str, default: Option<&str>) -> Result<String> {
+    eprint!("{label}");
+    if let Some(default) = default.filter(|value| !value.is_empty()) {
+        eprint!(" [{}]", safe_terminal_text(default));
+    }
+    eprint!(": ");
+    io::stderr().flush().context("flush setup prompt")?;
+    let mut value = String::new();
+    let read = io::stdin()
+        .read_line(&mut value)
+        .context("read setup value")?;
+    if read == 0 {
+        bail!("input ended during pbox setup");
+    }
+    let value = value.trim_end_matches(['\r', '\n']);
+    if value.is_empty() {
+        Ok(default.unwrap_or_default().to_owned())
+    } else {
+        Ok(value.to_owned())
+    }
 }
 
 #[derive(Debug)]
@@ -1823,27 +2107,238 @@ fn read_value_from_stdin() -> Result<String> {
     Ok(value.trim_end_matches(['\r', '\n']).to_owned())
 }
 
-fn read_secret_from_stdin() -> Result<String> {
-    let stdin = io::stdin();
-    let mut terminal = match tcgetattr(&stdin) {
-        Ok(terminal) => Some(terminal),
-        Err(nix::errno::Errno::ENOTTY) => None,
-        Err(error) => return Err(error).context("read terminal settings"),
-    };
-    if let Some(settings) = terminal.as_mut() {
-        settings.local_flags.remove(LocalFlags::ECHO);
-        tcsetattr(&stdin, SetArg::TCSANOW, settings).context("disable terminal echo")?;
+#[cfg(unix)]
+const SECRET_PROMPT_SIGNALS: [Signal; 5] = [
+    Signal::SIGHUP,
+    Signal::SIGINT,
+    Signal::SIGQUIT,
+    Signal::SIGTERM,
+    Signal::SIGTSTP,
+];
+
+#[cfg(unix)]
+struct SignalDispositionGuard {
+    original: Vec<(Signal, nix::libc::sigaction)>,
+}
+
+#[cfg(unix)]
+impl SignalDispositionGuard {
+    fn capture() -> Result<Self> {
+        let mut original = Vec::with_capacity(SECRET_PROMPT_SIGNALS.len());
+        for signal in SECRET_PROMPT_SIGNALS {
+            let mut action = std::mem::MaybeUninit::<nix::libc::sigaction>::uninit();
+            let result = unsafe {
+                nix::libc::sigaction(
+                    signal as nix::libc::c_int,
+                    std::ptr::null(),
+                    action.as_mut_ptr(),
+                )
+            };
+            if result != 0 {
+                return Err(nix::errno::Errno::last()).context("read signal disposition");
+            }
+            original.push((signal, unsafe { action.assume_init() }));
+        }
+        Ok(Self { original })
     }
-    eprint!("secret: ");
+
+    fn restore(&mut self) -> Result<()> {
+        let mut first_error = None;
+        for (signal, action) in &self.original {
+            let result = unsafe {
+                nix::libc::sigaction(
+                    *signal as nix::libc::c_int,
+                    action as *const nix::libc::sigaction,
+                    std::ptr::null_mut(),
+                )
+            };
+            if result != 0 && first_error.is_none() {
+                first_error = Some(nix::errno::Errno::last());
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error).context("restore signal dispositions")
+        } else {
+            self.original.clear();
+            Ok(())
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SignalDispositionGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+#[cfg(unix)]
+struct SecretPromptSignals {
+    interrupt: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    stop: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+async fn install_secret_prompt_signals() -> Result<SecretPromptSignals> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    Ok(SecretPromptSignals {
+        interrupt: signal(SignalKind::interrupt()).context("register SIGINT handler")?,
+        hangup: signal(SignalKind::hangup()).context("register SIGHUP handler")?,
+        quit: signal(SignalKind::quit()).context("register SIGQUIT handler")?,
+        terminate: signal(SignalKind::terminate()).context("register SIGTERM handler")?,
+        stop: signal(SignalKind::from_raw(nix::libc::SIGTSTP))
+            .context("register SIGTSTP handler")?,
+    })
+}
+
+#[cfg(unix)]
+struct TerminalEchoGuard {
+    original: Option<nix::sys::termios::Termios>,
+}
+
+#[cfg(unix)]
+impl TerminalEchoGuard {
+    fn new(stdin: &io::Stdin) -> Result<Option<Self>> {
+        let mut disabled = match tcgetattr(stdin) {
+            Ok(terminal) => terminal,
+            Err(nix::errno::Errno::ENOTTY) => return Ok(None),
+            Err(error) => return Err(error).context("read terminal settings"),
+        };
+        let original = disabled.clone();
+        disabled.local_flags.remove(LocalFlags::ECHO);
+        tcsetattr(stdin, SetArg::TCSANOW, &disabled).context("disable terminal echo")?;
+        Ok(Some(Self {
+            original: Some(original),
+        }))
+    }
+
+    fn restore(&mut self, stdin: &io::Stdin) -> Result<()> {
+        let Some(original) = self.original.as_ref() else {
+            return Ok(());
+        };
+        tcsetattr(stdin, SetArg::TCSANOW, original).context("restore terminal echo")?;
+        self.original = None;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalEchoGuard {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.as_ref() {
+            let stdin = io::stdin();
+            let _ = tcsetattr(&stdin, SetArg::TCSANOW, original);
+        }
+    }
+}
+
+fn read_secret_from_stdin() -> Result<String> {
+    read_secret_with_prompt("secret")
+}
+
+fn read_secret_with_prompt(prompt: &str) -> Result<String> {
+    #[cfg(unix)]
+    {
+        let mut signal_handlers = SignalDispositionGuard::capture()?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("create async runtime for secret prompt")?;
+        let result = runtime.block_on(read_secret_with_prompt_async(prompt));
+        drop(runtime);
+        let restore_result = signal_handlers.restore();
+        match (result, restore_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(signal_error)) => {
+                Err(anyhow!("{error}; additionally, {signal_error}"))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        eprint!("{prompt}: ");
+        io::stderr().flush().context("flush secret prompt")?;
+        let mut value = String::new();
+        let read = io::stdin()
+            .read_line(&mut value)
+            .context("read configuration secret")?;
+        if read == 0 {
+            bail!("input ended while reading secret");
+        }
+        Ok(value.trim_end_matches(['\r', '\n']).to_owned())
+    }
+}
+
+#[cfg(unix)]
+async fn read_secret_with_prompt_async(prompt: &str) -> Result<String> {
+    let signals = install_secret_prompt_signals().await?;
+    let stdin = io::stdin();
+    let read_stdin = io::stdin();
+    let mut terminal = TerminalEchoGuard::new(&stdin)?;
+    let had_terminal = terminal.is_some();
+    eprint!("{prompt}: ");
     io::stderr().flush().context("flush secret prompt")?;
-    let mut value = String::new();
-    let read_result = stdin.lock().read_line(&mut value);
-    if let Some(settings) = terminal.as_ref() {
-        tcsetattr(&stdin, SetArg::TCSANOW, settings).context("restore terminal echo")?;
+    let read_task = tokio::task::spawn_blocking(move || {
+        let mut value = String::new();
+        let read = read_stdin
+            .lock()
+            .read_line(&mut value)
+            .context("read configuration secret")?;
+        Ok::<_, anyhow::Error>((read, value))
+    });
+    let SecretPromptSignals {
+        mut interrupt,
+        mut hangup,
+        mut quit,
+        mut terminate,
+        mut stop,
+    } = signals;
+    let read_result = tokio::select! {
+        result = read_task => result.context("join secret input task"),
+        _ = interrupt.recv() => terminate_secret_prompt_on_signal(&mut terminal, had_terminal, 128 + 2),
+        _ = hangup.recv() => terminate_secret_prompt_on_signal(&mut terminal, had_terminal, 128 + 1),
+        _ = quit.recv() => terminate_secret_prompt_on_signal(&mut terminal, had_terminal, 128 + 3),
+        _ = terminate.recv() => terminate_secret_prompt_on_signal(&mut terminal, had_terminal, 128 + 15),
+        _ = stop.recv() => terminate_secret_prompt_on_signal(&mut terminal, had_terminal, 128 + 20),
+    };
+    let restore_result = match terminal.as_mut() {
+        Some(terminal) => terminal.restore(&stdin),
+        None => Ok(()),
+    };
+    if had_terminal {
         eprintln!();
     }
-    read_result.context("read configuration secret")?;
+    restore_result?;
+    let (read, value) = read_result??;
+    if read == 0 {
+        bail!("input ended while reading secret");
+    }
     Ok(value.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+#[cfg(unix)]
+fn terminate_secret_prompt_on_signal(
+    terminal: &mut Option<TerminalEchoGuard>,
+    had_terminal: bool,
+    exit_code: i32,
+) -> ! {
+    let restore_result = match terminal.as_mut() {
+        Some(terminal) => terminal.restore(&io::stdin()),
+        None => Ok(()),
+    };
+    if had_terminal {
+        eprintln!();
+    }
+    if let Err(error) = restore_result {
+        eprintln!("warning: could not restore terminal echo: {error}");
+    }
+    std::process::exit(exit_code);
 }
 const VMID_CREATE_ATTEMPTS: usize = 8;
 
@@ -3013,14 +3508,17 @@ fn color_enabled(color: ColorChoice, json: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnsibleRun, BoxRecord, ForwardCommand, RecipeSnapshot, SshCommand, create_box_snapshot,
-        create_recipe_snapshot, delete_box_snapshot, delete_recipe_snapshot, exec_exit_code,
-        finish_recipe_failure, finish_recipe_success, format_snapshot_time, parse_env_entry,
-        parse_recipe_sync_ttl, parse_remote_path, record_recipe_provenance, rollback_box_snapshot,
-        safe_terminal_text, ssh_command_argv, validate_forward_arguments,
+        AnsibleRun, BoxRecord, Cli, Command, ForwardCommand, RecipeSnapshot, SetupAnswers,
+        SetupCommand, SetupOutput, SshCommand, agent_identity_changes, apply_setup_values,
+        create_box_snapshot, create_recipe_snapshot, delete_box_snapshot, delete_recipe_snapshot,
+        exec_exit_code, finish_recipe_failure, finish_recipe_success, format_snapshot_time,
+        parse_env_entry, parse_recipe_sync_ttl, parse_remote_path, parse_setup_bool,
+        record_recipe_provenance, rollback_box_snapshot, safe_terminal_text,
+        setup_pve_error_message, ssh_command_argv, validate_forward_arguments,
         validate_snapshot_arguments, validate_ssh_arguments, write_download,
     };
     use anyhow::anyhow;
+    use clap::Parser;
     use pbox_agent_client::ExecResult;
     use pbox_core::ui::ColorMode;
     use pbox_core::{
@@ -3719,5 +4217,146 @@ mod tests {
                 .to_string()
                 .contains("command arguments cannot contain NUL bytes")
         );
+    }
+    #[test]
+    fn setup_alias_accepts_onboard_and_skip_verify() {
+        let cli = Cli::try_parse_from(["pbox", "onboard", "--skip-verify"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Setup(SetupCommand { skip_verify: true })
+        ));
+    }
+
+    #[test]
+    fn setup_answers_update_required_configuration_without_exposing_secrets() {
+        let mut config = Config::default();
+        let answers = SetupAnswers {
+            pve_url: "https://pve.example".to_owned(),
+            token_id: "user@pam!pbox".to_owned(),
+            token_secret: Some("secret-value".to_owned()),
+            tls_insecure: false,
+            vmid_pattern: "95xx".to_owned(),
+            agent_port: "7444".to_owned(),
+            recipes_repository: "https://example.test/recipes.git".to_owned(),
+            recipes_reference: "main".to_owned(),
+        };
+
+        apply_setup_values(&mut config, &answers).unwrap();
+
+        assert_eq!(config.pve.url.as_deref(), Some("https://pve.example"));
+        assert_eq!(config.pve.token_id.as_deref(), Some("user@pam!pbox"));
+        assert_eq!(
+            config
+                .pve
+                .token_secret
+                .as_ref()
+                .map(|secret| secret.expose()),
+            Some("secret-value")
+        );
+        assert_eq!(config.vmid_pattern.to_string(), "95xx");
+        assert_eq!(config.agent.port, 7444);
+        let redacted = serde_json::to_string(&config.redacted()).unwrap();
+        assert!(!redacted.contains("secret-value"));
+    }
+    #[test]
+    fn setup_keeps_existing_secret_when_prompt_is_blank() {
+        let mut config = Config::default();
+        config
+            .set_value("pve.token_secret", "existing-secret")
+            .unwrap();
+        let answers = SetupAnswers {
+            pve_url: "https://pve.example".to_owned(),
+            token_id: "user@pam!pbox".to_owned(),
+            token_secret: None,
+            tls_insecure: false,
+            vmid_pattern: "9xxx".to_owned(),
+            agent_port: "7443".to_owned(),
+            recipes_repository: Config::default().recipes.repository,
+            recipes_reference: "main".to_owned(),
+        };
+
+        apply_setup_values(&mut config, &answers).unwrap();
+
+        assert_eq!(
+            config
+                .pve
+                .token_secret
+                .as_ref()
+                .map(|secret| secret.expose()),
+            Some("existing-secret")
+        );
+    }
+
+    #[test]
+    fn setup_rejects_invalid_answers_without_partial_mutation() {
+        let mut config = Config::default();
+        config.set_value("pve.url", "https://old.example").unwrap();
+        let original = config.clone();
+        let answers = SetupAnswers {
+            pve_url: "http://not-https.example".to_owned(),
+            token_id: "user@pam!pbox".to_owned(),
+            token_secret: Some("secret-value".to_owned()),
+            tls_insecure: false,
+            vmid_pattern: "95xx".to_owned(),
+            agent_port: "7444".to_owned(),
+            recipes_repository: "https://example.test/recipes.git".to_owned(),
+            recipes_reference: "main".to_owned(),
+        };
+
+        assert!(apply_setup_values(&mut config, &answers).is_err());
+        assert_eq!(config, original);
+    }
+
+    #[test]
+    fn setup_detects_agent_identity_rotation() {
+        let mut config = Config::default();
+        config.set_value("pve.token_id", "old@pam!pbox").unwrap();
+        config.set_value("pve.token_secret", "old-secret").unwrap();
+        let unchanged = SetupAnswers {
+            pve_url: "https://pve.example".to_owned(),
+            token_id: "old@pam!pbox".to_owned(),
+            token_secret: None,
+            tls_insecure: false,
+            vmid_pattern: "9xxx".to_owned(),
+            agent_port: "7443".to_owned(),
+            recipes_repository: Config::default().recipes.repository,
+            recipes_reference: "main".to_owned(),
+        };
+        assert!(!agent_identity_changes(&config, &unchanged));
+
+        let mut rotated = unchanged.clone();
+        rotated.token_id = "new@pam!pbox".to_owned();
+        assert!(agent_identity_changes(&config, &rotated));
+        rotated.token_id = "old@pam!pbox".to_owned();
+        rotated.token_secret = Some("new-secret".to_owned());
+        assert!(agent_identity_changes(&config, &rotated));
+    }
+
+    #[test]
+    fn setup_boolean_parser_accepts_yes_and_no() {
+        assert!(parse_setup_bool("yes").unwrap());
+        assert!(!parse_setup_bool(" FALSE ").unwrap());
+        assert!(parse_setup_bool("maybe").is_err());
+    }
+
+    #[test]
+    fn setup_output_contains_only_safe_status_fields() {
+        let output = SetupOutput {
+            config_path: "/tmp/pbox/config.toml".to_owned(),
+            verified: true,
+        };
+        let json = serde_json::to_string(&output).unwrap();
+
+        assert!(json.contains("config_path"));
+        assert!(json.contains("verified"));
+        assert!(!json.contains("secret"));
+    }
+    #[test]
+    fn setup_verification_errors_use_safe_messages() {
+        let message = setup_pve_error_message(&PveError::InvalidBaseUrl);
+
+        assert_eq!(message, "the PVE URL is invalid");
+        assert!(!message.contains("secret"));
     }
 }
