@@ -46,13 +46,58 @@ impl<'de> Deserialize<'de> for Secret {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PveDefaults {
+    pub cores: u64,
+    pub memory: u64,
+    pub swap: u64,
+    pub disk: String,
+    pub unprivileged: bool,
+    pub onboot: bool,
+}
+
+impl Default for PveDefaults {
+    fn default() -> Self {
+        Self {
+            cores: 2,
+            memory: 1024,
+            swap: 256,
+            disk: "8G".to_owned(),
+            unprivileged: true,
+            onboot: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct PveConfig {
     pub url: Option<String>,
     pub token_id: Option<String>,
     pub token_secret: Option<Secret>,
     pub tls_insecure: bool,
+    pub node: String,
+    pub storage: String,
+    pub template_storage: String,
+    pub bridge: String,
+    pub defaults: PveDefaults,
+}
+
+impl Default for PveConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            token_id: None,
+            token_secret: None,
+            tls_insecure: false,
+            node: "auto".to_owned(),
+            storage: "auto".to_owned(),
+            template_storage: "local".to_owned(),
+            bridge: "vmbr0".to_owned(),
+            defaults: PveDefaults::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,9 +143,24 @@ impl Default for RecipeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct ImageConfig {
+    pub default: String,
+}
+
+impl Default for ImageConfig {
+    fn default() -> Self {
+        Self {
+            default: "debian-13".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Config {
     pub pve: PveConfig,
     pub agent: AgentConfig,
+    pub images: ImageConfig,
     pub recipes: RecipeConfig,
     pub vmid_pattern: VmidPattern,
 }
@@ -110,10 +170,21 @@ impl Default for Config {
         Self {
             pve: PveConfig::default(),
             agent: AgentConfig::default(),
+            images: ImageConfig::default(),
             recipes: RecipeConfig::default(),
             vmid_pattern: VmidPattern::parse("9xxx").expect("default VMID pattern is valid"),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RedactedPveDefaults {
+    pub cores: u64,
+    pub memory: u64,
+    pub swap: u64,
+    pub disk: String,
+    pub unprivileged: bool,
+    pub onboot: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,12 +193,22 @@ pub struct RedactedPveConfig {
     pub token_id: Option<String>,
     pub token_secret: Option<String>,
     pub tls_insecure: bool,
+    pub node: String,
+    pub storage: String,
+    pub template_storage: String,
+    pub bridge: String,
+    pub defaults: RedactedPveDefaults,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RedactedAgentConfig {
     pub binary: Option<PathBuf>,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RedactedImageConfig {
+    pub default: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -145,9 +226,11 @@ pub struct RedactedRecipeConfig {
 pub struct RedactedConfig {
     pub pve: RedactedPveConfig,
     pub agent: RedactedAgentConfig,
+    pub images: RedactedImageConfig,
     pub recipes: RedactedRecipeConfig,
     pub vmid_pattern: VmidPattern,
 }
+
 pub fn parse_duration(value: &str) -> Result<Duration, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -201,6 +284,30 @@ impl Config {
                 reason: "expected a TCP port from 1 to 65535".to_owned(),
             });
         }
+        validate_non_empty("pve.node", &self.pve.node, "PVE node cannot be empty")?;
+        validate_non_empty(
+            "pve.storage",
+            &self.pve.storage,
+            "PVE storage cannot be empty",
+        )?;
+        validate_non_empty(
+            "pve.template-storage",
+            &self.pve.template_storage,
+            "PVE template storage cannot be empty",
+        )?;
+        validate_non_empty("pve.bridge", &self.pve.bridge, "PVE bridge cannot be empty")?;
+        validate_positive("pve.defaults.cores", self.pve.defaults.cores)?;
+        validate_positive("pve.defaults.memory", self.pve.defaults.memory)?;
+        validate_non_empty(
+            "pve.defaults.disk",
+            &self.pve.defaults.disk,
+            "default disk size cannot be empty",
+        )?;
+        validate_non_empty(
+            "images.default",
+            &self.images.default,
+            "default image cannot be empty",
+        )?;
         validate_repository_reference("recipes.repository", &self.recipes.repository)?;
         validate_non_empty(
             "recipes.ref",
@@ -229,10 +336,25 @@ impl Config {
                     .as_ref()
                     .map(|_| "<redacted>".to_owned()),
                 tls_insecure: self.pve.tls_insecure,
+                node: self.pve.node.clone(),
+                storage: self.pve.storage.clone(),
+                template_storage: self.pve.template_storage.clone(),
+                bridge: self.pve.bridge.clone(),
+                defaults: RedactedPveDefaults {
+                    cores: self.pve.defaults.cores,
+                    memory: self.pve.defaults.memory,
+                    swap: self.pve.defaults.swap,
+                    disk: self.pve.defaults.disk.clone(),
+                    unprivileged: self.pve.defaults.unprivileged,
+                    onboot: self.pve.defaults.onboot,
+                },
             },
             agent: RedactedAgentConfig {
                 binary: self.agent.binary.clone(),
                 port: self.agent.port,
+            },
+            images: RedactedImageConfig {
+                default: self.images.default.clone(),
             },
             recipes: RedactedRecipeConfig {
                 repository: self.recipes.repository.clone(),
@@ -245,7 +367,9 @@ impl Config {
             vmid_pattern: self.vmid_pattern.clone(),
         }
     }
+}
 
+impl Config {
     pub fn redacted_pairs(&self) -> BTreeMap<String, String> {
         let mut values = BTreeMap::new();
         values.insert(
@@ -268,6 +392,38 @@ impl Config {
             "pve.tls_insecure".to_owned(),
             self.pve.tls_insecure.to_string(),
         );
+        values.insert("pve.node".to_owned(), self.pve.node.clone());
+        values.insert("pve.storage".to_owned(), self.pve.storage.clone());
+        values.insert(
+            "pve.template-storage".to_owned(),
+            self.pve.template_storage.clone(),
+        );
+        values.insert("pve.bridge".to_owned(), self.pve.bridge.clone());
+        values.insert(
+            "pve.defaults.cores".to_owned(),
+            self.pve.defaults.cores.to_string(),
+        );
+        values.insert(
+            "pve.defaults.memory".to_owned(),
+            self.pve.defaults.memory.to_string(),
+        );
+        values.insert(
+            "pve.defaults.swap".to_owned(),
+            self.pve.defaults.swap.to_string(),
+        );
+        values.insert(
+            "pve.defaults.disk".to_owned(),
+            self.pve.defaults.disk.clone(),
+        );
+        values.insert(
+            "pve.defaults.unprivileged".to_owned(),
+            self.pve.defaults.unprivileged.to_string(),
+        );
+        values.insert(
+            "pve.defaults.onboot".to_owned(),
+            self.pve.defaults.onboot.to_string(),
+        );
+        values.insert("images.default".to_owned(), self.images.default.clone());
         values.insert(
             "agent.binary".to_owned(),
             self.agent
@@ -311,12 +467,7 @@ impl Config {
                 self.pve.url = Some(value.trim().to_owned());
             }
             "pve.token_id" => {
-                if value.trim().is_empty() {
-                    return Err(ConfigError::InvalidValue {
-                        key: key.to_owned(),
-                        reason: "token id cannot be empty".to_owned(),
-                    });
-                }
+                validate_non_empty(key, value, "token id cannot be empty")?;
                 self.pve.token_id = Some(value.to_owned());
             }
             "pve.token_secret" => {
@@ -330,6 +481,45 @@ impl Config {
             }
             "pve.tls_insecure" => {
                 self.pve.tls_insecure = parse_bool(key, value)?;
+            }
+            "pve.node" => {
+                validate_non_empty(key, value, "PVE node cannot be empty")?;
+                self.pve.node = value.trim().to_owned();
+            }
+            "pve.storage" => {
+                validate_non_empty(key, value, "PVE storage cannot be empty")?;
+                self.pve.storage = value.trim().to_owned();
+            }
+            "pve.template-storage" => {
+                validate_non_empty(key, value, "PVE template storage cannot be empty")?;
+                self.pve.template_storage = value.trim().to_owned();
+            }
+            "pve.bridge" => {
+                validate_non_empty(key, value, "PVE bridge cannot be empty")?;
+                self.pve.bridge = value.trim().to_owned();
+            }
+            "pve.defaults.cores" => {
+                self.pve.defaults.cores = parse_positive(key, value)?;
+            }
+            "pve.defaults.memory" => {
+                self.pve.defaults.memory = parse_positive(key, value)?;
+            }
+            "pve.defaults.swap" => {
+                self.pve.defaults.swap = parse_unsigned(key, value)?;
+            }
+            "pve.defaults.disk" => {
+                validate_non_empty(key, value, "default disk size cannot be empty")?;
+                self.pve.defaults.disk = value.trim().to_owned();
+            }
+            "pve.defaults.unprivileged" => {
+                self.pve.defaults.unprivileged = parse_bool(key, value)?;
+            }
+            "pve.defaults.onboot" => {
+                self.pve.defaults.onboot = parse_bool(key, value)?;
+            }
+            "images.default" => {
+                validate_non_empty(key, value, "default image cannot be empty")?;
+                self.images.default = value.trim().to_owned();
             }
             "agent.binary" => {
                 if value.trim().is_empty() {
@@ -381,12 +571,28 @@ impl Config {
         }
         Ok(())
     }
+
     pub fn unset_value(&mut self, key: &str) -> Result<(), ConfigError> {
         match key {
             "pve.url" => self.pve.url = None,
             "pve.token_id" => self.pve.token_id = None,
             "pve.token_secret" => self.pve.token_secret = None,
             "pve.tls_insecure" => self.pve.tls_insecure = false,
+            "pve.node" => self.pve.node = PveConfig::default().node,
+            "pve.storage" => self.pve.storage = PveConfig::default().storage,
+            "pve.template-storage" => {
+                self.pve.template_storage = PveConfig::default().template_storage
+            }
+            "pve.bridge" => self.pve.bridge = PveConfig::default().bridge,
+            "pve.defaults.cores" => self.pve.defaults.cores = PveDefaults::default().cores,
+            "pve.defaults.memory" => self.pve.defaults.memory = PveDefaults::default().memory,
+            "pve.defaults.swap" => self.pve.defaults.swap = PveDefaults::default().swap,
+            "pve.defaults.disk" => self.pve.defaults.disk = PveDefaults::default().disk,
+            "pve.defaults.unprivileged" => {
+                self.pve.defaults.unprivileged = PveDefaults::default().unprivileged
+            }
+            "pve.defaults.onboot" => self.pve.defaults.onboot = PveDefaults::default().onboot,
+            "images.default" => self.images.default = ImageConfig::default().default,
             "agent.binary" => self.agent.binary = None,
             "agent.port" => self.agent.port = AgentConfig::default().port,
             "recipes.repository" => self.recipes.repository = RecipeConfig::default().repository,
@@ -545,6 +751,29 @@ fn parse_port(key: &str, value: &str) -> Result<u16, ConfigError> {
         });
     }
     Ok(port)
+}
+
+fn validate_positive(key: &str, value: u64) -> Result<(), ConfigError> {
+    if value == 0 {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_owned(),
+            reason: "expected a value greater than zero".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn parse_unsigned(key: &str, value: &str) -> Result<u64, ConfigError> {
+    value.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
+        key: key.to_owned(),
+        reason: "expected a non-negative integer".to_owned(),
+    })
+}
+
+fn parse_positive(key: &str, value: &str) -> Result<u64, ConfigError> {
+    let parsed = parse_unsigned(key, value)?;
+    validate_positive(key, parsed)?;
+    Ok(parsed)
 }
 
 fn validate_repository_reference(key: &str, value: &str) -> Result<(), ConfigError> {
@@ -915,6 +1144,44 @@ mod tests {
         assert_eq!(config.recipes.snapshot_before_apply, "auto");
         assert!(!config.recipes.rollback_on_failure);
     }
+    #[test]
+    fn provisioning_defaults_are_configurable_and_listed() {
+        let mut config = Config::default();
+        assert_eq!(config.pve.node, "auto");
+        assert_eq!(config.pve.storage, "auto");
+        assert_eq!(config.pve.template_storage, "local");
+        assert_eq!(config.pve.bridge, "vmbr0");
+        assert_eq!(config.images.default, "debian-13");
+        assert_eq!(config.pve.defaults.disk, "8G");
+
+        config.set_value("pve.node", "node-a").unwrap();
+        config.set_value("pve.defaults.memory", "2048").unwrap();
+        config
+            .set_value("pve.defaults.unprivileged", "false")
+            .unwrap();
+        config.set_value("images.default", "ubuntu-24.04").unwrap();
+
+        assert_eq!(config.get_redacted("pve.node").as_deref(), Some("node-a"));
+        assert_eq!(
+            config.get_redacted("pve.defaults.memory").as_deref(),
+            Some("2048")
+        );
+        assert_eq!(
+            config.get_redacted("pve.defaults.unprivileged").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            config.get_redacted("images.default").as_deref(),
+            Some("ubuntu-24.04")
+        );
+
+        config.unset_value("pve.node").unwrap();
+        config.unset_value("images.default").unwrap();
+        assert_eq!(config.pve.node, "auto");
+        assert_eq!(config.images.default, "debian-13");
+        assert!(config.set_value("pve.defaults.cores", "0").is_err());
+    }
+
     #[test]
     fn vmid_pattern_uses_the_public_pve_key() {
         let mut config = Config::default();

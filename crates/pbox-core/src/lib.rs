@@ -6,8 +6,8 @@ pub mod ui;
 pub mod vmid;
 
 pub use config::{
-    AgentConfig, Config, ConfigError, ConfigOverrides, ConfigStore, PveConfig, RedactedConfig,
-    Secret, parse_duration,
+    AgentConfig, Config, ConfigError, ConfigOverrides, ConfigStore, ImageConfig, PveConfig,
+    PveDefaults, RedactedConfig, Secret, parse_duration,
 };
 pub use id::{PboxId, PboxIdError};
 pub use metadata::{
