@@ -865,9 +865,23 @@ async fn receive_upload(
             .await
             .map_err(internal_io)?;
     } else {
-        tokio::fs::copy(temporary_path, destination)
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut destination_file = options.open(destination).await.map_err(internal_io)?;
+        let mut source_file = tokio::fs::File::open(temporary_path)
             .await
             .map_err(internal_io)?;
+        tokio::io::copy(&mut source_file, &mut destination_file)
+            .await
+            .map_err(internal_io)?;
+        destination_file.flush().await.map_err(internal_io)?;
+        if first.mode != 0 {
+            set_mode(destination, safe_mode(first.mode)).map_err(internal_io)?;
+        }
         tokio::fs::remove_file(temporary_path)
             .await
             .map_err(internal_io)?;
@@ -1095,7 +1109,8 @@ async fn main() -> Result<()> {
         // The context CA is the authorization boundary shared by all boxes.
         // Every client that can derive it from the dedicated PVE token can
         // control the corresponding pbox estate.
-        .client_ca_root(Certificate::from_pem(client_ca));
+        .client_ca_root(Certificate::from_pem(client_ca))
+        .timeout(HANDSHAKE_TIMEOUT);
     let exec_slots = Arc::new(Semaphore::new(args.max_exec));
     let file_slots = Arc::new(Semaphore::new(args.max_file));
     let handshake_slots = Arc::new(Semaphore::new(args.max_handshakes));

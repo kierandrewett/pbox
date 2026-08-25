@@ -47,16 +47,17 @@ impl AgentClient {
         let domain = server_dns_name(box_id)
             .map_err(|error| AgentClientError::Identity(error.to_string()))?;
         let endpoint = Endpoint::from_shared(endpoint.to_owned())
-            .map_err(|error| AgentClientError::Endpoint(error.to_string()))?
-            .tls_config(
-                ClientTlsConfig::new()
-                    .domain_name(domain)
-                    .ca_certificate(Certificate::from_pem(ca_pem))
-                    .identity(Identity::from_pem(
-                        client_identity.certificate_pem.clone(),
-                        client_identity.private_key_pem.clone(),
-                    )),
-            )?;
+            .map_err(|error| AgentClientError::Endpoint(error.to_string()))?;
+        validate_https_endpoint(&endpoint)?;
+        let endpoint = endpoint.tls_config(
+            ClientTlsConfig::new()
+                .domain_name(domain)
+                .ca_certificate(Certificate::from_pem(ca_pem))
+                .identity(Identity::from_pem(
+                    client_identity.certificate_pem.clone(),
+                    client_identity.private_key_pem.clone(),
+                )),
+        )?;
         let inner = GeneratedAgentClient::connect(endpoint).await?;
         Ok(Self {
             inner,
@@ -314,4 +315,31 @@ async fn collect_exec_stream(
         )));
     }
     Ok(result)
+}
+fn validate_https_endpoint(endpoint: &Endpoint) -> Result<(), AgentClientError> {
+    if endpoint
+        .uri()
+        .scheme_str()
+        .is_none_or(|scheme| !scheme.eq_ignore_ascii_case("https"))
+    {
+        return Err(AgentClientError::Endpoint(
+            "agent endpoint must use https".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_non_https_agent_endpoints() {
+        let endpoint = Endpoint::from_shared("http://127.0.0.1:7443").unwrap();
+        let error = validate_https_endpoint(&endpoint).unwrap_err();
+        assert!(matches!(
+            error,
+            AgentClientError::Endpoint(message) if message == "agent endpoint must use https"
+        ));
+    }
 }
