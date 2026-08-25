@@ -666,7 +666,7 @@ fn run_recipe(
                 repository: catalog.repository.clone(),
                 revision: catalog.revision.clone(),
             };
-            let run = match apply_recipe(
+            let applied = match apply_recipe(
                 store.path(),
                 &binary,
                 repository.cache_dir(),
@@ -675,7 +675,7 @@ fn run_recipe(
                 &box_id,
                 json,
             ) {
-                Ok(run) => run,
+                Ok(applied) => applied,
                 Err(error) => {
                     if let Err(provenance_error) = record_recipe_provenance(
                         &client,
@@ -691,6 +691,7 @@ fn run_recipe(
                     return Err(error);
                 }
             };
+            let ansible::RecipeApplyResult { run, cleanup_error } = applied;
             record_recipe_provenance(
                 &client,
                 &record,
@@ -698,6 +699,10 @@ fn run_recipe(
                 &selected.metadata.capabilities,
                 "success",
             )?;
+            if let Some(error) = cleanup_error {
+                return Err(error)
+                    .context("recipe applied successfully but operation cleanup failed");
+            }
             if json {
                 println!("{}", serde_json::to_string_pretty(&run)?);
             } else {
@@ -729,9 +734,13 @@ fn record_recipe_provenance(
     };
     let mut last_error = None;
     for _attempt in 0..3 {
-        let config = client
-            .get_lxc_config(&record.node, record.vmid)
-            .with_context(|| format!("read metadata for box {}", record.id))?;
+        let config = match client.get_lxc_config(&record.node, record.vmid) {
+            Ok(config) => config,
+            Err(error) => {
+                last_error = Some(format!("read metadata: {error}"));
+                continue;
+            }
+        };
         let description = config.description.as_deref().unwrap_or("");
         let mut metadata = parse_metadata(description)
             .context("parse pbox metadata before recording recipe provenance")?
@@ -748,9 +757,11 @@ fn record_recipe_provenance(
         } else {
             metadata.recipes.push(provenance.clone());
         }
-        for capability in capabilities {
-            if !metadata.capabilities.contains(capability) {
-                metadata.capabilities.push(capability.clone());
+        if result == "success" {
+            for capability in capabilities {
+                if !metadata.capabilities.contains(capability) {
+                    metadata.capabilities.push(capability.clone());
+                }
             }
         }
         metadata

@@ -3,8 +3,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use pbox_core::PboxId;
 use serde::Serialize;
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CONNECTION_PLUGIN_NAME: &str = "pbox_agent";
@@ -15,6 +17,12 @@ pub struct AnsibleRun {
     pub box_id: String,
     pub repository: String,
     pub revision: String,
+}
+
+#[derive(Debug)]
+pub struct RecipeApplyResult {
+    pub run: AnsibleRun,
+    pub cleanup_error: Option<anyhow::Error>,
 }
 
 struct AnsibleInvocation<'a> {
@@ -34,7 +42,7 @@ pub fn apply_recipe(
     recipe: &Recipe,
     box_id: &str,
     json: bool,
-) -> Result<AnsibleRun> {
+) -> Result<RecipeApplyResult> {
     validate_box_id(box_id)?;
     if !repository_root.is_dir() {
         bail!(
@@ -94,14 +102,29 @@ pub fn apply_recipe(
             .with_context(|| format!("apply recipe {} to box {box_id}", recipe.id))?;
         Ok(())
     })();
-    finish_operation(result, &operation_directory)?;
-
-    Ok(AnsibleRun {
-        recipe: recipe.id.clone(),
-        box_id: box_id.to_owned(),
-        repository: catalog.repository.clone(),
-        revision: catalog.revision.clone(),
-    })
+    let cleanup_result = fs::remove_dir_all(&operation_directory).with_context(|| {
+        format!(
+            "remove recipe operation directory {}",
+            operation_directory.display()
+        )
+    });
+    match result {
+        Err(error) => {
+            if let Err(cleanup_error) = cleanup_result {
+                return Err(error.context(cleanup_error));
+            }
+            Err(error)
+        }
+        Ok(()) => Ok(RecipeApplyResult {
+            run: AnsibleRun {
+                recipe: recipe.id.clone(),
+                box_id: box_id.to_owned(),
+                repository: catalog.repository.clone(),
+                revision: catalog.revision.clone(),
+            },
+            cleanup_error: cleanup_result.err(),
+        }),
+    }
 }
 
 fn run_ansible(invocation: &AnsibleInvocation<'_>, playbook: &Path, json: bool) -> Result<()> {
@@ -135,14 +158,29 @@ fn run_ansible(invocation: &AnsibleInvocation<'_>, playbook: &Path, json: bool) 
         .stdin(Stdio::inherit());
 
     if json {
-        let output = command
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .spawn()
             .context("run ansible-playbook; install Ansible on the control machine")?;
-        eprint!("{}", String::from_utf8_lossy(&output.stdout));
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-        ensure_success(output.status, "ansible-playbook")
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("ansible-playbook stdout pipe was not created"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("ansible-playbook stderr pipe was not created"))?;
+        let stdout_thread = thread::spawn(|| stream_child_output(stdout));
+        let stderr_thread = thread::spawn(|| stream_child_output(stderr));
+        let status = child.wait().context("wait for ansible-playbook")?;
+        stdout_thread
+            .join()
+            .map_err(|_| anyhow!("Ansible stdout stream thread panicked"))??;
+        stderr_thread
+            .join()
+            .map_err(|_| anyhow!("Ansible stderr stream thread panicked"))??;
+        ensure_success(status, "ansible-playbook")
     } else {
         let status = command
             .stdout(Stdio::inherit())
@@ -152,21 +190,10 @@ fn run_ansible(invocation: &AnsibleInvocation<'_>, playbook: &Path, json: bool) 
         ensure_success(status, "ansible-playbook")
     }
 }
-
-fn finish_operation(result: Result<()>, operation_directory: &Path) -> Result<()> {
-    let cleanup_result = fs::remove_dir_all(operation_directory).with_context(|| {
-        format!(
-            "remove recipe operation directory {}",
-            operation_directory.display()
-        )
-    });
-    if let Err(error) = result {
-        if let Err(cleanup_error) = cleanup_result {
-            return Err(error.context(cleanup_error));
-        }
-        return Err(error);
-    }
-    cleanup_result
+fn stream_child_output<R: Read>(mut reader: R) -> std::io::Result<()> {
+    let stderr = io::stderr();
+    let mut target = stderr.lock();
+    io::copy(&mut reader, &mut target).map(|_| ())
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf> {
@@ -460,6 +487,17 @@ class Connection(ConnectionBase):
             raise AnsibleError('pbox command returned a non-object JSON value')
         return payload
 
+    def _run_file_transfer(self, arguments):
+        try:
+            return subprocess.run(
+                self._pbox_command(arguments),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except OSError as error:
+            raise AnsibleError('cannot start pbox: %s' % error)
+
     def exec_command(self, cmd, in_data=None, sudoable=True):
         if in_data:
             raise AnsibleError('pbox_agent does not support pipelined stdin')
@@ -483,30 +521,20 @@ class Connection(ConnectionBase):
             raise AnsibleError('pbox exec returned an invalid JSON payload: %s' % error)
 
     def put_file(self, in_path, out_path):
-        result = subprocess.run(
-            self._pbox_command([
-                'scp',
-                in_path,
-                '%s:%s' % (self._target_box(), out_path),
-            ]),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
+        result = self._run_file_transfer([
+            'scp',
+            in_path,
+            '%s:%s' % (self._target_box(), out_path),
+        ])
         if result.returncode != 0:
             raise AnsibleError(result.stderr.decode('utf-8', errors='replace').strip() or 'pbox upload failed')
 
     def fetch_file(self, in_path, out_path):
-        result = subprocess.run(
-            self._pbox_command([
-                'scp',
-                '%s:%s' % (self._target_box(), in_path),
-                out_path,
-            ]),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
+        result = self._run_file_transfer([
+            'scp',
+            '%s:%s' % (self._target_box(), in_path),
+            out_path,
+        ])
         if result.returncode != 0:
             raise AnsibleError(result.stderr.decode('utf-8', errors='replace').strip() or 'pbox download failed')
 
