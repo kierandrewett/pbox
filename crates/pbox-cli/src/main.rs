@@ -4,7 +4,10 @@ mod recipes;
 use ansible::{AnsibleRun, apply_recipe};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
-use bootstrap::{BootstrapKey, BootstrapRequest, bootstrap_box};
+use bootstrap::{
+    AgentProbeRequest, BootstrapKey, BootstrapOperation, BootstrapRequest, bootstrap_box,
+    wait_for_agent,
+};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pbox_agent_client::{AgentClient, ExecResult};
 use pbox_core::{
@@ -69,6 +72,8 @@ enum Command {
     Config(ConfigCommand),
     /// Create a pbox-managed LXC container.
     New(NewCommand),
+    /// Resume an interrupted guest-agent bootstrap.
+    Repair { id: String },
     /// Execute a non-interactive command through pbox-agent.
     Exec(ExecCommand),
     /// Copy files between the control machine and a pbox.
@@ -285,6 +290,9 @@ fn run() -> Result<RunOutcome> {
         }
         Command::New(command) => {
             run_new(&store, command, cli.json, cli.color).map(|_| RunOutcome::Success)
+        }
+        Command::Repair { id } => {
+            run_repair(&store, &id, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
         Command::Exec(command) => run_exec(&store, command, cli.json),
         Command::Scp(command) => {
@@ -1329,6 +1337,16 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
     let id_text = id.to_string();
     let materials = agent_materials(&config, &id_text)?;
     let key = BootstrapKey::generate(&id_text).context("create temporary bootstrap SSH key")?;
+    let mut operation = BootstrapOperation::new(
+        &id_text,
+        &command.node,
+        config.agent.port,
+        key.remote_stage(),
+    );
+    if let Err(error) = key.save_operation(&operation) {
+        let _ = key.cleanup();
+        return Err(error).context("persist bootstrap recovery operation");
+    }
     let hostname = command
         .name
         .clone()
@@ -1337,29 +1355,44 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
     {
         Ok(result) => result,
         Err(error) => {
-            let cleanup = key.cleanup().err();
-            return Err(error).context(format_bootstrap_cleanup_failure(&key, cleanup.as_ref()));
+            return Err(error).context(format_bootstrap_repair_path(&key, &id_text));
         }
     };
+    operation.vmid = Some(vmid);
+    operation.phase = "container-created".to_owned();
+    key.save_operation(&operation)
+        .context("record created container in bootstrap recovery operation")?;
     if let Err(error) = wait_for_task(&client, &command.node, task) {
-        let cleanup = key.cleanup().err();
+        operation.phase = "container-create-task".to_owned();
+        let _ = key.save_operation(&operation);
         return Err(error)
             .context(format!(
                 "PVE did not finish creating box {id} with VMID {vmid} on {}",
                 command.node
             ))
-            .context(format_bootstrap_cleanup_failure(&key, cleanup.as_ref()));
+            .context(format_bootstrap_repair_path(&key, &id_text));
     }
+    operation.phase = "container-running".to_owned();
+    key.save_operation(&operation)
+        .context("record running container in bootstrap recovery operation")?;
 
     let ip = match wait_for_lxc_ip(&client, &command.node, vmid) {
         Ok(ip) => ip,
         Err(error) => {
-            let cleanup = key.cleanup().err();
+            operation.phase = "ip-discovery".to_owned();
+            let _ = key.save_operation(&operation);
             return Err(error)
                 .context("wait for the new container IPv4 address")
-                .context(format_bootstrap_cleanup_failure(&key, cleanup.as_ref()));
+                .context(format_bootstrap_repair_path(&key, &id_text));
         }
     };
+    operation.ip = Some(ip);
+    operation.phase = "ip-discovered".to_owned();
+    key.save_operation(&operation)
+        .context("record container address in bootstrap recovery operation")?;
+    operation.phase = "bootstrapping".to_owned();
+    key.save_operation(&operation)
+        .context("record guest bootstrap start")?;
     let bootstrap_request = BootstrapRequest {
         box_id: &id_text,
         ip,
@@ -1370,14 +1403,18 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         client_ca: &materials.ca,
         client_subject: &materials.client_subject,
     };
-    bootstrap_box(&bootstrap_request).with_context(|| {
+    if let Err(error) = bootstrap_box(&bootstrap_request) {
+        return Err(error).context(format_bootstrap_repair_path(&key, &id_text));
+    }
+    operation.phase = "agent-ready".to_owned();
+    key.save_operation(&operation)
+        .context("record authenticated guest agent readiness")?;
+    key.cleanup().with_context(|| {
         format!(
-            "bootstrap box {id}; temporary SSH credentials remain in {} for repair",
-            key.operation_directory().display()
+            "remove completed bootstrap credentials; {}",
+            format_bootstrap_repair_path(&key, &id_text)
         )
     })?;
-    key.cleanup()
-        .context("remove completed bootstrap credentials")?;
 
     let (state, output_ip) = if command.stopped {
         let task = client
@@ -1401,6 +1438,78 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
     };
     print_box_info(&info, json, color)
 }
+fn run_repair(
+    store: &ConfigStore,
+    requested_id: &str,
+    json: bool,
+    color: ColorChoice,
+) -> Result<()> {
+    let id: PboxId = requested_id.parse().context("parse pbox id")?;
+    let id_text = id.to_string();
+    let config = load_config(store)?;
+    let (key, mut operation) = BootstrapKey::find_pending(&id_text)?
+        .ok_or_else(|| anyhow!("no interrupted bootstrap operation found for {id_text}"))?;
+    let agent_binary = resolve_agent_binary(&config)?;
+    if !agent_binary.is_file() {
+        return Err(anyhow!(
+            "pbox-agent binary does not exist: {}",
+            agent_binary.display()
+        ));
+    }
+    let client = client_from_config(&config)?;
+    let record = find_box(&client, &id_text)?;
+    if record.state != "running" {
+        bail!(
+            "box {id_text} is {}; start it before running `pbox repair {id_text}`",
+            record.state
+        );
+    }
+    let ip = wait_for_lxc_ip(&client, &record.node, record.vmid)
+        .with_context(|| format!("discover IPv4 address for box {id_text}"))?;
+    let materials = agent_materials(&config, &id_text)?;
+    operation.node = record.node.clone();
+    operation.vmid = Some(record.vmid);
+    operation.ip = Some(ip);
+    operation.port = config.agent.port;
+    operation.phase = "repairing".to_owned();
+    key.save_operation(&operation)
+        .context("record bootstrap repair state")?;
+
+    let bootstrap_request = BootstrapRequest {
+        box_id: &id_text,
+        ip,
+        port: config.agent.port,
+        key: &key,
+        agent_binary: &agent_binary,
+        server_identity: &materials.server,
+        client_ca: &materials.ca,
+        client_subject: &materials.client_subject,
+    };
+    if let Err(error) = bootstrap_box(&bootstrap_request) {
+        return Err(error).context(format_bootstrap_repair_path(&key, &id_text));
+    }
+    operation.phase = "agent-ready".to_owned();
+    key.save_operation(&operation)
+        .context("record repaired guest agent readiness")?;
+    key.cleanup().with_context(|| {
+        format!(
+            "remove completed bootstrap credentials; {}",
+            format_bootstrap_repair_path(&key, &id_text)
+        )
+    })?;
+
+    let info = BoxInfo {
+        id,
+        vmid: record.vmid,
+        state: record.state,
+        node: record.node,
+        ip: Some(ip.to_string()),
+        name: record.name,
+        recipes: record.recipes,
+        capabilities: record.capabilities,
+    };
+    print_box_info(&info, json, color)
+}
 
 fn run_start(
     store: &ConfigStore,
@@ -1408,15 +1517,38 @@ fn run_start(
     json: bool,
     color: ColorChoice,
 ) -> Result<()> {
-    run_box_task(
-        store,
-        requested_id,
-        "start",
-        "running",
-        json,
-        color,
-        |client, record| client.start_lxc(&record.node, record.vmid),
-    )
+    let config = load_config(store)?;
+    let client = client_from_config(&config)?;
+    let record = find_box(&client, requested_id)?;
+    let task = client
+        .start_lxc(&record.node, record.vmid)
+        .with_context(|| format!("start box {}", record.id))?;
+    wait_for_task(&client, &record.node, task)
+        .with_context(|| format!("PVE did not finish starting box {}", record.id))?;
+    let ip = wait_for_lxc_ip(&client, &record.node, record.vmid)
+        .with_context(|| format!("discover IPv4 address for box {}", record.id))?;
+    let box_id = record.id.to_string();
+    let materials = agent_materials(&config, &box_id)?;
+    let probe = AgentProbeRequest {
+        box_id: &box_id,
+        ip,
+        port: config.agent.port,
+        client_ca: &materials.ca,
+        client_subject: &materials.client_subject,
+    };
+    wait_for_agent(&probe)
+        .with_context(|| format!("wait for authenticated pbox-agent in box {}", record.id))?;
+    let info = BoxInfo {
+        id: record.id,
+        vmid: record.vmid,
+        state: "running".to_owned(),
+        node: record.node,
+        ip: Some(ip.to_string()),
+        name: record.name,
+        recipes: record.recipes,
+        capabilities: record.capabilities,
+    };
+    print_box_info(&info, json, color)
 }
 
 fn run_stop(
@@ -1488,20 +1620,11 @@ where
     };
     print_box_info(&info, json, color)
 }
-fn format_bootstrap_cleanup_failure(
-    key: &BootstrapKey,
-    cleanup_error: Option<&anyhow::Error>,
-) -> String {
-    match cleanup_error {
-        Some(error) => format!(
-            "could not remove temporary bootstrap credentials in {}: {error}",
-            key.operation_directory().display()
-        ),
-        None => format!(
-            "temporary bootstrap credentials were removed from {}",
-            key.operation_directory().display()
-        ),
-    }
+fn format_bootstrap_repair_path(key: &BootstrapKey, box_id: &str) -> String {
+    format!(
+        "bootstrap operation remains in {}; run `pbox repair {box_id}` to retry",
+        key.operation_directory().display()
+    )
 }
 
 fn run_delete(
