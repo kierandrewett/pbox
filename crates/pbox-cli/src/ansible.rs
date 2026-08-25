@@ -1,15 +1,24 @@
 use crate::recipes::{Recipe, RecipeCatalog, RecipeKind};
 use anyhow::{Context, Result, anyhow, bail};
 use pbox_core::PboxId;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+#[cfg(unix)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CONNECTION_PLUGIN_NAME: &str = "pbox_agent";
+const BRIDGE_PROTOCOL_VERSION: u32 = 1;
+const MAX_BRIDGE_REQUEST_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AnsibleRun {
@@ -29,6 +38,7 @@ struct AnsibleInvocation<'a> {
     config_path: &'a Path,
     pbox_binary: &'a Path,
     repository_root: &'a Path,
+    operation_directory: &'a Path,
     plugin_directory: &'a Path,
     inventory: &'a Path,
     box_id: &'a str,
@@ -82,6 +92,7 @@ pub fn apply_recipe(
             config_path,
             pbox_binary,
             repository_root,
+            operation_directory: &operation_directory,
             plugin_directory: &plugin_directory,
             inventory: &inventory,
             box_id,
@@ -127,9 +138,363 @@ pub fn apply_recipe(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct BridgeRequest {
+    protocol: u32,
+    box_id: String,
+    #[serde(flatten)]
+    operation: BridgeOperation,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum BridgeOperation {
+    Exec {
+        argv: Vec<String>,
+        cwd: String,
+        env: Vec<String>,
+        user: String,
+    },
+    PutFile {
+        source: String,
+        destination: String,
+    },
+    GetFile {
+        source: String,
+        destination: String,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct BridgeContext {
+    config_path: PathBuf,
+    pbox_binary: PathBuf,
+    box_id: String,
+}
+
+#[cfg(unix)]
+struct BridgeHandle {
+    socket_path: PathBuf,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<Result<()>>>,
+}
+
+#[cfg(unix)]
+impl BridgeHandle {
+    fn start(
+        invocation: &AnsibleInvocation<'_>,
+        config_path: PathBuf,
+        pbox_binary: PathBuf,
+    ) -> Result<Self> {
+        let socket_path = invocation.operation_directory.join("bridge.sock");
+        match fs::remove_file(&socket_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "remove stale Ansible bridge socket {}",
+                        socket_path.display()
+                    )
+                });
+            }
+        }
+        let listener = UnixListener::bind(&socket_path)
+            .with_context(|| format!("bind Ansible bridge socket {}", socket_path.display()))?;
+        set_mode(&socket_path, 0o600)?;
+        listener
+            .set_nonblocking(true)
+            .context("configure Ansible bridge socket")?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let context = BridgeContext {
+            config_path,
+            pbox_binary,
+            box_id: invocation.box_id.to_owned(),
+        };
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::spawn(move || bridge_loop(listener, thread_stop, context));
+        Ok(Self {
+            socket_path,
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    fn stop(mut self) -> Result<()> {
+        self.stop.store(true, Ordering::Release);
+        let thread = self
+            .thread
+            .take()
+            .ok_or_else(|| anyhow!("Ansible bridge thread was already stopped"))?;
+        thread
+            .join()
+            .map_err(|_| anyhow!("Ansible bridge thread panicked"))??;
+        fs::remove_file(&self.socket_path).with_context(|| {
+            format!(
+                "remove Ansible bridge socket {}",
+                self.socket_path.display()
+            )
+        })?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn bridge_loop(
+    listener: UnixListener,
+    stop: Arc<AtomicBool>,
+    context: BridgeContext,
+) -> Result<()> {
+    let mut clients = Vec::new();
+    while !stop.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let client_context = context.clone();
+                clients.push(thread::spawn(move || {
+                    let _ = handle_bridge_client(stream, client_context);
+                }));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error).context("accept Ansible bridge connection"),
+        }
+    }
+    for client in clients {
+        client
+            .join()
+            .map_err(|_| anyhow!("Ansible bridge client thread panicked"))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn handle_bridge_client(mut stream: UnixStream, context: BridgeContext) -> Result<()> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .context("set Ansible bridge read timeout")?;
+    let response = match read_bridge_line(&mut stream) {
+        Ok(bytes) => match serde_json::from_slice::<BridgeRequest>(&bytes) {
+            Ok(request) => handle_bridge_request(request, &context),
+            Err(error) => Err(anyhow!("invalid Ansible bridge request: {error}")),
+        },
+        Err(error) => Err(anyhow!("read Ansible bridge request: {error}")),
+    };
+    let response = match response {
+        Ok(value) => value,
+        Err(error) => serde_json::json!({
+            "protocol": BRIDGE_PROTOCOL_VERSION,
+            "error": error.to_string(),
+        }),
+    };
+    let mut encoded = serde_json::to_vec(&response).context("encode Ansible bridge response")?;
+    encoded.push(b'\n');
+    stream
+        .write_all(&encoded)
+        .context("write Ansible bridge response")?;
+    stream.flush().context("flush Ansible bridge response")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_bridge_line(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
+    let mut line = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let count = stream.read(&mut byte)?;
+        if count == 0 {
+            break;
+        }
+        if byte[0] == b'\n' {
+            return Ok(line);
+        }
+        line.push(byte[0]);
+        if line.len() > MAX_BRIDGE_REQUEST_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Ansible bridge request exceeds the size limit",
+            ));
+        }
+    }
+    Ok(line)
+}
+
+#[cfg(unix)]
+fn handle_bridge_request(
+    request: BridgeRequest,
+    context: &BridgeContext,
+) -> Result<serde_json::Value> {
+    if request.protocol != BRIDGE_PROTOCOL_VERSION {
+        bail!(
+            "unsupported Ansible bridge protocol {}; expected {}",
+            request.protocol,
+            BRIDGE_PROTOCOL_VERSION
+        );
+    }
+    if request.box_id != context.box_id {
+        bail!(
+            "Ansible bridge request targeted {}; expected {}",
+            request.box_id,
+            context.box_id
+        );
+    }
+    match request.operation {
+        BridgeOperation::Exec {
+            argv,
+            cwd,
+            env,
+            user,
+        } => bridge_exec(context, argv, cwd, env, user),
+        BridgeOperation::PutFile {
+            source,
+            destination,
+        } => bridge_file_transfer(context, true, source, destination),
+        BridgeOperation::GetFile {
+            source,
+            destination,
+        } => bridge_file_transfer(context, false, source, destination),
+    }
+}
+
+#[cfg(unix)]
+fn bridge_exec(
+    context: &BridgeContext,
+    argv: Vec<String>,
+    cwd: String,
+    env: Vec<String>,
+    user: String,
+) -> Result<serde_json::Value> {
+    if argv.is_empty() {
+        bail!("Ansible bridge exec request has no command arguments");
+    }
+    let mut arguments = vec![
+        "exec".to_owned(),
+        context.box_id.clone(),
+        "--cwd".to_owned(),
+        cwd,
+        "--user".to_owned(),
+        user,
+    ];
+    for entry in env {
+        arguments.push("--env".to_owned());
+        arguments.push(entry);
+    }
+    arguments.push("--".to_owned());
+    arguments.extend(argv);
+    let output = run_bridge_command(context, &arguments)?;
+    let mut payload = match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+        Ok(value) => value,
+        Err(error) => {
+            bail!(
+                "pbox exec bridge returned invalid JSON: {}; {}",
+                error,
+                bridge_output_detail(context, &output)
+            );
+        }
+    };
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("pbox exec bridge returned a non-object JSON value"))?;
+    object.insert(
+        "protocol".to_owned(),
+        serde_json::json!(BRIDGE_PROTOCOL_VERSION),
+    );
+    Ok(payload)
+}
+
+#[cfg(unix)]
+fn bridge_file_transfer(
+    context: &BridgeContext,
+    upload: bool,
+    source: String,
+    destination: String,
+) -> Result<serde_json::Value> {
+    let remote_path = if upload {
+        destination.clone()
+    } else {
+        source.clone()
+    };
+    let remote = format!("{}:{remote_path}", context.box_id);
+    let arguments = if upload {
+        vec!["scp".to_owned(), source, remote]
+    } else {
+        vec!["scp".to_owned(), remote, destination]
+    };
+    let output = run_bridge_command(context, &arguments)?;
+    if !output.status.success() {
+        bail!(
+            "pbox file transfer failed: {}",
+            bridge_output_detail(context, &output)
+        );
+    }
+    Ok(serde_json::json!({
+        "protocol": BRIDGE_PROTOCOL_VERSION,
+        "ok": true,
+    }))
+}
+
+#[cfg(unix)]
+fn run_bridge_command(
+    context: &BridgeContext,
+    arguments: &[String],
+) -> Result<std::process::Output> {
+    let mut command = Command::new(&context.pbox_binary);
+    command.env_clear();
+    for key in ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command
+        .arg("--config")
+        .arg(&context.config_path)
+        .arg("--color")
+        .arg("never")
+        .arg("--json")
+        .args(arguments)
+        .output()
+        .context("run pbox Ansible bridge operation")
+}
+
+#[cfg(unix)]
+fn bridge_output_detail(context: &BridgeContext, output: &std::process::Output) -> String {
+    let mut detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if detail.is_empty() {
+        detail = format!(
+            "pbox exited with {}",
+            output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "a signal".to_owned())
+        );
+    }
+    detail.replace(context.config_path.to_string_lossy().as_ref(), "<config>")
+}
+
 fn run_ansible(invocation: &AnsibleInvocation<'_>, playbook: &Path, json: bool) -> Result<()> {
+    #[cfg(unix)]
+    {
+        run_ansible_unix(invocation, playbook, json)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (invocation, playbook, json);
+        bail!("the pbox Ansible bridge requires a Unix-domain socket")
+    }
+}
+
+#[cfg(unix)]
+fn run_ansible_unix(invocation: &AnsibleInvocation<'_>, playbook: &Path, json: bool) -> Result<()> {
     let config_path = absolute_path(invocation.config_path)?;
     let pbox_binary = absolute_path(invocation.pbox_binary)?;
+    let bridge = BridgeHandle::start(invocation, config_path, pbox_binary)?;
     let mut command = Command::new("ansible-playbook");
     command.env_clear();
     for key in ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"] {
@@ -152,12 +517,11 @@ fn run_ansible(invocation: &AnsibleInvocation<'_>, playbook: &Path, json: bool) 
             invocation.repository_root.join("roles"),
         )
         .env("ANSIBLE_HOST_KEY_CHECKING", "False")
-        .env("PBOX_BIN", pbox_binary)
-        .env("PBOX_CONFIG_FILE", config_path)
+        .env("PBOX_BRIDGE_SOCKET", bridge.socket_path())
         .env("PBOX_BOX_ID", invocation.box_id)
         .stdin(Stdio::inherit());
 
-    if json {
+    let result = if json {
         let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -188,6 +552,13 @@ fn run_ansible(invocation: &AnsibleInvocation<'_>, playbook: &Path, json: bool) 
             .status()
             .context("run ansible-playbook; install Ansible on the control machine")?;
         ensure_success(status, "ansible-playbook")
+    };
+    let bridge_result = bridge.stop();
+    match (result, bridge_result) {
+        (Err(error), Err(bridge_error)) => Err(error.context(bridge_error)),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(bridge_error)) => Err(bridge_error),
+        (Ok(()), Ok(())) => Ok(()),
     }
 }
 fn stream_child_output<R: Read>(mut reader: R) -> std::io::Result<()> {
@@ -418,10 +789,13 @@ import base64
 import binascii
 import json
 import os
-import subprocess
+import socket
 
 from ansible.errors import AnsibleError
 from ansible.plugins.connection import ConnectionBase
+
+BRIDGE_PROTOCOL_VERSION = 1
+MAX_BRIDGE_RESPONSE_BYTES = 192 * 1024 * 1024
 
 DOCUMENTATION = r'''
 ---
@@ -429,8 +803,8 @@ name: pbox_agent
 short_description: Execute Ansible operations through pbox-agent
 version_added: '0.1.0'
 description:
-  - Uses the pbox CLI as the authenticated control-plane client.
-  - The guest never receives the PVE API token or its derived trust material.
+  - Uses an ephemeral Rust-owned local bridge for authenticated pbox-agent operations.
+  - The Ansible process never receives the PVE API token or its configuration path.
 author:
   - pbox project
 '''
@@ -455,62 +829,59 @@ class Connection(ConnectionBase):
             )
         return target
 
-    def _pbox_command(self, arguments):
-        binary = os.environ.get('PBOX_BIN')
-        if not binary:
-            raise AnsibleError('PBOX_BIN is not configured for the pbox_agent connection')
-        command = [binary]
-        config = os.environ.get('PBOX_CONFIG_FILE')
-        if config:
-            command.extend(['--config', config])
-        command.extend(['--color', 'never', '--json'])
-        command.extend(arguments)
-        return command
-
-    def _run(self, arguments, input_data=None):
-        try:
-            result = subprocess.run(
-                self._pbox_command(arguments),
-                input=input_data,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
+    def _bridge_request(self, kind, **values):
+        socket_path = os.environ.get('PBOX_BRIDGE_SOCKET')
+        if not socket_path:
+            raise AnsibleError(
+                'PBOX_BRIDGE_SOCKET is not configured for the pbox_agent connection'
             )
-        except OSError as error:
-            raise AnsibleError('cannot start pbox: %s' % error)
+        payload = {
+            'protocol': BRIDGE_PROTOCOL_VERSION,
+            'kind': kind,
+            'box_id': self._target_box(),
+        }
+        payload.update(values)
         try:
-            payload = json.loads(result.stdout.decode('utf-8'))
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+                channel.settimeout(30)
+                channel.connect(socket_path)
+                channel.sendall(
+                    (
+                        json.dumps(payload, separators=(',', ':')) + '\n'
+                    ).encode('utf-8')
+                )
+                response = bytearray()
+                while not response.endswith(b'\n'):
+                    chunk = channel.recv(65536)
+                    if not chunk:
+                        break
+                    response.extend(chunk)
+                    if len(response) > MAX_BRIDGE_RESPONSE_BYTES:
+                        raise AnsibleError('pbox bridge response exceeds the size limit')
+        except AnsibleError:
+            raise
+        except OSError as error:
+            raise AnsibleError('pbox bridge request failed: %s' % error)
+        try:
+            result = json.loads(bytes(response).decode('utf-8'))
         except (UnicodeDecodeError, ValueError) as error:
-            detail = result.stderr.decode('utf-8', errors='replace').strip()
-            raise AnsibleError('pbox command failed: %s' % (detail or error))
-        if not isinstance(payload, dict):
-            raise AnsibleError('pbox command returned a non-object JSON value')
-        return payload
-
-    def _run_file_transfer(self, arguments):
-        try:
-            return subprocess.run(
-                self._pbox_command(arguments),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-        except OSError as error:
-            raise AnsibleError('cannot start pbox: %s' % error)
+            raise AnsibleError('pbox bridge returned invalid JSON: %s' % error)
+        if not isinstance(result, dict):
+            raise AnsibleError('pbox bridge returned a non-object JSON value')
+        if result.get('error'):
+            raise AnsibleError('pbox bridge request failed: %s' % result['error'])
+        return result
 
     def exec_command(self, cmd, in_data=None, sudoable=True):
         if in_data:
             raise AnsibleError('pbox_agent does not support pipelined stdin')
-        payload = self._run([
+        payload = self._bridge_request(
             'exec',
-            self._target_box(),
-            '--user',
-            self._play_context.remote_user or 'root',
-            '--',
-            '/bin/sh',
-            '-c',
-            cmd,
-        ])
+            argv=['/bin/sh', '-c', cmd],
+            cwd='/home/pbox',
+            env=[],
+            user=self._play_context.remote_user or 'root',
+        )
         try:
             return (
                 int(payload['exit_code']),
@@ -521,22 +892,18 @@ class Connection(ConnectionBase):
             raise AnsibleError('pbox exec returned an invalid JSON payload: %s' % error)
 
     def put_file(self, in_path, out_path):
-        result = self._run_file_transfer([
-            'scp',
-            in_path,
-            '%s:%s' % (self._target_box(), out_path),
-        ])
-        if result.returncode != 0:
-            raise AnsibleError(result.stderr.decode('utf-8', errors='replace').strip() or 'pbox upload failed')
+        self._bridge_request(
+            'put_file',
+            source=in_path,
+            destination=out_path,
+        )
 
     def fetch_file(self, in_path, out_path):
-        result = self._run_file_transfer([
-            'scp',
-            '%s:%s' % (self._target_box(), in_path),
-            out_path,
-        ])
-        if result.returncode != 0:
-            raise AnsibleError(result.stderr.decode('utf-8', errors='replace').strip() or 'pbox download failed')
+        self._bridge_request(
+            'get_file',
+            source=in_path,
+            destination=out_path,
+        )
 
     def close(self):
         self._connected = False
@@ -558,6 +925,106 @@ mod tests {
         assert!(source.contains("def put_file"));
         assert!(source.contains("def fetch_file"));
         assert!(source.contains("def close"));
+        assert!(source.contains("PBOX_BRIDGE_SOCKET"));
+        assert!(source.contains("BRIDGE_PROTOCOL_VERSION"));
+        assert!(!source.contains("PBOX_CONFIG_FILE"));
+        assert!(!source.contains("PBOX_BIN"));
+        assert!(!source.contains("subprocess"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_rejects_wrong_protocol_and_box() {
+        let context = BridgeContext {
+            config_path: PathBuf::from("/tmp/pbox-config"),
+            pbox_binary: PathBuf::from("/bin/false"),
+            box_id: "pbx_abcd1234".to_owned(),
+        };
+        let wrong_protocol = BridgeRequest {
+            protocol: BRIDGE_PROTOCOL_VERSION + 1,
+            box_id: context.box_id.clone(),
+            operation: BridgeOperation::Exec {
+                argv: vec!["true".to_owned()],
+                cwd: "/".to_owned(),
+                env: Vec::new(),
+                user: "root".to_owned(),
+            },
+        };
+        assert!(handle_bridge_request(wrong_protocol, &context).is_err());
+
+        let wrong_box = BridgeRequest {
+            protocol: BRIDGE_PROTOCOL_VERSION,
+            box_id: "pbx_other123".to_owned(),
+            operation: BridgeOperation::Exec {
+                argv: vec!["true".to_owned()],
+                cwd: "/".to_owned(),
+                env: Vec::new(),
+                user: "root".to_owned(),
+            },
+        };
+        assert!(handle_bridge_request(wrong_box, &context).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_socket_round_trip_uses_rust_owned_request_boundary() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("pbox-ansible-bridge-test-{suffix}"));
+        fs::create_dir_all(&root).expect("create bridge directory");
+        let binary = root.join("pbox");
+        fs::write(
+            &binary,
+            "#!/bin/sh\nprintf '%s\\n' '{\"exit_code\":0,\"stdout_base64\":\"\",\"stderr_base64\":\"\"}'\n",
+        )
+        .expect("write fake pbox");
+        set_mode(&binary, 0o700).expect("make fake pbox executable");
+        let invocation = AnsibleInvocation {
+            config_path: Path::new("/tmp/pbox-config"),
+            pbox_binary: &binary,
+            repository_root: &root,
+            operation_directory: &root,
+            plugin_directory: &root,
+            inventory: &root,
+            box_id: "pbx_abcd1234",
+        };
+        let bridge = BridgeHandle::start(
+            &invocation,
+            PathBuf::from("/tmp/pbox-config"),
+            binary.clone(),
+        )
+        .expect("start bridge");
+        let mut stream = UnixStream::connect(bridge.socket_path()).expect("connect bridge");
+        stream
+            .write_all(
+                br#"{"protocol":1,"kind":"exec","box_id":"pbx_abcd1234","argv":["true"],"cwd":"/","env":[],"user":"root"}
+"#,
+            )
+            .expect("write request");
+        let response = read_bridge_line(&mut stream).expect("read response");
+        let response: serde_json::Value =
+            serde_json::from_slice(&response).expect("decode response");
+        assert_eq!(response["protocol"], BRIDGE_PROTOCOL_VERSION);
+        assert_eq!(response["exit_code"], 0);
+        drop(stream);
+        bridge.stop().expect("stop bridge");
+        fs::remove_dir_all(root).expect("remove bridge directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_request_size_is_bounded() {
+        let (mut writer, mut reader) = UnixStream::pair().expect("create socket pair");
+        let writer_thread = thread::spawn(move || {
+            writer
+                .write_all(&vec![b'x'; MAX_BRIDGE_REQUEST_BYTES + 1])
+                .expect("write oversized request");
+        });
+        let error = read_bridge_line(&mut reader).expect_err("reject oversized request");
+        writer_thread.join().expect("join oversized request writer");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
