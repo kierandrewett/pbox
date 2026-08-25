@@ -21,6 +21,26 @@ pub trait PveApi {
         storage: &str,
         content: &str,
     ) -> Result<Vec<PveStorageContent>, PveError>;
+    /// List tags for an OCI repository through the PVE node.
+    fn list_oci_repo_tags(&self, node: &str, reference: &str) -> Result<Vec<String>, PveError> {
+        let _ = (node, reference);
+        Err(PveError::Unsupported(
+            "this PVE client does not support OCI registry tag queries".to_owned(),
+        ))
+    }
+    /// Ask the PVE node to pull an OCI image into a template storage.
+    fn pull_oci_registry(
+        &self,
+        node: &str,
+        storage: &str,
+        reference: &str,
+        filename: &str,
+    ) -> Result<PveTaskResponse, PveError> {
+        let _ = (node, storage, reference, filename);
+        Err(PveError::Unsupported(
+            "this PVE client does not support OCI registry pulls".to_owned(),
+        ))
+    }
     fn get_lxc_config(&self, node: &str, vmid: u64) -> Result<LxcConfig, PveError>;
     fn list_lxc_interfaces(&self, node: &str, vmid: u64) -> Result<Vec<LxcInterface>, PveError>;
     fn list_lxc_snapshots(&self, node: &str, vmid: u64) -> Result<Vec<LxcSnapshot>, PveError>;
@@ -228,6 +248,36 @@ impl PveApi for PveClient {
             "/nodes/{node}/storage/{storage}/content?content={content}"
         ))
     }
+    fn list_oci_repo_tags(&self, node: &str, reference: &str) -> Result<Vec<String>, PveError> {
+        validate_path_segment(node, "node")?;
+        validate_oci_reference(reference)?;
+        let reference = encode_query_component(reference);
+        self.get(&format!(
+            "/nodes/{node}/query-oci-repo-tags?reference={reference}"
+        ))
+    }
+
+    fn pull_oci_registry(
+        &self,
+        node: &str,
+        storage: &str,
+        reference: &str,
+        filename: &str,
+    ) -> Result<PveTaskResponse, PveError> {
+        validate_path_segment(node, "node")?;
+        validate_path_segment(storage, "storage")?;
+        validate_oci_reference(reference)?;
+        validate_path_segment(filename, "filename")?;
+        let form = OciRegistryPullForm {
+            reference,
+            filename,
+        };
+        self.task(
+            Method::POST,
+            &format!("/nodes/{node}/storage/{storage}/oci-registry-pull"),
+            &form,
+        )
+    }
 
     fn create_lxc(
         &self,
@@ -370,6 +420,34 @@ fn validate_path_segment(value: &str, field: &str) -> Result<(), PveError> {
         });
     }
     Ok(())
+}
+
+fn validate_oci_reference(value: &str) -> Result<(), PveError> {
+    if value.is_empty()
+        || value.chars().any(|character| {
+            character.is_ascii_control() || matches!(character, '?' | '#' | '%' | '&' | '\\')
+        })
+    {
+        return Err(PveError::InvalidPathSegment {
+            field: "OCI reference".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn encode_query_component(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| {
+            if byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/' | b':' | b'@')
+            {
+                vec![byte as char]
+            } else {
+                format!("%{byte:02X}").chars().collect()
+            }
+        })
+        .collect()
 }
 
 fn validate_snapshot_name(value: &str) -> Result<(), PveError> {
@@ -547,6 +625,11 @@ struct LxcCreateForm<'a> {
     #[serde(flatten)]
     request: &'a LxcCreateRequest,
 }
+#[derive(Debug, Serialize)]
+struct OciRegistryPullForm<'a> {
+    reference: &'a str,
+    filename: &'a str,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LxcConfig {
@@ -656,7 +739,6 @@ struct PveResponse<T> {
 struct PveErrorEnvelope {
     errors: Option<String>,
 }
-
 #[derive(Debug, Error)]
 pub enum PveError {
     #[error("could not build PVE HTTP client: {0}")]
@@ -673,6 +755,8 @@ pub enum PveError {
     InvalidPathSegment { field: String },
     #[error("invalid PVE snapshot name: {name}")]
     InvalidSnapshotName { name: String },
+    #[error("PVE client does not support this operation: {0}")]
+    Unsupported(String),
 }
 
 #[cfg(test)]
@@ -907,5 +991,26 @@ mod tests {
         let interfaces: Vec<LxcInterface> =
             serde_json::from_str(r#"[{"name":"eth0","inet":"10.0.20.43/24","active":0}]"#).unwrap();
         assert_eq!(select_lxc_ipv4(&interfaces), None);
+    }
+    #[test]
+    fn oci_pull_form_uses_reference_and_filename() {
+        let form = OciRegistryPullForm {
+            reference: "ghcr.io/example/base:latest",
+            filename: "pbox-oci-ghcr.io-example-base-latest",
+        };
+        let value = serde_json::to_value(form).unwrap();
+        assert_eq!(value["reference"], "ghcr.io/example/base:latest");
+        assert_eq!(value["filename"], "pbox-oci-ghcr.io-example-base-latest");
+    }
+
+    #[test]
+    fn oci_reference_query_encoding_rejects_injection() {
+        assert!(validate_oci_reference("ghcr.io/example/base:latest").is_ok());
+        assert!(validate_oci_reference("ghcr.io/example/base?x=1").is_err());
+        assert_eq!(
+            encode_query_component("ghcr.io/example/base:latest"),
+            "ghcr.io/example/base:latest"
+        );
+        assert_eq!(encode_query_component("repo tag"), "repo%20tag");
     }
 }
