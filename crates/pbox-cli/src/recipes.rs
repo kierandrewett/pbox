@@ -6,7 +6,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_REPOSITORY: &str = "https://github.com/kierandrewett/pbox-recipes.git";
 const DEFAULT_REFERENCE: &str = "main";
@@ -99,6 +99,7 @@ impl RecipeRepository {
         } else {
             reference.trim().to_owned()
         };
+        validate_recipe_reference(&reference)?;
         let cache_dir = default_cache_dir(&repository)?;
         Ok(Self {
             repository,
@@ -148,6 +149,7 @@ impl RecipeRepository {
                     "--depth",
                     "1",
                     "origin",
+                    "--",
                     &self.reference,
                 ],
                 &self.repository,
@@ -185,12 +187,14 @@ impl RecipeRepository {
                     "1",
                     "--branch",
                     &self.reference,
+                    "--",
                     &self.repository,
                     cache,
                 ],
                 &self.repository,
             )?;
         }
+        restrict_cache_directory(&self.cache_dir)?;
         self.write_reference_marker()?;
         self.discover_unlocked_checked()
     }
@@ -240,24 +244,23 @@ impl RecipeRepository {
 
     fn discover_unlocked_checked(&self) -> Result<RecipeCatalog> {
         self.ensure_cache_path_is_safe()?;
+        restrict_cache_directory(&self.cache_dir)?;
         self.ensure_cache_integrity()?;
-        if self.cache_is_git_checkout()? {
-            let reference = self.reference_marker()?.ok_or_else(|| {
-                anyhow!("recipe cache reference marker is missing; sync the repository")
-            })?;
-            if reference != self.reference {
-                bail!(
-                    "recipe cache contains reference {reference}, expected {}",
-                    self.reference
-                );
-            }
-            let expected_revision = self.revision_marker()?.ok_or_else(|| {
-                anyhow!("recipe cache revision marker is missing; sync the repository")
-            })?;
-            let actual_revision = git_revision(&self.cache_dir)?;
-            if expected_revision != actual_revision {
-                bail!("recipe cache HEAD does not match its recorded revision; synchronise again");
-            }
+        let reference = self.reference_marker()?.ok_or_else(|| {
+            anyhow!("recipe cache reference marker is missing; sync the repository")
+        })?;
+        if reference != self.reference {
+            bail!(
+                "recipe cache contains reference {reference}, expected {}",
+                self.reference
+            );
+        }
+        let expected_revision = self.revision_marker()?.ok_or_else(|| {
+            anyhow!("recipe cache revision marker is missing; sync the repository")
+        })?;
+        let actual_revision = git_revision(&self.cache_dir)?;
+        if expected_revision != actual_revision {
+            bail!("recipe cache HEAD does not match its recorded revision; synchronise again");
         }
         self.discover_unlocked()
     }
@@ -284,17 +287,50 @@ impl RecipeRepository {
                 format!("create recipe cache lock directory {}", parent.display())
             })?;
         }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .with_context(|| format!("acquire recipe cache lock {}", path.display()))?;
-        if let Err(error) = writeln!(file, "pid={}", std::process::id()) {
-            let _ = fs::remove_file(&path);
-            return Err(error)
-                .with_context(|| format!("write recipe cache lock {}", path.display()));
+        for _attempt in 0..2 {
+            let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if !stale_lock(&path)? {
+                        bail!("recipe cache lock is held: {}", path.display());
+                    }
+                    let stamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("read system clock")?
+                        .as_nanos();
+                    let quarantine =
+                        path.with_extension(format!("lock.stale-{}-{stamp}", std::process::id()));
+                    match fs::rename(&path, &quarantine) {
+                        Ok(()) => {
+                            fs::remove_file(&quarantine).with_context(|| {
+                                format!(
+                                    "remove quarantined recipe cache lock {}",
+                                    quarantine.display()
+                                )
+                            })?;
+                            continue;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("quarantine stale recipe cache lock {}", path.display())
+                            });
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("acquire recipe cache lock {}", path.display()));
+                }
+            };
+            if let Err(error) = writeln!(file, "pid={}", std::process::id()) {
+                let _ = fs::remove_file(&path);
+                return Err(error)
+                    .with_context(|| format!("write recipe cache lock {}", path.display()));
+            }
+            return Ok(RecipeCacheLock { path });
         }
-        Ok(RecipeCacheLock { path })
+        bail!("could not acquire recipe cache lock: {}", path.display())
     }
 
     fn cache_path(&self) -> Result<&str> {
@@ -352,18 +388,15 @@ impl RecipeRepository {
 
     fn write_reference_marker(&self) -> Result<()> {
         let reference_path = self.cache_dir.join(".git").join("pbox-reference");
-        fs::write(&reference_path, format!("{}\n", self.reference)).with_context(|| {
-            format!("write recipe cache reference {}", reference_path.display())
-        })?;
+        write_cache_marker(&reference_path, &format!("{}\n", self.reference))?;
         let revision_path = self.cache_dir.join(".git").join("pbox-revision");
         let revision = git_revision(&self.cache_dir)?;
-        fs::write(&revision_path, format!("{revision}\n"))
-            .with_context(|| format!("write recipe cache revision {}", revision_path.display()))
+        write_cache_marker(&revision_path, &format!("{revision}\n"))
     }
 
     fn ensure_cache_integrity(&self) -> Result<()> {
         if !self.cache_is_git_checkout()? {
-            return Ok(());
+            bail!("recipe cache is not a Git checkout; synchronise the repository");
         }
         let origin = run_git(
             &["-C", self.cache_path()?, "remote", "get-url", "origin"],
@@ -376,6 +409,26 @@ impl RecipeRepository {
         if repository_identity(&actual_origin) != repository_identity(&self.repository) {
             bail!("recipe cache origin does not match the configured repository");
         }
+        let submodules = run_git(
+            &[
+                "-C",
+                self.cache_path()?,
+                "submodule",
+                "status",
+                "--recursive",
+            ],
+            &self.repository,
+        )?;
+        if !submodules.stdout.is_empty() {
+            bail!("recipe cache must not contain Git submodules");
+        }
+        let index_flags = run_git(
+            &["-C", self.cache_path()?, "ls-files", "-v"],
+            &self.repository,
+        )?;
+        if has_unsafe_git_index_flags(&index_flags.stdout) {
+            bail!("recipe cache uses Git index flags; remove the cache and synchronise again");
+        }
         let status = run_git(
             &[
                 "-C",
@@ -387,11 +440,105 @@ impl RecipeRepository {
             ],
             &self.repository,
         )?;
+        if run_git(
+            &[
+                "-C",
+                self.cache_path()?,
+                "diff",
+                "--no-ext-diff",
+                "--quiet",
+                "HEAD",
+                "--",
+            ],
+            &self.repository,
+        )
+        .is_err()
+        {
+            bail!("recipe cache has local changes; remove the cache and synchronise again");
+        }
         if !status.stdout.is_empty() {
             bail!("recipe cache has local changes; remove the cache and synchronise again");
         }
         Ok(())
     }
+}
+
+fn write_cache_marker(path: &Path, contents: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("recipe cache marker has no parent directory"))?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("read system clock")?
+        .as_nanos();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("recipe cache marker path is not UTF-8"))?;
+    let temporary = parent.join(format!(".{file_name}.tmp-{}-{stamp}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .with_context(|| {
+            format!(
+                "create temporary recipe cache marker {}",
+                temporary.display()
+            )
+        })?;
+    if let Err(error) = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("write recipe cache marker {}", path.display()));
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error)
+            .with_context(|| format!("replace recipe cache marker {}", path.display()));
+    }
+    Ok(())
+}
+fn restrict_cache_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("inspect recipe cache {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!("recipe cache path must not be a symbolic link");
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restrict recipe cache {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn stale_lock(path: &Path) -> Result<bool> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect recipe cache lock {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("recipe cache lock must not be a symbolic link");
+    }
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("read recipe cache lock {}", path.display()))?;
+    if let Some(pid) = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|value| value.trim().parse::<u32>().ok())
+    {
+        return Ok(!Path::new("/proc").join(pid.to_string()).exists());
+    }
+    let age = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+    Ok(age.is_some_and(|age| age >= Duration::from_secs(3600)))
 }
 
 pub fn discover_path(root: &Path, repository: &str, reference: &str) -> Result<RecipeCatalog> {
@@ -421,6 +568,7 @@ pub fn discover_path(root: &Path, repository: &str, reference: &str) -> Result<R
         let metadata = manifest_entry
             .map(|entry| entry.metadata.clone())
             .unwrap_or_default();
+        validate_recipe_capabilities(&id, &metadata.capabilities)?;
         recipes.push(Recipe {
             id,
             kind,
@@ -434,11 +582,13 @@ pub fn discover_path(root: &Path, repository: &str, reference: &str) -> Result<R
             continue;
         }
         let (kind, path) = manifest_recipe_path(root, &id, &entry)?;
+        let metadata = entry.metadata;
+        validate_recipe_capabilities(&id, &metadata.capabilities)?;
         recipes.push(Recipe {
             id,
             kind,
             path,
-            metadata: entry.metadata,
+            metadata,
         });
     }
 
@@ -768,9 +918,37 @@ fn path_string(path: &Path) -> String {
         .join("/")
 }
 
+const MAX_RECIPE_CAPABILITIES: usize = 32;
+const MAX_RECIPE_CAPABILITY_LENGTH: usize = 64;
+
+fn validate_recipe_capabilities(recipe_id: &str, capabilities: &[String]) -> Result<()> {
+    if capabilities.len() > MAX_RECIPE_CAPABILITIES {
+        bail!("recipe {recipe_id} declares more than {MAX_RECIPE_CAPABILITIES} capabilities");
+    }
+    for capability in capabilities {
+        if capability.is_empty()
+            || capability.len() > MAX_RECIPE_CAPABILITY_LENGTH
+            || !capability.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/')
+            })
+        {
+            bail!("recipe {recipe_id} has an invalid capability: {capability:?}");
+        }
+    }
+    Ok(())
+}
+fn has_unsafe_git_index_flags(output: &[u8]) -> bool {
+    output
+        .split(|byte| *byte == b'\n')
+        .any(|line| matches!(line.first(), Some(b'h' | b'S')))
+}
+
 fn validate_repository_reference(repository: &str) -> Result<()> {
     if repository.contains('?') || repository.contains('#') {
         bail!("recipe repository must not contain query or fragment data");
+    }
+    if repository.contains("::") {
+        bail!("recipe repository must not use Git external transport");
     }
     if let Some((scheme, authority_and_path)) = repository.split_once("://") {
         let scheme = scheme.to_ascii_lowercase();
@@ -787,6 +965,24 @@ fn validate_repository_reference(repository: &str) -> Result<()> {
         if scheme != "file" && authority.is_empty() {
             bail!("recipe repository URL must include a host");
         }
+    }
+    Ok(())
+}
+fn validate_recipe_reference(reference: &str) -> Result<()> {
+    if reference.is_empty()
+        || reference.starts_with('-')
+        || reference.contains("..")
+        || reference.contains("@{")
+        || reference.ends_with('/')
+        || reference.ends_with('.')
+        || reference
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || reference
+            .chars()
+            .any(|character| matches!(character, '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+    {
+        bail!("recipe reference is not a valid Git ref: {reference}");
     }
     Ok(())
 }
@@ -820,16 +1016,16 @@ fn default_cache_dir(repository: &str) -> Result<PathBuf> {
 
 fn run_git(arguments: &[&str], repository: &str) -> Result<Output> {
     let mut command = Command::new("git");
-    for key in [
-        "PBOX_CONFIG_FILE",
-        "PBOX_PVE_URL",
-        "PBOX_PVE_TOKEN_ID",
-        "PBOX_PVE_TOKEN_SECRET",
-        "PBOX_AGENT_BINARY",
-        "PBOX_AGENT_PORT",
-    ] {
-        command.env_remove(key);
+    command.env_clear();
+    for key in ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSH_AUTH_SOCK"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
     }
+    command
+        .env("GIT_ALLOW_PROTOCOL", "file:ssh:https")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
     let output = command
         .args(arguments)
         .stdin(Stdio::null())
@@ -882,6 +1078,23 @@ mod tests {
             .expect("system clock")
             .as_nanos();
         std::env::temp_dir().join(format!("pbox-recipes-test-{suffix}"))
+    }
+
+    #[test]
+    fn stale_cache_lock_is_recovered() {
+        let root = temporary_directory();
+        fs::create_dir_all(&root).expect("create fixture");
+        let cache = root.join("cache");
+        let lock_path = cache.with_extension("lock");
+        fs::write(&lock_path, "pid=4294967295\n").expect("write stale lock");
+        let repository = RecipeRepository::with_cache_dir(Some("test/repository"), "main", &cache)
+            .expect("create repository");
+
+        let lock = repository.acquire_lock().expect("recover stale lock");
+        assert!(lock_path.is_file());
+        drop(lock);
+        assert!(!lock_path.exists());
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]
@@ -939,7 +1152,6 @@ mod tests {
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
-    #[cfg(unix)]
     #[test]
     fn discovery_skips_symlink_cycles() {
         use std::os::unix::fs::symlink;
@@ -966,19 +1178,50 @@ mod tests {
         assert!(RecipeRepository::new(Some("http://example.test/recipes.git"), "main").is_err());
         assert!(RecipeRepository::new(Some("git://example.test/recipes.git"), "main").is_err());
         assert!(RecipeRepository::new(Some("https://example.test/recipes.git"), "main").is_ok());
+        assert!(RecipeRepository::new(Some("ext::sh -c evil"), "main").is_err());
+    }
+    #[test]
+    fn repository_rejects_invalid_git_references() {
+        for reference in ["-main", "main..broken", "main\nbroken", "main:evil"] {
+            assert!(
+                RecipeRepository::new(Some("https://example.test/recipes.git"), reference).is_err(),
+                "reference should be rejected: {reference:?}"
+            );
+        }
+        assert_eq!(
+            RecipeRepository::new(Some("https://example.test/recipes.git"), "")
+                .expect("empty reference uses the default")
+                .reference,
+            DEFAULT_REFERENCE
+        );
     }
 
     #[test]
-    fn discover_reads_a_non_git_working_tree() {
+    fn recipe_capabilities_are_bounded_slugs() {
+        assert!(validate_recipe_capabilities("demo", &["desktop".to_owned()]).is_ok());
+        assert!(validate_recipe_capabilities("demo", &["not valid".to_owned()]).is_err());
+        assert!(validate_recipe_capabilities("demo", &[String::from("x").repeat(65)]).is_err());
+    }
+    #[test]
+    fn unsafe_git_index_flags_are_detected() {
+        assert!(!has_unsafe_git_index_flags(b"H playbook.yml\n"));
+        assert!(has_unsafe_git_index_flags(b"h playbook.yml\n"));
+        assert!(has_unsafe_git_index_flags(b"S playbook.yml\n"));
+    }
+
+    #[test]
+    fn discovery_rejects_non_git_cache() {
         let root = temporary_directory();
         fs::create_dir_all(&root).expect("create fixture");
         fs::write(root.join("main.yml"), "---\n- hosts: all\n").expect("write playbook");
         let repository = RecipeRepository::with_cache_dir(Some("test/repository"), "main", &root)
             .expect("create repository");
 
-        let catalog = repository.discover().expect("discover working tree");
+        let error = repository
+            .discover()
+            .expect_err("reject non-Git recipe cache");
 
-        assert_eq!(catalog.recipes[0].id, "main");
+        assert!(error.to_string().contains("not a Git checkout"));
         fs::remove_dir_all(root).expect("remove fixture");
     }
     #[cfg(unix)]

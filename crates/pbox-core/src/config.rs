@@ -554,6 +554,12 @@ fn validate_repository_reference(key: &str, value: &str) -> Result<(), ConfigErr
             reason: "recipe repository must not contain query or fragment data".to_owned(),
         });
     }
+    if value.contains("::") {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_owned(),
+            reason: "recipe repository must not use Git external transport".to_owned(),
+        });
+    }
     if let Some((scheme, authority_and_path)) = value.split_once("://") {
         let scheme = scheme.to_ascii_lowercase();
         if !matches!(scheme.as_str(), "https" | "ssh" | "file") {
@@ -805,6 +811,11 @@ mod tests {
         assert!(
             config
                 .set_value("recipes.repository", "http://example.test/recipes.git")
+                .is_err()
+        );
+        assert!(
+            config
+                .set_value("recipes.repository", "ext::sh -c evil")
                 .is_err()
         );
         config.pve.url = Some("https://user:secret@pve.example".to_owned());
