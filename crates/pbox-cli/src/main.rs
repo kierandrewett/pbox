@@ -545,6 +545,113 @@ struct SetupAnswers {
     recipes_repository: String,
     recipes_reference: String,
 }
+const SETUP_PROMPT_LABEL_WIDTH: usize = 30;
+const ANSI_BOLD: &str = "\x1b[1m";
+const ANSI_DIM: &str = "\x1b[2m";
+const ANSI_CYAN: &str = "\x1b[36m";
+const ANSI_BOLD_CYAN: &str = "\x1b[1;36m";
+const ANSI_GREEN: &str = "\x1b[1;32m";
+const ANSI_YELLOW: &str = "\x1b[1;33m";
+const ANSI_RED: &str = "\x1b[1;31m";
+const ANSI_RESET: &str = "\x1b[0m";
+
+#[derive(Clone, Copy)]
+struct SetupStyle {
+    enabled: bool,
+}
+
+impl SetupStyle {
+    fn for_stderr(color: ColorChoice, json: bool) -> Self {
+        Self {
+            enabled: color_enabled_for(color, json, io::stderr().is_terminal()),
+        }
+    }
+
+    fn for_stdout(color: ColorChoice, json: bool) -> Self {
+        Self {
+            enabled: color_enabled_for(color, json, io::stdout().is_terminal()),
+        }
+    }
+
+    fn from_enabled(enabled: bool) -> Self {
+        Self { enabled }
+    }
+
+    fn text(self, value: &str) -> String {
+        safe_terminal_text(value)
+    }
+
+    fn paint(self, code: &str, value: &str) -> String {
+        let value = self.text(value);
+        if self.enabled && !code.is_empty() {
+            format!("{code}{value}{ANSI_RESET}")
+        } else {
+            value
+        }
+    }
+
+    fn status(self, marker: &str, code: &str, message: &str) -> String {
+        format!(
+            "{} {}",
+            self.paint(code, marker),
+            self.paint(ANSI_BOLD, message)
+        )
+    }
+
+    fn heading(self, message: &str) {
+        eprintln!("{}", self.paint(ANSI_BOLD_CYAN, message));
+    }
+
+    fn section(self, message: &str) {
+        eprintln!();
+        eprintln!("{}", self.paint(ANSI_BOLD_CYAN, message));
+    }
+
+    fn hint(self, message: &str) {
+        eprintln!("  {}", self.paint(ANSI_DIM, message));
+    }
+
+    fn metadata(self, label: &str, value: &str) {
+        let label = format!("{label:<12}");
+        eprintln!("  {} {}", self.paint(ANSI_DIM, &label), self.text(value));
+    }
+
+    fn warning(self, message: &str) {
+        eprintln!("{}", self.status("!", ANSI_YELLOW, message));
+    }
+
+    fn error(self, message: &str) {
+        eprintln!("{}", self.status("x", ANSI_RED, message));
+    }
+
+    fn progress(self, message: &str) {
+        eprintln!("{}", self.status(">", ANSI_CYAN, message));
+    }
+
+    fn prompt(self, label: &str, default: Option<&str>) -> Result<()> {
+        let label = format!("{label:<SETUP_PROMPT_LABEL_WIDTH$}");
+        eprint!(
+            "{} {}",
+            self.paint(ANSI_CYAN, "?"),
+            self.paint(ANSI_BOLD, &label)
+        );
+        if let Some(default) = default.filter(|value| !value.is_empty()) {
+            let default = format!("[{}]", self.text(default));
+            eprint!(" {}", self.paint(ANSI_DIM, &default));
+        }
+        eprint!(": ");
+        io::stderr().flush().context("flush setup prompt")
+    }
+
+    fn stdout_status(self, marker: &str, code: &str, message: &str) {
+        println!("{}", self.status(marker, code, message));
+    }
+
+    fn stdout_metadata(self, label: &str, value: &str) {
+        let label = format!("{label:<12}");
+        println!("  {} {}", self.paint(ANSI_DIM, &label), self.text(value));
+    }
+}
 
 fn apply_setup_values(config: &mut Config, answers: &SetupAnswers) -> Result<()> {
     let mut updated = config.clone();
@@ -608,28 +715,40 @@ fn run_setup(
     color: ColorChoice,
 ) -> Result<()> {
     let mut config = store.load_file().context("load pbox configuration")?;
-    eprintln!("pbox setup");
-    eprintln!(
-        "Configure the PVE connection and local defaults. Press Enter to keep a shown default."
-    );
+    let style = SetupStyle::for_stderr(color, json);
+    style.heading("pbox setup");
+    style.hint("Connect pbox to Proxmox and set defaults for new guests.");
     let config_path = store.path().display().to_string();
-    eprintln!("Configuration file: {}", safe_terminal_text(&config_path));
+    style.metadata("config", &config_path);
+    style.hint("Press Enter to keep the shown default. Secret input is hidden.");
 
-    let pve_url =
-        prompt_setup_config_value(&config, "pve.url", "PVE API URL", config.pve.url.as_deref())?;
+    style.section("PVE connection");
+    let pve_url = prompt_setup_config_value(
+        style,
+        &config,
+        "pve.url",
+        "PVE API URL",
+        config.pve.url.as_deref(),
+    )?;
     let token_id = prompt_setup_config_value(
+        style,
         &config,
         "pve.token_id",
         "PVE API token ID",
         config.pve.token_id.as_deref(),
     )?;
-    let token_secret = prompt_setup_secret(config.pve.token_secret.is_some())?;
+    let token_secret = prompt_setup_secret(style, config.pve.token_secret.is_some())?;
+
+    style.section("Guest defaults");
+    style.hint("Keep TLS verification enabled unless your PVE endpoint requires otherwise.");
     let tls_insecure = prompt_setup_bool(
+        style,
         "Disable PVE TLS certificate verification (not recommended)",
         config.pve.tls_insecure,
     )?;
     let vmid_pattern_default = config.vmid_pattern.to_string();
     let vmid_pattern = prompt_setup_config_value(
+        style,
         &config,
         "pve.vmid-pattern",
         "PVE VMID pattern",
@@ -637,18 +756,23 @@ fn run_setup(
     )?;
     let agent_port_default = config.agent.port.to_string();
     let agent_port = prompt_setup_config_value(
+        style,
         &config,
         "agent.port",
         "Guest agent port",
         Some(&agent_port_default),
     )?;
+
+    style.section("Recipes");
     let recipes_repository = prompt_setup_config_value(
+        style,
         &config,
         "recipes.repository",
         "Recipe repository",
         Some(config.recipes.repository.as_str()),
     )?;
     let recipes_reference = prompt_setup_config_value(
+        style,
         &config,
         "recipes.ref",
         "Recipe repository ref",
@@ -665,12 +789,11 @@ fn run_setup(
         recipes_reference,
     };
 
+    style.section("Apply");
     if agent_identity_changes(&config, &answers) {
-        eprintln!(
-            "warning: changing the PVE token ID or secret changes the agent trust root \
-             and can disconnect existing boxes."
-        );
-        if !prompt_setup_bool("Continue with the token change", false)? {
+        style.warning("Changing the token ID or secret changes the agent trust root.");
+        style.hint("Existing boxes can disconnect until their trust is repaired.");
+        if !prompt_setup_bool(style, "Continue with token change", false)? {
             bail!("setup cancelled");
         }
     }
@@ -679,6 +802,7 @@ fn run_setup(
     let verified = if command.skip_verify {
         false
     } else {
+        style.progress("Verifying PVE connection...");
         let client = client_from_config(&config)?;
         client.list_cluster_resources().map_err(|error| {
             anyhow!(
@@ -696,74 +820,74 @@ fn run_setup(
     if json {
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        let status = if verified {
-            "PVE connection verified"
+        let output_style = SetupStyle::for_stdout(color, false);
+        println!();
+        output_style.stdout_status("ok", ANSI_GREEN, "Configuration saved");
+        output_style.stdout_metadata("config", &output.config_path);
+        if verified {
+            output_style.stdout_status("ok", ANSI_GREEN, "PVE connection verified");
         } else {
-            "configuration saved; PVE connection check skipped"
-        };
-        if color_enabled(color, false) {
-            println!(
-                "\x1b[1;32mConfiguration saved\x1b[0m to {}",
-                safe_terminal_text(&output.config_path)
+            output_style.stdout_status(
+                "!",
+                ANSI_YELLOW,
+                "PVE connection not checked (--skip-verify)",
             );
-            println!("\x1b[1;32m{status}\x1b[0m");
-        } else {
-            println!(
-                "Configuration saved to {}",
-                safe_terminal_text(&output.config_path)
-            );
-            println!("{status}");
         }
-        println!("Next: pbox list");
+        output_style.stdout_metadata("next", "pbox list");
     }
     Ok(())
 }
 
 fn prompt_setup_config_value(
+    style: SetupStyle,
     config: &Config,
     key: &str,
     label: &str,
     default: Option<&str>,
 ) -> Result<String> {
     loop {
-        let value = prompt_setup_text(label, default)?;
+        let value = prompt_setup_text(style, label, default)?;
         let mut candidate = config.clone();
         match candidate.set_value(key, &value) {
             Ok(()) => return Ok(value),
-            Err(error) => eprintln!(
-                "invalid {label}: {}",
-                safe_terminal_text(&error.to_string())
-            ),
+            Err(error) => {
+                style.error(&format!(
+                    "Invalid {label}: {}",
+                    safe_terminal_text(&error.to_string())
+                ));
+                style.hint("Correct the value and try again.");
+            }
         }
     }
 }
 
-fn prompt_setup_secret(existing: bool) -> Result<Option<String>> {
-    let label = if existing {
-        "PVE API token secret (leave blank to keep current)"
-    } else {
-        "PVE API token secret"
-    };
+fn prompt_setup_secret(style: SetupStyle, existing: bool) -> Result<Option<String>> {
+    if existing {
+        style.hint("Leave blank to keep the current secret.");
+    }
     loop {
-        let value = read_secret_with_prompt(label)?;
+        let value = read_secret_with_prompt(style, "PVE API token secret")?;
         if value.is_empty() {
             if existing {
                 return Ok(None);
             }
-            eprintln!("PVE API token secret is required.");
+            style.error("API token secret is required.");
             continue;
         }
         return Ok(Some(value));
     }
 }
 
-fn prompt_setup_bool(label: &str, default: bool) -> Result<bool> {
+fn prompt_setup_bool(style: SetupStyle, label: &str, default: bool) -> Result<bool> {
     let default_text = if default { "yes" } else { "no" };
     loop {
-        let value = prompt_setup_text(label, Some(default_text))?;
+        let value = prompt_setup_text(style, label, Some(default_text))?;
         match parse_setup_bool(&value) {
             Ok(value) => return Ok(value),
-            Err(error) => eprintln!("invalid {label}: {error}"),
+            Err(error) => {
+                style.error(&format!("Invalid {label}: {error}"));
+                style.hint("Enter yes or no.");
+            }
         }
     }
 }
@@ -776,13 +900,8 @@ fn parse_setup_bool(value: &str) -> Result<bool> {
     }
 }
 
-fn prompt_setup_text(label: &str, default: Option<&str>) -> Result<String> {
-    eprint!("{label}");
-    if let Some(default) = default.filter(|value| !value.is_empty()) {
-        eprint!(" [{}]", safe_terminal_text(default));
-    }
-    eprint!(": ");
-    io::stderr().flush().context("flush setup prompt")?;
+fn prompt_setup_text(style: SetupStyle, label: &str, default: Option<&str>) -> Result<String> {
+    style.prompt(label, default)?;
     let mut value = String::new();
     let read = io::stdin()
         .read_line(&mut value)
@@ -2237,10 +2356,10 @@ impl Drop for TerminalEchoGuard {
 }
 
 fn read_secret_from_stdin() -> Result<String> {
-    read_secret_with_prompt("secret")
+    read_secret_with_prompt(SetupStyle::from_enabled(false), "secret")
 }
 
-fn read_secret_with_prompt(prompt: &str) -> Result<String> {
+fn read_secret_with_prompt(style: SetupStyle, prompt: &str) -> Result<String> {
     #[cfg(unix)]
     {
         let mut signal_handlers = SignalDispositionGuard::capture()?;
@@ -2248,7 +2367,7 @@ fn read_secret_with_prompt(prompt: &str) -> Result<String> {
             .enable_all()
             .build()
             .context("create async runtime for secret prompt")?;
-        let result = runtime.block_on(read_secret_with_prompt_async(prompt));
+        let result = runtime.block_on(read_secret_with_prompt_async(style, prompt));
         drop(runtime);
         let restore_result = signal_handlers.restore();
         match (result, restore_result) {
@@ -2262,8 +2381,7 @@ fn read_secret_with_prompt(prompt: &str) -> Result<String> {
     }
     #[cfg(not(unix))]
     {
-        eprint!("{prompt}: ");
-        io::stderr().flush().context("flush secret prompt")?;
+        style.prompt(prompt, None)?;
         let mut value = String::new();
         let read = io::stdin()
             .read_line(&mut value)
@@ -2276,14 +2394,13 @@ fn read_secret_with_prompt(prompt: &str) -> Result<String> {
 }
 
 #[cfg(unix)]
-async fn read_secret_with_prompt_async(prompt: &str) -> Result<String> {
+async fn read_secret_with_prompt_async(style: SetupStyle, prompt: &str) -> Result<String> {
     let signals = install_secret_prompt_signals().await?;
     let stdin = io::stdin();
     let read_stdin = io::stdin();
     let mut terminal = TerminalEchoGuard::new(&stdin)?;
     let had_terminal = terminal.is_some();
-    eprint!("{prompt}: ");
-    io::stderr().flush().context("flush secret prompt")?;
+    style.prompt(prompt, None)?;
     let read_task = tokio::task::spawn_blocking(move || {
         let mut value = String::new();
         let read = read_stdin
@@ -3492,28 +3609,28 @@ fn print_value<T: Serialize>(value: &T, json: bool, color: ColorChoice) -> Resul
     Ok(())
 }
 
-fn color_enabled(color: ColorChoice, json: bool) -> bool {
+fn color_enabled_for(color: ColorChoice, json: bool, is_terminal: bool) -> bool {
     let mode = match color {
         ColorChoice::Auto => pbox_core::ui::ColorMode::Auto,
         ColorChoice::Always => pbox_core::ui::ColorMode::Always,
         ColorChoice::Never => pbox_core::ui::ColorMode::Never,
     };
-    mode.enabled(
-        io::stdout().is_terminal(),
-        std::env::var_os("NO_COLOR").is_some(),
-        json,
-    )
+    mode.enabled(is_terminal, std::env::var_os("NO_COLOR").is_some(), json)
+}
+
+fn color_enabled(color: ColorChoice, json: bool) -> bool {
+    color_enabled_for(color, json, io::stdout().is_terminal())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AnsibleRun, BoxRecord, Cli, Command, ForwardCommand, RecipeSnapshot, SetupAnswers,
-        SetupCommand, SetupOutput, SshCommand, agent_identity_changes, apply_setup_values,
-        create_box_snapshot, create_recipe_snapshot, delete_box_snapshot, delete_recipe_snapshot,
-        exec_exit_code, finish_recipe_failure, finish_recipe_success, format_snapshot_time,
-        parse_env_entry, parse_recipe_sync_ttl, parse_remote_path, parse_setup_bool,
-        record_recipe_provenance, rollback_box_snapshot, safe_terminal_text,
+        ANSI_CYAN, AnsibleRun, BoxRecord, Cli, Command, ForwardCommand, RecipeSnapshot,
+        SetupAnswers, SetupCommand, SetupOutput, SetupStyle, SshCommand, agent_identity_changes,
+        apply_setup_values, create_box_snapshot, create_recipe_snapshot, delete_box_snapshot,
+        delete_recipe_snapshot, exec_exit_code, finish_recipe_failure, finish_recipe_success,
+        format_snapshot_time, parse_env_entry, parse_recipe_sync_ttl, parse_remote_path,
+        parse_setup_bool, record_recipe_provenance, rollback_box_snapshot, safe_terminal_text,
         setup_pve_error_message, ssh_command_argv, validate_forward_arguments,
         validate_snapshot_arguments, validate_ssh_arguments, write_download,
     };
@@ -4057,6 +4174,18 @@ mod tests {
     fn colour_is_disabled_for_json_and_no_color() {
         assert!(!ColorMode::Always.enabled(true, false, true));
         assert!(!ColorMode::Auto.enabled(true, true, false));
+    }
+
+    #[test]
+    fn setup_style_sanitises_and_paints_text() {
+        let plain = SetupStyle::from_enabled(false);
+        let coloured = SetupStyle::from_enabled(true);
+
+        assert_eq!(plain.paint(ANSI_CYAN, "unsafe\ntext"), "unsafe text");
+        assert_eq!(
+            coloured.paint(ANSI_CYAN, "unsafe\ntext"),
+            "\x1b[36munsafe text\x1b[0m"
+        );
     }
     #[test]
     fn forward_arguments_reject_zero_ports_and_nul_values() {
