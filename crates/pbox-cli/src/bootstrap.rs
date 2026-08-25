@@ -327,22 +327,32 @@ systemctl restart pbox-agent.service\n",
         client_subject: request.client_subject,
     };
     wait_for_agent(&probe).context("wait for authenticated pbox-agent")?;
+    Ok(())
+}
 
-    let cleanup = format!(
+pub fn cleanup_bootstrap(ip: Ipv4Addr, key: &BootstrapKey) -> Result<()> {
+    validate_stage(key.remote_stage())?;
+    let ssh = SshSession::new(ip, key);
+    let cleanup = cleanup_script(key);
+    ssh.run(&cleanup)
+        .context("remove temporary guest bootstrap credentials")?;
+    Ok(())
+}
+
+fn cleanup_script(key: &BootstrapKey) -> String {
+    let stage = key.remote_stage();
+    format!(
         "set -eu\n\
+rm -rf {}\n\
 if [ -f /root/.ssh/authorized_keys ]; then\n\
   temporary=/root/.ssh/.pbox-authorized-keys-cleanup\n\
   grep -Fvx -- {} /root/.ssh/authorized_keys > \"$temporary\" || true\n\
   install -m 0600 \"$temporary\" /root/.ssh/authorized_keys\n\
   rm -f \"$temporary\"\n\
-fi\n\
-rm -rf {}\n",
-        shell_quote(request.key.public_key()),
+fi\n",
         shell_quote(stage),
-    );
-    ssh.run(&cleanup)
-        .context("remove temporary guest bootstrap credentials")?;
-    Ok(())
+        shell_quote(key.public_key()),
+    )
 }
 
 struct LocalMaterial {
@@ -434,6 +444,43 @@ pub fn wait_for_agent(request: &AgentProbeRequest<'_>) -> Result<()> {
         "{last_error} after {} seconds",
         AGENT_READY_TIMEOUT.as_secs()
     ))
+}
+
+pub fn cleanup_bootstrap_authenticated(
+    request: &AgentProbeRequest<'_>,
+    key: &BootstrapKey,
+) -> Result<()> {
+    validate_stage(key.remote_stage())?;
+    let endpoint = format!("https://{}:{}", request.ip, request.port);
+    let ca_pem = request.client_ca.certificate_pem.clone();
+    let identity = issue_certificate(
+        request.client_ca,
+        request.client_subject,
+        CertificatePurpose::Client,
+    )
+    .context("create short-lived pbox agent client certificate")?;
+    let box_id = request.box_id.to_owned();
+    let command = vec!["/bin/sh".to_owned(), "-c".to_owned(), cleanup_script(key)];
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create async runtime for authenticated bootstrap cleanup")?;
+    let result = runtime.block_on(async {
+        let mut client = AgentClient::connect(&endpoint, &box_id, &ca_pem, &identity)
+            .await
+            .context("connect to pbox-agent for bootstrap cleanup")?;
+        client
+            .exec(command, "/", std::iter::empty::<(String, String)>(), "root")
+            .await
+            .context("remove bootstrap credentials through pbox-agent")
+    })?;
+    if !result.exited || result.code != 0 {
+        bail!(
+            "authenticated bootstrap cleanup exited with code {}",
+            result.code
+        );
+    }
+    Ok(())
 }
 
 struct SshSession<'a> {
@@ -587,6 +634,14 @@ mod tests {
         assert!(validate_stage("/tmp/pbox-bootstrap-box-123").is_ok());
         assert!(validate_stage("/tmp/pbox-bootstrap-box/../../etc").is_err());
         assert!(validate_stage("/var/tmp/pbox-bootstrap-box").is_err());
+    }
+
+    #[test]
+    fn bootstrap_cleanup_preserves_key_until_stage_is_removed() {
+        let key = BootstrapKey::generate("pbx_12345678").unwrap();
+        let cleanup = cleanup_script(&key);
+        assert!(cleanup.find("rm -rf").unwrap() < cleanup.find("grep -Fvx").unwrap());
+        key.cleanup().unwrap();
     }
 
     #[test]
