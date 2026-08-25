@@ -383,7 +383,11 @@ impl Agent for AgentService {
                 "unsupported agent protocol version",
             ));
         }
-        if open.host.is_empty() || open.port == 0 || open.port > u16::MAX as u32 {
+        if open.host.is_empty()
+            || open.host.contains('\0')
+            || open.port == 0
+            || open.port > u16::MAX as u32
+        {
             return Err(Status::invalid_argument("invalid forward target"));
         }
         drop(handshake_permit);
@@ -414,10 +418,25 @@ impl Agent for AgentService {
         tokio::spawn(async move {
             let _forward_permit = forward_permit;
             let mut buffer = [0u8; 8192];
-            let mut close_code = 0;
+            let mut client_write_closed = false;
+            let mut target_write_closed = false;
+            let close_code: u32;
             loop {
+                if client_write_closed && target_write_closed {
+                    let _ = tokio::time::timeout(
+                        FORWARD_IDLE_TIMEOUT,
+                        sender.send(Ok(ForwardEvent {
+                            event: Some(forward_event::Event::Close(ForwardClose {
+                                code: 0,
+                                half_close: false,
+                            })),
+                        })),
+                    )
+                    .await;
+                    return;
+                }
                 tokio::select! {
-                    message = tokio::time::timeout(FORWARD_IDLE_TIMEOUT, inbound.message()) => {
+                    message = tokio::time::timeout(FORWARD_IDLE_TIMEOUT, inbound.message()), if !client_write_closed => {
                         let message = match message {
                             Ok(Ok(Some(message))) => message,
                             Ok(Ok(None)) => {
@@ -435,17 +454,34 @@ impl Agent for AgentService {
                         };
                         match message.event {
                             Some(forward_event::Event::Data(data)) => {
-                                match tokio::time::timeout(FORWARD_WRITE_TIMEOUT, writer.write_all(&data)).await {
-                                    Ok(Ok(())) => {}
-                                    _ => {
-                                        close_code = 1;
-                                        break;
-                                    }
+                                if !matches!(
+                                    tokio::time::timeout(FORWARD_WRITE_TIMEOUT, writer.write_all(&data))
+                                        .await,
+                                    Ok(Ok(()))
+                                ) {
+                                    close_code = 1;
+                                    break;
                                 }
                             }
                             Some(forward_event::Event::Close(close)) => {
-                                close_code = close.code;
-                                break;
+                                if close.code != 0 {
+                                    close_code = close.code;
+                                    break;
+                                }
+                                if close.half_close {
+                                    if !matches!(
+                                        tokio::time::timeout(FORWARD_WRITE_TIMEOUT, writer.shutdown())
+                                            .await,
+                                        Ok(Ok(()))
+                                    ) {
+                                        close_code = 1;
+                                        break;
+                                    }
+                                    client_write_closed = true;
+                                } else {
+                                    close_code = 0;
+                                    break;
+                                }
                             }
                             Some(forward_event::Event::Open(_)) | None => {
                                 close_code = 1;
@@ -453,18 +489,37 @@ impl Agent for AgentService {
                             }
                         }
                     }
-                    result = tokio::time::timeout(FORWARD_IDLE_TIMEOUT, reader.read(&mut buffer)) => {
+                    result = tokio::time::timeout(FORWARD_IDLE_TIMEOUT, reader.read(&mut buffer)), if !target_write_closed => {
                         match result {
-                            Ok(Ok(0)) => break,
-                            Ok(Ok(size)) => {
-                                let event = Ok(ForwardEvent {
-                                    event: Some(forward_event::Event::Data(
-                                        buffer[..size].to_vec(),
-                                    )),
-                                });
+                            Ok(Ok(0)) => {
+                                target_write_closed = true;
                                 if !matches!(
-                                    tokio::time::timeout(FORWARD_IDLE_TIMEOUT, sender.send(event))
-                                        .await,
+                                    tokio::time::timeout(
+                                        FORWARD_IDLE_TIMEOUT,
+                                        sender.send(Ok(ForwardEvent {
+                                            event: Some(forward_event::Event::Close(ForwardClose {
+                                                code: 0,
+                                                half_close: true,
+                                            })),
+                                        })),
+                                    )
+                                    .await,
+                                    Ok(Ok(()))
+                                ) {
+                                    return;
+                                }
+                            }
+                            Ok(Ok(size)) => {
+                                if !matches!(
+                                    tokio::time::timeout(
+                                        FORWARD_IDLE_TIMEOUT,
+                                        sender.send(Ok(ForwardEvent {
+                                            event: Some(forward_event::Event::Data(
+                                                buffer[..size].to_vec(),
+                                            )),
+                                        })),
+                                    )
+                                    .await,
                                     Ok(Ok(()))
                                 ) {
                                     return;
@@ -487,6 +542,7 @@ impl Agent for AgentService {
                 sender.send(Ok(ForwardEvent {
                     event: Some(forward_event::Event::Close(ForwardClose {
                         code: close_code,
+                        half_close: false,
                     })),
                 })),
             )
@@ -1380,7 +1436,7 @@ mod tests {
         CertificatePurpose, derive_context_seed, generate_context_ca, issue_certificate,
         server_subject,
     };
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     async fn spawn_test_agent(
         box_id: &str,
@@ -1468,6 +1524,59 @@ mod tests {
         assert_eq!(result.code, 0);
         assert!(result.exited);
 
+        stop_test_agent(task).await;
+    }
+    #[tokio::test]
+    async fn forward_tunnels_data_and_closes_after_remote_eof() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target_listener.local_addr().unwrap().port();
+        let target_task = tokio::spawn(async move {
+            let (mut socket, _) = target_listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            socket.read_to_end(&mut request).await.unwrap();
+            assert_eq!(request, b"ping");
+            socket.write_all(b"pong").await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        let box_id = "pbx_t3yzd9y3";
+        let seed = derive_context_seed("pbox@pve!cli", "secret");
+        let ca = generate_context_ca(&seed).unwrap();
+        let server = issue_certificate(
+            &ca,
+            &server_subject(box_id).unwrap(),
+            CertificatePurpose::Server,
+        )
+        .unwrap();
+        let client = issue_certificate(
+            &ca,
+            "pbox.cwd.dev/context/test-client",
+            CertificatePurpose::Client,
+        )
+        .unwrap();
+        let (endpoint, task) = spawn_test_agent(box_id, server, &ca).await;
+        let mut agent = AgentClient::connect(&endpoint, box_id, &ca.certificate_pem, &client)
+            .await
+            .unwrap();
+
+        let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_address = local_listener.local_addr().unwrap();
+        let client_task = tokio::spawn(async move {
+            let mut socket = TcpStream::connect(local_address).await.unwrap();
+            socket.write_all(b"ping").await.unwrap();
+            socket.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            socket.read_to_end(&mut response).await.unwrap();
+            response
+        });
+        let (local_socket, _) = local_listener.accept().await.unwrap();
+        agent
+            .forward_tcp(local_socket, "127.0.0.1", target_port)
+            .await
+            .unwrap();
+
+        assert_eq!(client_task.await.unwrap(), b"pong");
+        target_task.await.unwrap();
         stop_test_agent(task).await;
     }
 

@@ -2,9 +2,9 @@ use hyper_util::rt::TokioIo;
 use pbox_crypto::{CertificateMaterial, server_dns_name};
 use pbox_proto::PROTOCOL_VERSION;
 use pbox_proto::agent::{
-    ExecEvent, ExecRequest, FileChunk, FileResult, ForwardEvent, GetFileRequest, InfoRequest,
-    InfoResponse, PingRequest, PingResponse, agent_client::AgentClient as GeneratedAgentClient,
-    exec_event,
+    ExecEvent, ExecRequest, FileChunk, FileResult, ForwardClose, ForwardEvent, ForwardOpen,
+    GetFileRequest, InfoRequest, InfoResponse, PingRequest, PingResponse,
+    agent_client::AgentClient as GeneratedAgentClient, exec_event, forward_event,
 };
 use rustls::ClientConfig;
 use rustls::RootCertStore;
@@ -15,8 +15,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::codegen::{Service, http::Uri};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Status, Streaming};
@@ -30,6 +33,10 @@ pub enum AgentClientError {
     Endpoint(String),
     #[error("agent transport failed: {0}")]
     Transport(#[from] tonic::transport::Error),
+    #[error("local forwarding I/O failed: {0}")]
+    Io(#[from] io::Error),
+    #[error("agent forward request stream closed")]
+    ForwardRequestClosed,
     #[error("agent RPC failed: {0}")]
     Rpc(#[from] Status),
     #[error("agent TLS configuration failed: {0}")]
@@ -254,6 +261,102 @@ impl AgentClient {
     {
         Ok(self.inner.forward(requests).await?.into_inner())
     }
+    pub async fn forward_tcp(
+        &mut self,
+        socket: TcpStream,
+        host: impl Into<String>,
+        port: u16,
+    ) -> Result<(), AgentClientError> {
+        let host = host.into();
+        validate_forward_target(&host, port)?;
+        let (sender, receiver) = mpsc::channel(32);
+        sender
+            .send(ForwardEvent {
+                event: Some(forward_event::Event::Open(ForwardOpen {
+                    protocol_version: PROTOCOL_VERSION,
+                    host,
+                    port: port as u32,
+                })),
+            })
+            .await
+            .map_err(|_| AgentClientError::ForwardRequestClosed)?;
+        let mut stream = self
+            .inner
+            .forward(ReceiverStream::new(receiver))
+            .await?
+            .into_inner();
+        let (mut reader, mut writer) = socket.into_split();
+        let mut buffer = [0u8; 8192];
+        let mut local_write_closed = false;
+        let mut remote_write_closed = false;
+        loop {
+            if local_write_closed && remote_write_closed {
+                let _ = sender
+                    .send(ForwardEvent {
+                        event: Some(forward_event::Event::Close(ForwardClose {
+                            code: 0,
+                            half_close: false,
+                        })),
+                    })
+                    .await;
+                return Ok(());
+            }
+            tokio::select! {
+                result = reader.read(&mut buffer), if !local_write_closed => {
+                    let size = result?;
+                    if size == 0 {
+                        sender
+                            .send(ForwardEvent {
+                                event: Some(forward_event::Event::Close(ForwardClose {
+                                    code: 0,
+                                    half_close: true,
+                                })),
+                            })
+                            .await
+                            .map_err(|_| AgentClientError::ForwardRequestClosed)?;
+                        local_write_closed = true;
+                    } else {
+                        sender
+                            .send(ForwardEvent {
+                                event: Some(forward_event::Event::Data(buffer[..size].to_vec())),
+                            })
+                            .await
+                            .map_err(|_| AgentClientError::ForwardRequestClosed)?;
+                    }
+                }
+                result = stream.message(), if !remote_write_closed => {
+                    let event = result?
+                        .ok_or_else(|| AgentClientError::Rpc(Status::unknown(
+                            "agent forward stream ended without close",
+                        )))?;
+                    match event.event {
+                        Some(forward_event::Event::Data(data)) => {
+                            writer.write_all(&data).await?;
+                        }
+                        Some(forward_event::Event::Close(close)) => {
+                            writer.shutdown().await?;
+                            if close.code != 0 {
+                                return Err(AgentClientError::Rpc(Status::unknown(format!(
+                                    "agent forward closed with code {}",
+                                    close.code
+                                ))));
+                            }
+                            if close.half_close {
+                                remote_write_closed = true;
+                            } else {
+                                return Ok(());
+                            }
+                        }
+                        Some(forward_event::Event::Open(_)) | None => {
+                            return Err(AgentClientError::Rpc(Status::invalid_argument(
+                                "agent forward stream sent an invalid event",
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     pub async fn put_file(
         &mut self,
@@ -432,6 +535,25 @@ async fn collect_file_stream(
     }
     Ok(data)
 }
+fn validate_forward_target(host: &str, port: u16) -> Result<(), AgentClientError> {
+    if host.is_empty() {
+        return Err(AgentClientError::Endpoint(
+            "agent forward target host cannot be empty".to_owned(),
+        ));
+    }
+    if host.contains('\0') {
+        return Err(AgentClientError::Endpoint(
+            "agent forward target host cannot contain NUL bytes".to_owned(),
+        ));
+    }
+    if port == 0 {
+        return Err(AgentClientError::Endpoint(
+            "agent forward target port cannot be zero".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_https_endpoint(endpoint: &Endpoint) -> Result<(), AgentClientError> {
     if endpoint
         .uri()
@@ -457,5 +579,19 @@ mod tests {
             error,
             AgentClientError::Endpoint(message) if message == "agent endpoint must use https"
         ));
+    }
+    #[test]
+    fn forward_target_validation_rejects_empty_host_and_zero_port() {
+        assert!(matches!(
+            validate_forward_target("", 8080),
+            Err(AgentClientError::Endpoint(message))
+                if message == "agent forward target host cannot be empty"
+        ));
+        assert!(matches!(
+            validate_forward_target("127.0.0.1", 0),
+            Err(AgentClientError::Endpoint(message))
+                if message == "agent forward target port cannot be zero"
+        ));
+        assert!(validate_forward_target("127.0.0.1", 8080).is_ok());
     }
 }

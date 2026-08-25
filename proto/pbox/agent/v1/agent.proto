@@ -92,4 +92,5 @@ message ForwardOpen {
 
 message ForwardClose {
   uint32 code = 1;
+  bool half_close = 2;
 }
