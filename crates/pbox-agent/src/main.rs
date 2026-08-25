@@ -82,18 +82,14 @@ struct Args {
 }
 type TlsHandshake =
     Pin<Box<dyn Future<Output = Result<TlsStream<LimitedTcpStream>, io::Error>> + Send>>;
+type SemaphoreAcquire =
+    Pin<Box<dyn Future<Output = Result<OwnedSemaphorePermit, tokio::sync::AcquireError>> + Send>>;
 
 struct LimitedIncoming {
     listener: TcpListener,
     permits: Arc<Semaphore>,
     tls_config: Arc<rustls::ServerConfig>,
-    acquire: Option<
-        Pin<
-            Box<
-                dyn Future<Output = Result<OwnedSemaphorePermit, tokio::sync::AcquireError>> + Send,
-            >,
-        >,
-    >,
+    acquire: Option<SemaphoreAcquire>,
     permit: Option<OwnedSemaphorePermit>,
     handshake: Option<TlsHandshake>,
 }
