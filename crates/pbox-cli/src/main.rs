@@ -8,9 +8,10 @@ use bootstrap::{BootstrapKey, BootstrapRequest, bootstrap_box};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pbox_agent_client::{AgentClient, ExecResult};
 use pbox_core::{
-    Config, ConfigStore, LxcConfigUpdateRequest, LxcCreateRequest, PboxId, PboxMetadata,
-    PboxRecipeProvenance, PveApi, PveClient, PveClientConfig, PveError, PveTaskResponse,
-    encode_metadata, parse_duration, parse_metadata, preserve_metadata, select_lxc_ipv4,
+    Config, ConfigStore, LxcConfigUpdateRequest, LxcCreateRequest, LxcSnapshotRequest, PboxId,
+    PboxMetadata, PboxRecipeProvenance, PveApi, PveClient, PveClientConfig, PveError,
+    PveTaskResponse, encode_metadata, parse_duration, parse_metadata, preserve_metadata,
+    select_lxc_ipv4,
 };
 use pbox_crypto::{
     CertificateMaterial, CertificatePurpose, client_subject, derive_context_seed,
@@ -659,12 +660,32 @@ fn run_recipe(
             if record.state != "running" {
                 bail!("box {} is not running", record.id);
             }
+            if config.recipes.rollback_on_failure && config.recipes.snapshot_before_apply == "never"
+            {
+                eprintln!(
+                    "[recipe] rollback-on-failure is enabled but snapshot-before-apply is never"
+                );
+            }
             let binary = std::env::current_exe().context("locate pbox executable")?;
             let planned_run = AnsibleRun {
                 recipe: selected.id.clone(),
                 box_id: box_id.clone(),
                 repository: catalog.repository.clone(),
                 revision: catalog.revision.clone(),
+            };
+            let snapshot = match create_recipe_snapshot(&client, &record, &config, &planned_run) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return finish_recipe_failure(
+                        &client,
+                        &record,
+                        &planned_run,
+                        &selected.metadata.capabilities,
+                        error,
+                        None,
+                        false,
+                    );
+                }
             };
             let applied = match apply_recipe(
                 store.path(),
@@ -677,32 +698,26 @@ fn run_recipe(
             ) {
                 Ok(applied) => applied,
                 Err(error) => {
-                    if let Err(provenance_error) = record_recipe_provenance(
+                    return finish_recipe_failure(
                         &client,
                         &record,
                         &planned_run,
                         &selected.metadata.capabilities,
-                        "failed",
-                    ) {
-                        return Err(error).context(format!(
-                            "record failed recipe provenance: {provenance_error}"
-                        ));
-                    }
-                    return Err(error);
+                        error,
+                        snapshot.as_ref(),
+                        config.recipes.rollback_on_failure,
+                    );
                 }
             };
             let ansible::RecipeApplyResult { run, cleanup_error } = applied;
-            record_recipe_provenance(
+            finish_recipe_success(
                 &client,
                 &record,
                 &run,
                 &selected.metadata.capabilities,
-                "success",
+                snapshot.as_ref(),
+                cleanup_error,
             )?;
-            if let Some(error) = cleanup_error {
-                return Err(error)
-                    .context("recipe applied successfully but operation cleanup failed");
-            }
             if json {
                 println!("{}", serde_json::to_string_pretty(&run)?);
             } else {
@@ -716,6 +731,212 @@ fn run_recipe(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct RecipeSnapshot {
+    name: String,
+}
+
+fn create_recipe_snapshot(
+    client: &impl PveApi,
+    record: &BoxRecord,
+    config: &Config,
+    run: &AnsibleRun,
+) -> Result<Option<RecipeSnapshot>> {
+    match config.recipes.snapshot_before_apply.as_str() {
+        "never" => return Ok(None),
+        "always" | "auto" => {}
+        policy => bail!("invalid recipe snapshot policy: {policy}"),
+    }
+    let name = format!(
+        "pbox-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("read system clock")?
+            .as_nanos()
+    );
+    let request = LxcSnapshotRequest {
+        snapname: name.clone(),
+        description: Some(format!(
+            "pbox before recipe {} @ {}",
+            safe_terminal_text(&run.recipe),
+            safe_terminal_text(&run.revision)
+        )),
+    };
+    let task = match client.create_lxc_snapshot(&record.node, record.vmid, &request) {
+        Ok(task) => task,
+        Err(error)
+            if config.recipes.snapshot_before_apply == "auto" && snapshot_unavailable(&error) =>
+        {
+            eprintln!(
+                "[recipe] snapshots are unavailable for {}; continuing without one",
+                safe_terminal_text(record.id.as_str())
+            );
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(cleanup_failed_recipe_snapshot(
+                client,
+                record,
+                &name,
+                anyhow!(error).context("create recipe snapshot"),
+            ));
+        }
+    };
+    if let Err(error) = wait_for_task(client, &record.node, task) {
+        return Err(cleanup_failed_recipe_snapshot(
+            client,
+            record,
+            &name,
+            anyhow!(error).context(format!("wait for recipe snapshot {name}")),
+        ));
+    }
+    Ok(Some(RecipeSnapshot { name }))
+}
+
+fn cleanup_failed_recipe_snapshot(
+    client: &impl PveApi,
+    record: &BoxRecord,
+    name: &str,
+    primary_error: anyhow::Error,
+) -> anyhow::Error {
+    match delete_recipe_snapshot(
+        client,
+        record,
+        &RecipeSnapshot {
+            name: name.to_owned(),
+        },
+    ) {
+        Ok(()) => primary_error.context(format!(
+            "removed incomplete recipe snapshot {name} after snapshot operation failure"
+        )),
+        Err(cleanup_error) => attach_error(
+            primary_error,
+            &format!("recipe snapshot {name} may remain; cleanup failed"),
+            cleanup_error,
+        ),
+    }
+}
+
+fn snapshot_unavailable(error: &PveError) -> bool {
+    matches!(
+        error,
+        PveError::Http { status, .. } if matches!(status.as_u16(), 400 | 405 | 501)
+    )
+}
+
+fn rollback_recipe_snapshot(
+    client: &impl PveApi,
+    record: &BoxRecord,
+    snapshot: &RecipeSnapshot,
+) -> Result<()> {
+    let task = client
+        .rollback_lxc_snapshot(&record.node, record.vmid, &snapshot.name, true)
+        .with_context(|| format!("rollback recipe snapshot {}", snapshot.name))?;
+    wait_for_task(client, &record.node, task)
+        .with_context(|| format!("wait for recipe snapshot rollback {}", snapshot.name))
+}
+
+fn delete_recipe_snapshot(
+    client: &impl PveApi,
+    record: &BoxRecord,
+    snapshot: &RecipeSnapshot,
+) -> Result<()> {
+    let task = client
+        .delete_lxc_snapshot(&record.node, record.vmid, &snapshot.name)
+        .with_context(|| format!("delete recipe snapshot {}", snapshot.name))?;
+    wait_for_task(client, &record.node, task)
+        .with_context(|| format!("wait for recipe snapshot deletion {}", snapshot.name))
+}
+
+fn finish_recipe_failure(
+    client: &impl PveApi,
+    record: &BoxRecord,
+    planned_run: &AnsibleRun,
+    capabilities: &[String],
+    primary_error: anyhow::Error,
+    snapshot: Option<&RecipeSnapshot>,
+    rollback_on_failure: bool,
+) -> Result<()> {
+    let mut error = primary_error;
+    if rollback_on_failure {
+        match snapshot {
+            Some(snapshot) => match rollback_recipe_snapshot(client, record, snapshot) {
+                Ok(()) => {
+                    if let Err(delete_error) = delete_recipe_snapshot(client, record, snapshot) {
+                        error =
+                            attach_error(error, "delete recovered recipe snapshot", delete_error);
+                    }
+                }
+                Err(rollback_error) => {
+                    error = attach_error(error, "rollback recipe snapshot", rollback_error);
+                }
+            },
+            None => {
+                error = error.context("rollback requested but no recipe snapshot was available");
+            }
+        }
+    } else if let Some(snapshot) = snapshot {
+        error = error.context(format!(
+            "recipe snapshot {} was preserved for manual recovery",
+            snapshot.name
+        ));
+    }
+    if let Err(provenance_error) =
+        record_recipe_provenance(client, record, planned_run, capabilities, "failed")
+    {
+        error = attach_error(error, "record failed recipe provenance", provenance_error);
+    }
+    Err(error)
+}
+
+fn finish_recipe_success(
+    client: &impl PveApi,
+    record: &BoxRecord,
+    run: &AnsibleRun,
+    capabilities: &[String],
+    snapshot: Option<&RecipeSnapshot>,
+    cleanup_error: Option<anyhow::Error>,
+) -> Result<()> {
+    let mut cleanup_error = cleanup_error;
+    if let Err(error) = record_recipe_provenance(client, record, run, capabilities, "success") {
+        let error = match cleanup_error {
+            Some(cleanup_error) => attach_error(error, "recipe cleanup also failed", cleanup_error),
+            None => error,
+        };
+        return Err(match snapshot {
+            Some(snapshot) => error.context(format!(
+                "recipe snapshot {} was preserved for manual recovery",
+                snapshot.name
+            )),
+            None => error,
+        });
+    }
+    if let Some(snapshot) = snapshot
+        && let Err(error) = delete_recipe_snapshot(client, record, snapshot)
+    {
+        cleanup_error = merge_cleanup_error(cleanup_error, "remove recipe snapshot", error);
+    }
+    if let Some(error) = cleanup_error {
+        return Err(error.context("recipe applied successfully but cleanup failed"));
+    }
+    Ok(())
+}
+
+fn attach_error(primary: anyhow::Error, label: &str, secondary: anyhow::Error) -> anyhow::Error {
+    primary.context(format!("{label}: {secondary:#}"))
+}
+
+fn merge_cleanup_error(
+    existing: Option<anyhow::Error>,
+    label: &str,
+    error: anyhow::Error,
+) -> Option<anyhow::Error> {
+    Some(match existing {
+        Some(existing) => attach_error(existing, label, error),
+        None => error.context(label.to_owned()),
+    })
 }
 
 fn record_recipe_provenance(
@@ -1690,12 +1911,469 @@ fn color_enabled(color: ColorChoice, json: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        exec_exit_code, parse_env_entry, parse_recipe_sync_ttl, parse_remote_path, write_download,
+        AnsibleRun, BoxRecord, RecipeSnapshot, create_recipe_snapshot, delete_recipe_snapshot,
+        exec_exit_code, finish_recipe_failure, finish_recipe_success, parse_env_entry,
+        parse_recipe_sync_ttl, parse_remote_path, record_recipe_provenance, write_download,
     };
+    use anyhow::anyhow;
     use pbox_agent_client::ExecResult;
     use pbox_core::ui::ColorMode;
+    use pbox_core::{
+        Config, LxcConfig, LxcConfigUpdateRequest, LxcCreateRequest, LxcInterface,
+        LxcSnapshotRequest, PboxId, PboxMetadata, PveApi, PveError, PveTaskResponse, PveTaskStatus,
+        encode_metadata, parse_metadata,
+    };
+    use std::cell::RefCell;
     use std::fs;
     use std::time::Duration;
+
+    struct FakePve {
+        config: RefCell<LxcConfig>,
+        events: RefCell<Vec<String>>,
+        fail_next_task: RefCell<bool>,
+        fail_create: RefCell<bool>,
+        fail_updates: RefCell<bool>,
+    }
+
+    impl FakePve {
+        fn new(metadata: &PboxMetadata, note: &str) -> Self {
+            Self {
+                config: RefCell::new(LxcConfig {
+                    digest: Some("digest-1".to_owned()),
+                    description: Some(format!("{note}\n\n{}", encode_metadata(metadata).unwrap())),
+                    hostname: None,
+                    cores: None,
+                    memory: None,
+                    swap: None,
+                    rootfs: None,
+                    unprivileged: None,
+                    net0: None,
+                    extra: serde_json::Map::new(),
+                }),
+                events: RefCell::new(Vec::new()),
+                fail_create: RefCell::new(false),
+                fail_next_task: RefCell::new(false),
+                fail_updates: RefCell::new(false),
+            }
+        }
+
+        fn fail_next_task(&self) {
+            *self.fail_next_task.borrow_mut() = true;
+        }
+
+        fn fail_create(&self) {
+            *self.fail_create.borrow_mut() = true;
+        }
+
+        fn fail_updates(&self) {
+            *self.fail_updates.borrow_mut() = true;
+        }
+
+        fn unsupported() -> PveError {
+            PveError::InvalidPathSegment {
+                field: "test".to_owned(),
+            }
+        }
+
+        fn task(name: &str) -> PveTaskResponse {
+            PveTaskResponse {
+                upid: name.to_owned(),
+            }
+        }
+    }
+
+    impl PveApi for FakePve {
+        fn list_cluster_resources(&self) -> Result<Vec<pbox_core::ClusterResource>, PveError> {
+            Err(Self::unsupported())
+        }
+
+        fn get_lxc_config(&self, _node: &str, _vmid: u64) -> Result<LxcConfig, PveError> {
+            Ok(self.config.borrow().clone())
+        }
+
+        fn list_lxc_interfaces(
+            &self,
+            _node: &str,
+            _vmid: u64,
+        ) -> Result<Vec<LxcInterface>, PveError> {
+            Err(Self::unsupported())
+        }
+
+        fn get_task_status(&self, _node: &str, upid: &str) -> Result<PveTaskStatus, PveError> {
+            self.events.borrow_mut().push(format!("wait:{upid}"));
+            let failed = self.fail_next_task.replace(false);
+            Ok(PveTaskStatus {
+                status: "stopped".to_owned(),
+                exitstatus: Some(if failed {
+                    "ERROR: test".to_owned()
+                } else {
+                    "OK".to_owned()
+                }),
+                upid: Some(upid.to_owned()),
+                node: None,
+                pid: None,
+                starttime: None,
+                type_: None,
+            })
+        }
+
+        fn create_lxc(
+            &self,
+            _node: &str,
+            _vmid: u64,
+            _request: &LxcCreateRequest,
+        ) -> Result<PveTaskResponse, PveError> {
+            Err(Self::unsupported())
+        }
+
+        fn update_lxc_config(
+            &self,
+            _node: &str,
+            _vmid: u64,
+            request: &LxcConfigUpdateRequest,
+        ) -> Result<(), PveError> {
+            self.events.borrow_mut().push("update".to_owned());
+            if *self.fail_updates.borrow() {
+                return Err(Self::unsupported());
+            }
+            let mut config = self.config.borrow_mut();
+            config.digest = request.digest.clone();
+            if let Some(description) = &request.description {
+                config.description = Some(description.clone());
+            }
+            Ok(())
+        }
+
+        fn start_lxc(&self, _node: &str, _vmid: u64) -> Result<PveTaskResponse, PveError> {
+            Err(Self::unsupported())
+        }
+
+        fn shutdown_lxc(&self, _node: &str, _vmid: u64) -> Result<PveTaskResponse, PveError> {
+            Err(Self::unsupported())
+        }
+
+        fn stop_lxc(&self, _node: &str, _vmid: u64) -> Result<PveTaskResponse, PveError> {
+            Err(Self::unsupported())
+        }
+
+        fn delete_lxc(&self, _node: &str, _vmid: u64) -> Result<PveTaskResponse, PveError> {
+            Err(Self::unsupported())
+        }
+
+        fn create_lxc_snapshot(
+            &self,
+            _node: &str,
+            _vmid: u64,
+            request: &LxcSnapshotRequest,
+        ) -> Result<PveTaskResponse, PveError> {
+            self.events
+                .borrow_mut()
+                .push(format!("create:{}", request.snapname));
+            if *self.fail_create.borrow() {
+                return Err(Self::unsupported());
+            }
+            Ok(Self::task("snapshot-create"))
+        }
+
+        fn rollback_lxc_snapshot(
+            &self,
+            _node: &str,
+            _vmid: u64,
+            snapname: &str,
+            start: bool,
+        ) -> Result<PveTaskResponse, PveError> {
+            self.events
+                .borrow_mut()
+                .push(format!("rollback:{snapname}:{start}"));
+            Ok(Self::task("snapshot-rollback"))
+        }
+
+        fn delete_lxc_snapshot(
+            &self,
+            _node: &str,
+            _vmid: u64,
+            snapname: &str,
+        ) -> Result<PveTaskResponse, PveError> {
+            self.events.borrow_mut().push(format!("delete:{snapname}"));
+            Ok(Self::task("snapshot-delete"))
+        }
+    }
+
+    fn test_record() -> BoxRecord {
+        BoxRecord {
+            id: PboxId::parse("pbx_t3yzd9y3").unwrap(),
+            vmid: 9007,
+            state: "running".to_owned(),
+            node: "pve01".to_owned(),
+            ip: None,
+            name: Some("test-box".to_owned()),
+            recipes: Vec::new(),
+            capabilities: Vec::new(),
+        }
+    }
+
+    fn test_metadata(record: &BoxRecord) -> PboxMetadata {
+        PboxMetadata::new(record.id.clone(), record.vmid).with_node(record.node.clone())
+    }
+    #[test]
+    fn provenance_failure_preserves_snapshot_for_manual_recovery() {
+        let record = test_record();
+        let metadata = test_metadata(&record);
+        let fake = FakePve::new(&metadata, "user note");
+        fake.fail_updates();
+        let run = AnsibleRun {
+            recipe: "desktop/xfce".to_owned(),
+            box_id: record.id.to_string(),
+            repository: "https://example.test/recipes.git".to_owned(),
+            revision: "abc123".to_owned(),
+        };
+        let snapshot = RecipeSnapshot {
+            name: "pbox-recipe-test".to_owned(),
+        };
+
+        let error = finish_recipe_success(
+            &fake,
+            &record,
+            &run,
+            &["desktop".to_owned()],
+            Some(&snapshot),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("preserved for manual recovery"));
+        assert_eq!(
+            &*fake.events.borrow(),
+            &[
+                "update".to_owned(),
+                "update".to_owned(),
+                "update".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_snapshot_request_attempts_cleanup_before_reporting() {
+        let record = test_record();
+        let metadata = test_metadata(&record);
+        let fake = FakePve::new(&metadata, "user note");
+        fake.fail_create();
+        let run = AnsibleRun {
+            recipe: "desktop/xfce".to_owned(),
+            box_id: record.id.to_string(),
+            repository: "https://example.test/recipes.git".to_owned(),
+            revision: "abc123".to_owned(),
+        };
+
+        let error = create_recipe_snapshot(&fake, &record, &Config::default(), &run).unwrap_err();
+
+        assert!(format!("{error:#}").contains("create recipe snapshot"));
+        let events = fake.events.borrow();
+        assert_eq!(events.len(), 3);
+        assert!(events[0].starts_with("create:pbox-"));
+        let snapshot_name = events[0].trim_start_matches("create:");
+        assert_eq!(events[1], format!("delete:{snapshot_name}"));
+        assert_eq!(events[2], "wait:snapshot-delete");
+    }
+
+    #[test]
+    fn failed_snapshot_task_attempts_cleanup_before_reporting() {
+        let record = test_record();
+        let metadata = test_metadata(&record);
+        let fake = FakePve::new(&metadata, "user note");
+        fake.fail_next_task();
+        let run = AnsibleRun {
+            recipe: "desktop/xfce".to_owned(),
+            box_id: record.id.to_string(),
+            repository: "https://example.test/recipes.git".to_owned(),
+            revision: "abc123".to_owned(),
+        };
+
+        let error = create_recipe_snapshot(&fake, &record, &Config::default(), &run).unwrap_err();
+
+        assert!(format!("{error:#}").contains("PVE task failed"));
+        let events = fake.events.borrow();
+        assert_eq!(events.len(), 4);
+        assert!(events[0].starts_with("create:pbox-"));
+        let snapshot_name = events[0].trim_start_matches("create:");
+        assert_eq!(events[2], format!("delete:{snapshot_name}"));
+        assert_eq!(
+            &events[1..],
+            [
+                "wait:snapshot-create".to_owned(),
+                format!("delete:{snapshot_name}"),
+                "wait:snapshot-delete".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_policy_controls_creation_and_cleanup() {
+        let record = test_record();
+        let metadata = test_metadata(&record);
+        let fake = FakePve::new(&metadata, "user note");
+        let run = AnsibleRun {
+            recipe: "desktop/xfce".to_owned(),
+            box_id: record.id.to_string(),
+            repository: "https://example.test/recipes.git".to_owned(),
+            revision: "abc123".to_owned(),
+        };
+        let mut config = Config::default();
+        config.recipes.snapshot_before_apply = "never".to_owned();
+        assert!(
+            create_recipe_snapshot(&fake, &record, &config, &run)
+                .unwrap()
+                .is_none()
+        );
+        assert!(fake.events.borrow().is_empty());
+
+        config.recipes.snapshot_before_apply = "always".to_owned();
+        let snapshot = create_recipe_snapshot(&fake, &record, &config, &run)
+            .unwrap()
+            .expect("snapshot");
+        assert!(snapshot.name.starts_with("pbox-"));
+        delete_recipe_snapshot(&fake, &record, &snapshot).unwrap();
+        assert_eq!(
+            &*fake.events.borrow(),
+            &[
+                format!("create:{}", snapshot.name),
+                "wait:snapshot-create".to_owned(),
+                format!("delete:{}", snapshot.name),
+                "wait:snapshot-delete".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn successful_provenance_preserves_user_text_and_records_capabilities() {
+        let record = test_record();
+        let metadata = test_metadata(&record);
+        let fake = FakePve::new(&metadata, "user note");
+        let run = AnsibleRun {
+            recipe: "desktop/xfce".to_owned(),
+            box_id: record.id.to_string(),
+            repository: "https://example.test/recipes.git".to_owned(),
+            revision: "abc123".to_owned(),
+        };
+
+        record_recipe_provenance(&fake, &record, &run, &["desktop".to_owned()], "success").unwrap();
+
+        let description = fake.config.borrow().description.clone().unwrap();
+        assert!(description.starts_with("user note"));
+        let metadata = parse_metadata(&description).unwrap().unwrap();
+        assert_eq!(metadata.capabilities, vec!["desktop".to_owned()]);
+        assert_eq!(metadata.recipes.len(), 1);
+        assert_eq!(metadata.recipes[0].result.as_deref(), Some("success"));
+    }
+
+    #[test]
+    fn failed_recipe_rolls_back_deletes_snapshot_and_records_failure() {
+        let record = test_record();
+        let metadata = test_metadata(&record);
+        let fake = FakePve::new(&metadata, "user note");
+        let run = AnsibleRun {
+            recipe: "desktop/xfce".to_owned(),
+            box_id: record.id.to_string(),
+            repository: "https://example.test/recipes.git".to_owned(),
+            revision: "abc123".to_owned(),
+        };
+        let snapshot = RecipeSnapshot {
+            name: "pbox-recipe-test".to_owned(),
+        };
+
+        let error = finish_recipe_failure(
+            &fake,
+            &record,
+            &run,
+            &["desktop".to_owned()],
+            anyhow!("recipe failed"),
+            Some(&snapshot),
+            true,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("recipe failed"));
+        assert_eq!(
+            &*fake.events.borrow(),
+            &[
+                "rollback:pbox-recipe-test:true".to_owned(),
+                "wait:snapshot-rollback".to_owned(),
+                "delete:pbox-recipe-test".to_owned(),
+                "wait:snapshot-delete".to_owned(),
+                "update".to_owned(),
+            ]
+        );
+        let description = fake.config.borrow().description.clone().unwrap();
+        let metadata = parse_metadata(&description).unwrap().unwrap();
+        assert!(metadata.capabilities.is_empty());
+        assert_eq!(metadata.recipes[0].result.as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn failed_recipe_without_snapshot_reports_missing_recovery() {
+        let record = test_record();
+        let metadata = test_metadata(&record);
+        let fake = FakePve::new(&metadata, "user note");
+        let run = AnsibleRun {
+            recipe: "docker".to_owned(),
+            box_id: record.id.to_string(),
+            repository: "https://example.test/recipes.git".to_owned(),
+            revision: "abc123".to_owned(),
+        };
+
+        let error = finish_recipe_failure(
+            &fake,
+            &record,
+            &run,
+            &[],
+            anyhow!("recipe failed"),
+            None,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("rollback requested but no recipe snapshot was available")
+        );
+        assert_eq!(&*fake.events.borrow(), &["update".to_owned()]);
+    }
+
+    #[test]
+    fn failed_recipe_without_rollback_preserves_snapshot_for_recovery() {
+        let record = test_record();
+        let metadata = test_metadata(&record);
+        let fake = FakePve::new(&metadata, "user note");
+        let run = AnsibleRun {
+            recipe: "docker".to_owned(),
+            box_id: record.id.to_string(),
+            repository: "https://example.test/recipes.git".to_owned(),
+            revision: "abc123".to_owned(),
+        };
+        let snapshot = RecipeSnapshot {
+            name: "pbox-recipe-test".to_owned(),
+        };
+
+        let error = finish_recipe_failure(
+            &fake,
+            &record,
+            &run,
+            &[],
+            anyhow!("recipe failed"),
+            Some(&snapshot),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("recipe snapshot pbox-recipe-test was preserved")
+        );
+        assert_eq!(&*fake.events.borrow(), &["update".to_owned()]);
+    }
+
     #[test]
     fn colour_is_disabled_for_json_and_no_color() {
         assert!(!ColorMode::Always.enabled(true, false, true));
