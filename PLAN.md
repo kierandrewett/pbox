@@ -5,7 +5,7 @@
 Deliver a usable pbox CLI in small increments while keeping PVE as the source
 of truth and keeping guest access separate from infrastructure control.
 
-## First vertical slice
+## Completed slices
 
 1. Rust workspace and CLI shell.
 2. Typed configuration, redaction, and XDG paths.
@@ -13,26 +13,27 @@ of truth and keeping guest access separate from infrastructure control.
 4. PVE metadata parsing and preservation.
 5. Typed PVE REST client with task polling primitives.
 6. Human and JSON renderers for read-only commands.
+7. LXC creation, lifecycle operations, and guest-agent bootstrap.
+8. Authenticated agent operations for shell, exec, files, and forwarding.
+9. Ansible recipe discovery and application.
+10. PVE snapshot operations.
+11. OCI registry search, image pulls, and template selection.
 
-This slice is testable without a live Proxmox cluster. It must not claim that
-LXC creation or guest access works yet.
+All completed slices have local unit or fake-PVE coverage. Live PVE and guest
+network verification remains outstanding.
 
-## Dependency order
+## Next dependency order
 
 ```text
-config + domain models
+current-box shell state + command aliases
         |
-        +--> PVE client + metadata
+        +--> fork and agent identity re-keying
         |
-        +--> UI renderers + read-only CLI
+        +--> desktop recipe transport
         |
-        +--> crypto + protocol
-                 |
-                 +--> agent client + transport
-                              |
-                              +--> lifecycle bootstrap
-                                         |
-                                         +--> recipes + Ansible
+        +--> PVE console relay fallback
+        |
+        +--> release packaging, upgrades, and end-to-end verification
 ```
 
 ## Product invariants

@@ -2,15 +2,38 @@
 
 Build a Linux-only developer sandbox CLI backed by Proxmox VE LXC containers.
 
-The first shippable milestone proves the control-plane contract without a hosted
-service or local box registry:
+## Current state
 
-- `pbox config` stores validated local configuration and redacts secrets.
-- `pbox id` creates and validates stable public IDs such as `pbx_t3yzd9y3`.
-- VMID patterns such as `9xxx` allocate the lowest free candidate safely.
-- PVE metadata preserves user notes while storing machine-readable ownership.
-- A typed PVE client can list resources, inspect containers, and handle tasks.
-- `pbox list`, `pbox info`, and JSON output use the same domain data.
+The repository has passed the first control-plane milestone and now contains
+these implemented slices:
 
-The next vertical slice adds real LXC lifecycle operations, then guest access
-through the authenticated agent. PVE remains the authoritative box registry.
+- validated local configuration with secret redaction;
+- stable public IDs such as `pbx_t3yzd9y3`;
+- VMID pattern allocation;
+- PVE metadata parsing and preservation;
+- a typed PVE REST client with task polling;
+- human and JSON output for box data;
+- LXC creation, lifecycle commands, and guest-agent bootstrap;
+- agent-backed shell, command execution, file transfer, and TCP forwarding;
+- Ansible recipe discovery and application;
+- PVE snapshot operations;
+- OCI registry search, image pulls, and template selection for `pbox new`.
+
+These paths still need a live PVE cluster and guest network for end-to-end
+verification. Unit tests and fake-PVE tests do not prove a live deployment.
+
+## Remaining product work
+
+The full product specification still includes work that is not in the current
+CLI:
+
+- `current` shell resolution and the complete Box-style command aliases;
+- box forking with controlled agent identity re-keying;
+- desktop recipe transport and the `pbox desktop` command;
+- PVE console relay fallback when direct guest access is unavailable;
+- agent release packaging, upgrades, and trust rotation commands;
+- recipe repository content, release packaging, and operator documentation;
+- production end-to-end tests against a disposable PVE environment.
+
+PVE remains the authoritative box registry. The local client must not require a
+database to rediscover boxes.
