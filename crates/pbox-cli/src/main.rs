@@ -17,8 +17,8 @@ use pbox_agent_client::{AgentClient, ExecInput, ExecResult, exec_event};
 use pbox_core::{
     Config, ConfigStore, LxcConfigUpdateRequest, LxcCreateRequest, LxcSnapshot, LxcSnapshotRequest,
     PboxId, PboxMetadata, PboxRecipeProvenance, PveApi, PveClient, PveClientConfig, PveError,
-    PveTaskResponse, encode_metadata, parse_duration, parse_metadata, preserve_metadata,
-    select_lxc_ipv4,
+    PveStorage, PveStorageContent, PveTaskResponse, encode_metadata, parse_duration,
+    parse_metadata, preserve_metadata, select_lxc_ipv4,
 };
 use pbox_crypto::{
     CertificateMaterial, CertificatePurpose, client_subject, derive_context_seed,
@@ -128,28 +128,31 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct NewCommand {
-    /// PVE node on which to create the container.
+    /// PVE node. Defaults to automatic selection from online nodes.
     #[arg(long)]
-    node: String,
-    /// PVE template volume, for example local:vztmpl/debian-13.tar.zst.
+    node: Option<String>,
+    /// Image name to find in the configured PVE template storage.
     #[arg(long)]
-    ostemplate: String,
-    /// Root filesystem volume, for example local-zfs:8.
+    image: Option<String>,
+    /// Raw PVE template volume override.
     #[arg(long)]
-    rootfs: String,
-    /// Container network configuration, for example name=eth0,bridge=vmbr0,ip=dhcp.
+    ostemplate: Option<String>,
+    /// Root filesystem volume override, for example local-zfs:8G.
     #[arg(long)]
-    net0: String,
+    rootfs: Option<String>,
+    /// Container network configuration override.
+    #[arg(long)]
+    net0: Option<String>,
     /// Container hostname. Defaults to a name derived from the public ID.
     #[arg(long)]
     name: Option<String>,
-    /// Memory limit in MiB.
+    /// Memory limit in MiB. Defaults to pve.defaults.memory.
     #[arg(long)]
     memory: Option<u64>,
-    /// Swap limit in MiB.
+    /// Swap limit in MiB. Defaults to pve.defaults.swap.
     #[arg(long)]
     swap: Option<u64>,
-    /// CPU core count.
+    /// CPU core count. Defaults to pve.defaults.cores.
     #[arg(long)]
     cores: Option<u64>,
     /// Leave the new container stopped after bootstrap.
@@ -2457,12 +2460,233 @@ fn terminate_secret_prompt_on_signal(
     }
     std::process::exit(exit_code);
 }
+#[derive(Debug, Clone)]
+struct ResolvedNew {
+    node: String,
+    ostemplate: String,
+    rootfs: String,
+    net0: String,
+    name: Option<String>,
+    memory: u64,
+    swap: u64,
+    cores: u64,
+    unprivileged: bool,
+    onboot: bool,
+    stopped: bool,
+}
+
+fn non_empty_new_value(label: &str, value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("{label} cannot be empty");
+    }
+    Ok(value.to_owned())
+}
+
+fn positive_new_value(label: &str, value: u64) -> Result<u64> {
+    if value == 0 {
+        bail!("{label} must be greater than zero");
+    }
+    Ok(value)
+}
+
+fn new_volume_override(label: &str, value: &str) -> Result<String> {
+    let value = non_empty_new_value(label, value)?;
+    let (storage, volume) = value
+        .split_once(':')
+        .ok_or_else(|| anyhow!("{label} must use STORAGE:VALUE syntax"))?;
+    if storage.is_empty() || volume.is_empty() {
+        bail!("{label} must use STORAGE:VALUE syntax");
+    }
+    Ok(value)
+}
+
+fn storage_supports(storage: &PveStorage, content: &str) -> bool {
+    storage.active == Some(1)
+        && storage.enabled == Some(1)
+        && storage.content.as_deref().is_some_and(|available| {
+            available
+                .split(',')
+                .any(|candidate| candidate.trim() == content)
+        })
+}
+
+fn select_pve_storage<'a>(
+    storages: &'a [PveStorage],
+    configured: &str,
+    content: &str,
+    role: &str,
+) -> Result<&'a str> {
+    if configured != "auto" {
+        let storage = storages
+            .iter()
+            .find(|storage| storage.storage == configured)
+            .ok_or_else(|| anyhow!("PVE storage '{configured}' was not found on this node"))?;
+        if !storage_supports(storage, content) {
+            bail!(
+                "PVE storage '{configured}' cannot store {role}; set the matching pve storage setting"
+            );
+        }
+        return Ok(&storage.storage);
+    }
+
+    let mut candidates: Vec<&PveStorage> = storages
+        .iter()
+        .filter(|storage| storage_supports(storage, content))
+        .collect();
+    candidates.sort_by(|left, right| left.storage.cmp(&right.storage));
+    candidates
+        .first()
+        .map(|storage| storage.storage.as_str())
+        .ok_or_else(|| anyhow!("no active PVE storage on this node supports {role}"))
+}
+
+fn template_matches(content: &PveStorageContent, image: &str) -> bool {
+    if content.content.as_deref() != Some("vztmpl") {
+        return false;
+    }
+    let Some(filename) = content.volid.rsplit('/').next() else {
+        return false;
+    };
+    let image = image.trim().to_ascii_lowercase();
+    if image.is_empty() {
+        return false;
+    }
+    let filename = filename.to_ascii_lowercase();
+    let stem = filename
+        .strip_suffix(".tar.zst")
+        .or_else(|| filename.strip_suffix(".tar"))
+        .unwrap_or(&filename);
+    let versionless = stem.split('_').next().unwrap_or(stem);
+    let canonical = versionless
+        .strip_suffix("-standard")
+        .or_else(|| versionless.strip_suffix("-default"))
+        .unwrap_or(versionless);
+    // Require a recognised PVE flavour. A bare filename such as
+    // `debian-13.tar.zst` must not impersonate the configured image alias.
+    canonical != versionless && (canonical == image || versionless == image)
+}
+
+fn resolve_new_node(client: &impl PveApi, config: &Config, command: &NewCommand) -> Result<String> {
+    let requested = command.node.as_deref().unwrap_or(config.pve.node.as_str());
+    if requested != "auto" {
+        return non_empty_new_value("PVE node", requested);
+    }
+
+    let mut nodes = client.list_nodes().context("discover PVE nodes")?;
+    nodes.retain(|node| node.status.as_deref() == Some("online"));
+    nodes.sort_by(|left, right| left.node.cmp(&right.node));
+    nodes
+        .first()
+        .map(|node| node.node.clone())
+        .ok_or_else(|| anyhow!("no online PVE node found; pass --node or set pve.node"))
+}
+
+fn resolve_new_command(
+    client: &impl PveApi,
+    config: &Config,
+    command: &NewCommand,
+) -> Result<ResolvedNew> {
+    let node = resolve_new_node(client, config, command)?;
+    let needs_storages = command.rootfs.is_none() || command.ostemplate.is_none();
+    let storages = if needs_storages {
+        Some(
+            client
+                .list_node_storages(&node)
+                .with_context(|| format!("discover PVE storage on node {node}"))?,
+        )
+    } else {
+        None
+    };
+
+    let rootfs = match command.rootfs.as_deref() {
+        Some(rootfs) => new_volume_override("--rootfs", rootfs)?,
+        None => {
+            let storages = storages
+                .as_deref()
+                .ok_or_else(|| anyhow!("internal error: rootfs storage discovery was skipped"))?;
+            let storage = select_pve_storage(storages, &config.pve.storage, "rootdir", "rootfs")?;
+            format!("{storage}:{}", config.pve.defaults.disk)
+        }
+    };
+
+    let ostemplate = match command.ostemplate.as_deref() {
+        Some(ostemplate) => new_volume_override("--ostemplate", ostemplate)?,
+        None => {
+            let image = non_empty_new_value(
+                "--image",
+                command
+                    .image
+                    .as_deref()
+                    .unwrap_or(config.images.default.as_str()),
+            )?;
+            let storages = storages
+                .as_deref()
+                .ok_or_else(|| anyhow!("internal error: template storage discovery was skipped"))?;
+            let storage = select_pve_storage(
+                storages,
+                &config.pve.template_storage,
+                "vztmpl",
+                "templates",
+            )?;
+            let contents = client
+                .list_storage_content(&node, storage, "vztmpl")
+                .with_context(|| format!("list PVE templates in storage {storage}"))?;
+            let matches: Vec<&PveStorageContent> = contents
+                .iter()
+                .filter(|content| template_matches(content, &image))
+                .collect();
+            match matches.as_slice() {
+                [] => bail!(
+                    "could not find image '{image}' in PVE storage '{storage}'; use --ostemplate or set images.default"
+                ),
+                [content] => content.volid.clone(),
+                _ => bail!(
+                    "image '{image}' matches multiple PVE templates in storage '{storage}'; use --ostemplate to select one"
+                ),
+            }
+        }
+    };
+
+    let net0 = match command.net0.as_deref() {
+        Some(net0) => non_empty_new_value("--net0", net0)?,
+        None => {
+            let bridge = non_empty_new_value("pve.bridge", &config.pve.bridge)?;
+            format!("name=eth0,bridge={bridge},ip=dhcp")
+        }
+    };
+    let name = command
+        .name
+        .as_deref()
+        .map(|name| non_empty_new_value("--name", name))
+        .transpose()?;
+
+    Ok(ResolvedNew {
+        node,
+        ostemplate,
+        rootfs,
+        net0,
+        name,
+        memory: positive_new_value(
+            "--memory",
+            command.memory.unwrap_or(config.pve.defaults.memory),
+        )?,
+        swap: command.swap.unwrap_or(config.pve.defaults.swap),
+        cores: positive_new_value(
+            "--cores",
+            command.cores.unwrap_or(config.pve.defaults.cores),
+        )?,
+        unprivileged: config.pve.defaults.unprivileged,
+        onboot: config.pve.defaults.onboot,
+        stopped: command.stopped,
+    })
+}
 const VMID_CREATE_ATTEMPTS: usize = 8;
 
 fn create_lxc_with_retry(
-    client: &PveClient,
+    client: &impl PveApi,
     config: &Config,
-    command: &NewCommand,
+    resolved: &ResolvedNew,
     id: &PboxId,
     hostname: &str,
     key: &BootstrapKey,
@@ -2479,25 +2703,26 @@ fn create_lxc_with_retry(
             .vmid_pattern
             .allocate_lowest(occupied.iter())
             .context("allocate a free PVE VMID")?;
-        let metadata = PboxMetadata::new(id.clone(), vmid).with_node(&command.node);
+        let metadata = PboxMetadata::new(id.clone(), vmid).with_node(&resolved.node);
         let description = format!(
             "Managed by `pbox`.\n{}",
             encode_metadata(&metadata).context("encode pbox metadata")?
         );
         let request = LxcCreateRequest {
-            ostemplate: Some(command.ostemplate.clone()),
+            ostemplate: Some(resolved.ostemplate.clone()),
             hostname: Some(hostname.to_owned()),
-            memory: command.memory,
-            swap: command.swap,
-            cores: command.cores,
-            rootfs: Some(command.rootfs.clone()),
-            net0: Some(command.net0.clone()),
-            unprivileged: Some(true),
+            memory: Some(resolved.memory),
+            swap: Some(resolved.swap),
+            cores: Some(resolved.cores),
+            rootfs: Some(resolved.rootfs.clone()),
+            net0: Some(resolved.net0.clone()),
+            unprivileged: Some(resolved.unprivileged),
+            onboot: Some(resolved.onboot),
             description: Some(description),
             ssh_public_keys: Some(key.public_key().to_owned()),
             start: Some(true),
         };
-        match client.create_lxc(&command.node, vmid, &request) {
+        match client.create_lxc(&resolved.node, vmid, &request) {
             Ok(task) => return Ok((vmid, task)),
             Err(error) if is_vmid_conflict(&error) && attempt + 1 < VMID_CREATE_ATTEMPTS => {
                 occupied.insert(vmid);
@@ -2508,7 +2733,7 @@ fn create_lxc_with_retry(
             }
             Err(error) => {
                 return Err(error).with_context(|| {
-                    format!("create box {id} with VMID {vmid} on {}", command.node)
+                    format!("create box {id} with VMID {vmid} on {}", resolved.node)
                 });
             }
         }
@@ -2536,6 +2761,7 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         ));
     }
     let client = client_from_config(&config)?;
+    let resolved = resolve_new_command(&client, &config, &command)?;
     let existing = discover_boxes(&client)?;
     let id = generate_unique_id(&existing)?;
     let id_text = id.to_string();
@@ -2543,7 +2769,7 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
     let key = BootstrapKey::generate(&id_text).context("create temporary bootstrap SSH key")?;
     let mut operation = BootstrapOperation::new(
         &id_text,
-        &command.node,
+        &resolved.node,
         config.agent.port,
         key.remote_stage(),
     );
@@ -2551,15 +2777,15 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         let _ = key.cleanup();
         return Err(error).context("persist bootstrap recovery operation");
     }
-    let hostname = command
+    let hostname = resolved
         .name
         .clone()
         .unwrap_or_else(|| format!("pbox-{}", id_text.trim_start_matches("pbx_")));
-    let (vmid, task) = match create_lxc_with_retry(&client, &config, &command, &id, &hostname, &key)
-    {
-        Ok(result) => result,
-        Err(error) => return Err(cleanup_uncreated_bootstrap(&key, error, &id_text)),
-    };
+    let (vmid, task) =
+        match create_lxc_with_retry(&client, &config, &resolved, &id, &hostname, &key) {
+            Ok(result) => result,
+            Err(error) => return Err(cleanup_uncreated_bootstrap(&key, error, &id_text)),
+        };
     operation.vmid = Some(vmid);
     operation.phase = "container-created".to_owned();
     save_bootstrap_operation(
@@ -2568,13 +2794,13 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         "record created container in bootstrap recovery operation",
         &id_text,
     )?;
-    if let Err(error) = wait_for_task(&client, &command.node, task) {
+    if let Err(error) = wait_for_task(&client, &resolved.node, task) {
         operation.phase = "container-create-task".to_owned();
         let _ = key.save_operation(&operation);
         return Err(error)
             .context(format!(
                 "PVE did not finish creating box {id} with VMID {vmid} on {}",
-                command.node
+                resolved.node
             ))
             .context(format_bootstrap_repair_path(&key, &id_text));
     }
@@ -2586,7 +2812,7 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         &id_text,
     )?;
 
-    let ip = match wait_for_lxc_ip(&client, &command.node, vmid) {
+    let ip = match wait_for_lxc_ip(&client, &resolved.node, vmid) {
         Ok(ip) => ip,
         Err(error) => {
             operation.phase = "ip-discovery".to_owned();
@@ -2644,11 +2870,11 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         )
     })?;
 
-    let (state, output_ip) = if command.stopped {
+    let (state, output_ip) = if resolved.stopped {
         let task = client
-            .shutdown_lxc(&command.node, vmid)
+            .shutdown_lxc(&resolved.node, vmid)
             .with_context(|| format!("stop bootstrapped box {id}"))?;
-        wait_for_task(&client, &command.node, task)
+        wait_for_task(&client, &resolved.node, task)
             .with_context(|| format!("PVE did not finish stopping box {id}"))?;
         ("stopped".to_owned(), None)
     } else {
@@ -2658,7 +2884,7 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         id,
         vmid,
         state,
-        node: command.node,
+        node: resolved.node,
         ip: output_ip,
         name: Some(hostname),
         recipes: Vec::new(),
@@ -3625,13 +3851,14 @@ fn color_enabled(color: ColorChoice, json: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANSI_CYAN, AnsibleRun, BoxRecord, Cli, Command, ForwardCommand, RecipeSnapshot,
-        SetupAnswers, SetupCommand, SetupOutput, SetupStyle, SshCommand, agent_identity_changes,
-        apply_setup_values, create_box_snapshot, create_recipe_snapshot, delete_box_snapshot,
-        delete_recipe_snapshot, exec_exit_code, finish_recipe_failure, finish_recipe_success,
-        format_snapshot_time, parse_env_entry, parse_recipe_sync_ttl, parse_remote_path,
-        parse_setup_bool, record_recipe_provenance, rollback_box_snapshot, safe_terminal_text,
-        setup_pve_error_message, ssh_command_argv, validate_forward_arguments,
+        ANSI_CYAN, AnsibleRun, BootstrapKey, BoxRecord, Cli, Command, ForwardCommand, NewCommand,
+        RecipeSnapshot, SetupAnswers, SetupCommand, SetupOutput, SetupStyle, SshCommand,
+        agent_identity_changes, apply_setup_values, create_box_snapshot, create_lxc_with_retry,
+        create_recipe_snapshot, delete_box_snapshot, delete_recipe_snapshot, exec_exit_code,
+        finish_recipe_failure, finish_recipe_success, format_snapshot_time, parse_env_entry,
+        parse_recipe_sync_ttl, parse_remote_path, parse_setup_bool, record_recipe_provenance,
+        resolve_new_command, rollback_box_snapshot, safe_terminal_text, setup_pve_error_message,
+        ssh_command_argv, template_matches, validate_forward_arguments,
         validate_snapshot_arguments, validate_ssh_arguments, write_download,
     };
     use anyhow::anyhow;
@@ -3639,9 +3866,10 @@ mod tests {
     use pbox_agent_client::ExecResult;
     use pbox_core::ui::ColorMode;
     use pbox_core::{
-        Config, LxcConfig, LxcConfigUpdateRequest, LxcCreateRequest, LxcInterface, LxcSnapshot,
-        LxcSnapshotRequest, PboxId, PboxMetadata, PveApi, PveError, PveTaskResponse, PveTaskStatus,
-        encode_metadata, parse_metadata,
+        ClusterResource, Config, LxcConfig, LxcConfigUpdateRequest, LxcCreateRequest, LxcInterface,
+        LxcSnapshot, LxcSnapshotRequest, PboxId, PboxMetadata, PveApi, PveError, PveNode,
+        PveStorage, PveStorageContent, PveTaskResponse, PveTaskStatus, encode_metadata,
+        parse_metadata,
     };
     use std::cell::RefCell;
     use std::fs;
@@ -3650,12 +3878,17 @@ mod tests {
     struct FakePve {
         config: RefCell<LxcConfig>,
         snapshots: RefCell<Vec<LxcSnapshot>>,
+        nodes: RefCell<Vec<PveNode>>,
+        storages: RefCell<Vec<PveStorage>>,
+        storage_content: RefCell<Vec<PveStorageContent>>,
+        resources: RefCell<Vec<ClusterResource>>,
+        created: RefCell<Vec<(String, u64, LxcCreateRequest)>>,
+        create_conflicts: RefCell<usize>,
         events: RefCell<Vec<String>>,
         fail_next_task: RefCell<bool>,
         fail_create: RefCell<bool>,
         fail_updates: RefCell<bool>,
     }
-
     impl FakePve {
         fn new(metadata: &PboxMetadata, note: &str) -> Self {
             Self {
@@ -3672,6 +3905,28 @@ mod tests {
                     extra: serde_json::Map::new(),
                 }),
                 snapshots: RefCell::new(Vec::new()),
+                nodes: RefCell::new(vec![PveNode {
+                    node: "pve01".to_owned(),
+                    status: Some("online".to_owned()),
+                    extra: serde_json::Map::new(),
+                }]),
+                storages: RefCell::new(vec![PveStorage {
+                    storage: "local".to_owned(),
+                    content: Some("vztmpl,rootdir".to_owned()),
+                    active: Some(1),
+                    enabled: Some(1),
+                    extra: serde_json::Map::new(),
+                }]),
+                storage_content: RefCell::new(vec![PveStorageContent {
+                    volid: "local:vztmpl/debian-13-standard_13.0-1_amd64.tar.zst".to_owned(),
+                    content: Some("vztmpl".to_owned()),
+                    format: Some("tar.zst".to_owned()),
+                    is_base: Some(1),
+                    extra: serde_json::Map::new(),
+                }]),
+                resources: RefCell::new(Vec::new()),
+                created: RefCell::new(Vec::new()),
+                create_conflicts: RefCell::new(0),
                 events: RefCell::new(Vec::new()),
                 fail_create: RefCell::new(false),
                 fail_next_task: RefCell::new(false),
@@ -3705,15 +3960,15 @@ mod tests {
     }
 
     impl PveApi for FakePve {
-        fn list_cluster_resources(&self) -> Result<Vec<pbox_core::ClusterResource>, PveError> {
-            Err(Self::unsupported())
+        fn list_cluster_resources(&self) -> Result<Vec<ClusterResource>, PveError> {
+            Ok(self.resources.borrow().clone())
         }
         fn list_nodes(&self) -> Result<Vec<pbox_core::PveNode>, PveError> {
-            Err(Self::unsupported())
+            Ok(self.nodes.borrow().clone())
         }
 
         fn list_node_storages(&self, _node: &str) -> Result<Vec<pbox_core::PveStorage>, PveError> {
-            Err(Self::unsupported())
+            Ok(self.storages.borrow().clone())
         }
 
         fn list_storage_content(
@@ -3722,7 +3977,7 @@ mod tests {
             _storage: &str,
             _content: &str,
         ) -> Result<Vec<pbox_core::PveStorageContent>, PveError> {
-            Err(Self::unsupported())
+            Ok(self.storage_content.borrow().clone())
         }
 
         fn get_lxc_config(&self, _node: &str, _vmid: u64) -> Result<LxcConfig, PveError> {
@@ -3765,11 +4020,22 @@ mod tests {
 
         fn create_lxc(
             &self,
-            _node: &str,
-            _vmid: u64,
-            _request: &LxcCreateRequest,
+            node: &str,
+            vmid: u64,
+            request: &LxcCreateRequest,
         ) -> Result<PveTaskResponse, PveError> {
-            Err(Self::unsupported())
+            self.created
+                .borrow_mut()
+                .push((node.to_owned(), vmid, request.clone()));
+            let mut conflicts = self.create_conflicts.borrow_mut();
+            if *conflicts > 0 {
+                *conflicts -= 1;
+                return Err(PveError::Http {
+                    status: "409".parse().unwrap(),
+                    message: "VMID already exists".to_owned(),
+                });
+            }
+            Ok(Self::task("create"))
         }
 
         fn update_lxc_config(
@@ -3870,6 +4136,278 @@ mod tests {
 
     fn test_metadata(record: &BoxRecord) -> PboxMetadata {
         PboxMetadata::new(record.id.clone(), record.vmid).with_node(record.node.clone())
+    }
+    fn test_cluster_resource(vmid: u64) -> ClusterResource {
+        ClusterResource {
+            resource_type: "lxc".to_owned(),
+            vmid: Some(vmid),
+            node: Some("pve01".to_owned()),
+            status: Some("stopped".to_owned()),
+            name: Some(format!("pbox-{vmid}")),
+            tags: None,
+            uptime: None,
+            mem: None,
+            maxmem: None,
+            disk: None,
+            maxdisk: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn test_resolved_new() -> super::ResolvedNew {
+        super::ResolvedNew {
+            node: "pve01".to_owned(),
+            ostemplate: "local:vztmpl/debian-13-standard_13.0-1_amd64.tar.zst".to_owned(),
+            rootfs: "local:8G".to_owned(),
+            net0: "name=eth0,bridge=vmbr0,ip=dhcp".to_owned(),
+            name: Some("pbox-test".to_owned()),
+            memory: 2048,
+            swap: 128,
+            cores: 4,
+            unprivileged: true,
+            onboot: true,
+            stopped: false,
+        }
+    }
+
+    #[test]
+    fn new_command_accepts_zero_arguments() {
+        let cli = Cli::try_parse_from(["pbox", "new"]).unwrap();
+        let Command::New(command) = cli.command else {
+            panic!("expected new command");
+        };
+        assert!(command.node.is_none());
+        assert!(command.image.is_none());
+        assert!(command.ostemplate.is_none());
+        assert!(command.rootfs.is_none());
+        assert!(command.net0.is_none());
+    }
+
+    #[test]
+    fn new_resolution_uses_cluster_and_config_defaults() {
+        let metadata = PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007);
+        let fake = FakePve::new(&metadata, "user note");
+        let resolved = resolve_new_command(
+            &fake,
+            &Config::default(),
+            &NewCommand {
+                node: None,
+                image: None,
+                ostemplate: None,
+                rootfs: None,
+                net0: None,
+                name: None,
+                memory: None,
+                swap: None,
+                cores: None,
+                stopped: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved.node, "pve01");
+        assert_eq!(
+            resolved.ostemplate,
+            "local:vztmpl/debian-13-standard_13.0-1_amd64.tar.zst"
+        );
+        assert_eq!(resolved.rootfs, "local:8G");
+        assert_eq!(resolved.net0, "name=eth0,bridge=vmbr0,ip=dhcp");
+        assert_eq!(resolved.memory, 1024);
+        assert_eq!(resolved.swap, 256);
+        assert_eq!(resolved.cores, 2);
+        assert!(resolved.unprivileged);
+    }
+    #[test]
+    fn template_matching_requires_an_exact_pve_image_alias() {
+        let metadata = PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007);
+        let fake = FakePve::new(&metadata, "user note");
+        let content = fake.storage_content.borrow()[0].clone();
+
+        assert!(template_matches(&content, "debian-13"));
+
+        let mut untyped = content.clone();
+        untyped.content = None;
+        assert!(!template_matches(&untyped, "debian-13"));
+
+        let mut unrelated = content;
+        unrelated.volid = "local:vztmpl/debian-13-backdoor_1.0_amd64.tar.zst".to_owned();
+        assert!(!template_matches(&unrelated, "debian-13"));
+        let mut bare = unrelated.clone();
+        bare.volid = "local:vztmpl/debian-13.tar.zst".to_owned();
+        assert!(!template_matches(&bare, "debian-13"));
+    }
+
+    #[test]
+    fn new_resolution_preserves_explicit_overrides() {
+        let metadata = PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007);
+        let fake = FakePve::new(&metadata, "user note");
+
+        let resolved = resolve_new_command(
+            &fake,
+            &Config::default(),
+            &NewCommand {
+                node: Some("pve01".to_owned()),
+                image: None,
+                ostemplate: Some("local:vztmpl/custom.tar.zst".to_owned()),
+                rootfs: Some("local-zfs:16G".to_owned()),
+                net0: Some("name=eth0,bridge=vmbr9".to_owned()),
+                name: Some("custom-name".to_owned()),
+                memory: Some(2048),
+                swap: Some(0),
+                cores: Some(4),
+                stopped: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved.node, "pve01");
+        assert_eq!(resolved.ostemplate, "local:vztmpl/custom.tar.zst");
+        assert_eq!(resolved.rootfs, "local-zfs:16G");
+        assert_eq!(resolved.net0, "name=eth0,bridge=vmbr9");
+        assert_eq!(resolved.name.as_deref(), Some("custom-name"));
+        assert_eq!(resolved.memory, 2048);
+        assert_eq!(resolved.swap, 0);
+        assert_eq!(resolved.cores, 4);
+        assert!(resolved.stopped);
+    }
+    #[test]
+    fn new_resolution_rejects_ambiguous_image_alias() {
+        let metadata = PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007);
+        let fake = FakePve::new(&metadata, "user note");
+        let mut second = fake.storage_content.borrow()[0].clone();
+        second.volid = "local:vztmpl/debian-13-standard_13.0-2_amd64.tar.zst".to_owned();
+        fake.storage_content.borrow_mut().push(second);
+
+        let error = resolve_new_command(
+            &fake,
+            &Config::default(),
+            &NewCommand {
+                node: None,
+                image: None,
+                ostemplate: None,
+                rootfs: None,
+                net0: None,
+                name: None,
+                memory: None,
+                swap: None,
+                cores: None,
+                stopped: false,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("matches multiple PVE templates"));
+    }
+
+    #[test]
+    fn new_resolution_rejects_zero_memory() {
+        let metadata = PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007);
+        let fake = FakePve::new(&metadata, "user note");
+        let error = resolve_new_command(
+            &fake,
+            &Config::default(),
+            &NewCommand {
+                node: None,
+                image: None,
+                ostemplate: None,
+                rootfs: None,
+                net0: None,
+                name: None,
+                memory: Some(0),
+                swap: None,
+                cores: None,
+                stopped: false,
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("--memory must be greater than zero")
+        );
+    }
+    #[test]
+    fn create_lxc_allocates_gap_and_propagates_resolved_values() {
+        let fake = FakePve::new(
+            &PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007),
+            "user note",
+        );
+        *fake.resources.borrow_mut() = vec![
+            test_cluster_resource(9000),
+            test_cluster_resource(9001),
+            test_cluster_resource(9003),
+        ];
+        let key = BootstrapKey::generate("pbx_create_success").unwrap();
+        let id = PboxId::parse("pbx_t3yzd9y3").unwrap();
+        let resolved = test_resolved_new();
+
+        let (vmid, task) =
+            create_lxc_with_retry(&fake, &Config::default(), &resolved, &id, "pbox-test", &key)
+                .unwrap();
+
+        assert_eq!(vmid, 9002);
+        assert_eq!(task.upid, "create");
+        {
+            let created = fake.created.borrow();
+            assert_eq!(created.len(), 1);
+            let (node, created_vmid, request) = &created[0];
+            assert_eq!(node, "pve01");
+            assert_eq!(*created_vmid, 9002);
+            assert_eq!(
+                request.ostemplate.as_deref(),
+                Some(resolved.ostemplate.as_str())
+            );
+            assert_eq!(request.rootfs.as_deref(), Some(resolved.rootfs.as_str()));
+            assert_eq!(request.net0.as_deref(), Some(resolved.net0.as_str()));
+            assert_eq!(request.memory, Some(2048));
+            assert_eq!(request.swap, Some(128));
+            assert_eq!(request.cores, Some(4));
+            assert_eq!(request.unprivileged, Some(true));
+            assert_eq!(request.onboot, Some(true));
+            assert_eq!(request.start, Some(true));
+            let metadata = parse_metadata(request.description.as_deref().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(metadata.id, id);
+            assert_eq!(metadata.vmid, 9002);
+            assert_eq!(metadata.node.as_deref(), Some("pve01"));
+        }
+        key.cleanup().unwrap();
+    }
+
+    #[test]
+    fn create_lxc_retries_after_a_vmid_conflict() {
+        let fake = FakePve::new(
+            &PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007),
+            "user note",
+        );
+        *fake.resources.borrow_mut() = vec![
+            test_cluster_resource(9000),
+            test_cluster_resource(9001),
+            test_cluster_resource(9003),
+        ];
+        *fake.create_conflicts.borrow_mut() = 1;
+        let key = BootstrapKey::generate("pbx_create_conflict").unwrap();
+        let id = PboxId::parse("pbx_t3yzd9y3").unwrap();
+
+        let (vmid, _) = create_lxc_with_retry(
+            &fake,
+            &Config::default(),
+            &test_resolved_new(),
+            &id,
+            "pbox-test",
+            &key,
+        )
+        .unwrap();
+
+        assert_eq!(vmid, 9004);
+        let created = fake.created.borrow();
+        assert_eq!(
+            created.iter().map(|entry| entry.1).collect::<Vec<_>>(),
+            [9002, 9004]
+        );
+        key.cleanup().unwrap();
     }
 
     #[test]
