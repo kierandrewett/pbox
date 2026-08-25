@@ -15,6 +15,7 @@ pub trait PveApi {
     fn list_cluster_resources(&self) -> Result<Vec<ClusterResource>, PveError>;
     fn get_lxc_config(&self, node: &str, vmid: u64) -> Result<LxcConfig, PveError>;
     fn list_lxc_interfaces(&self, node: &str, vmid: u64) -> Result<Vec<LxcInterface>, PveError>;
+    fn list_lxc_snapshots(&self, node: &str, vmid: u64) -> Result<Vec<LxcSnapshot>, PveError>;
     fn get_task_status(&self, node: &str, upid: &str) -> Result<PveTaskStatus, PveError>;
     fn create_lxc(
         &self,
@@ -186,6 +187,11 @@ impl PveApi for PveClient {
         self.get(&format!("/nodes/{node}/lxc/{vmid}/interfaces"))
     }
 
+    fn list_lxc_snapshots(&self, node: &str, vmid: u64) -> Result<Vec<LxcSnapshot>, PveError> {
+        validate_path_segment(node, "node")?;
+        self.get(&format!("/nodes/{node}/lxc/{vmid}/snapshot"))
+    }
+
     fn get_task_status(&self, node: &str, upid: &str) -> Result<PveTaskStatus, PveError> {
         validate_path_segment(node, "node")?;
         validate_path_segment(upid, "UPID")?;
@@ -336,7 +342,8 @@ fn validate_path_segment(value: &str, field: &str) -> Result<(), PveError> {
 }
 
 fn validate_snapshot_name(value: &str) -> Result<(), PveError> {
-    let valid = !value.is_empty()
+    let valid = value.len() >= 2
+        && !value.is_empty()
         && value.len() <= 40
         && value != "current"
         && value != "vzdump"
@@ -449,6 +456,22 @@ pub struct LxcSnapshotRequest {
     pub snapname: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+/// Snapshot data returned by the PVE LXC snapshot endpoint.
+///
+/// PVE includes a synthetic `current` entry and may add fields such as
+/// `digest`, `running`, or `snapstate`. Keep those fields in `extra` so the
+/// client remains compatible with PVE response additions.
+/// Source: https://github.com/proxmox/pve-container/blob/master/src/PVE/API2/LXC/Snapshot.pm
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LxcSnapshot {
+    pub name: String,
+    pub description: Option<String>,
+    pub snaptime: Option<u64>,
+    pub parent: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -666,6 +689,30 @@ mod tests {
     }
 
     #[test]
+    fn lxc_snapshots_decode_current_and_stored_entries() {
+        let snapshots: Vec<LxcSnapshot> = serde_json::from_str(
+            r#"[{"name":"before_recipe","description":"Before recipe","snaptime":1724520000,"parent":"base","snapstate":"prepare"},{"name":"current","description":"You are here!","running":1,"digest":"deadbeef"}]"#,
+        )
+        .unwrap();
+        assert_eq!(snapshots[0].name, "before_recipe");
+        assert_eq!(snapshots[0].snaptime, Some(1_724_520_000));
+        assert_eq!(snapshots[0].parent.as_deref(), Some("base"));
+        assert_eq!(snapshots[0].extra["snapstate"], "prepare");
+        assert_eq!(snapshots[1].name, "current");
+        assert_eq!(snapshots[1].snaptime, None);
+        assert_eq!(snapshots[1].extra["running"], 1);
+    }
+
+    #[test]
+    fn lxc_snapshot_response_preserves_optional_fields() {
+        let snapshot: LxcSnapshot =
+            serde_json::from_str(r#"{"name":"checkpoint","description":""}"#).unwrap();
+        assert_eq!(snapshot.description.as_deref(), Some(""));
+        assert_eq!(snapshot.snaptime, None);
+        assert_eq!(snapshot.parent, None);
+    }
+
+    #[test]
     fn task_status_maps_type_and_success() {
         let status: PveTaskStatus =
             serde_json::from_str(r#"{"status":"stopped","exitstatus":"OK","type":"vzcreate"}"#)
@@ -742,6 +789,7 @@ mod tests {
         assert!(validate_snapshot_name("A1-test").is_ok());
         for invalid in [
             "",
+            "a",
             "1-before",
             "before recipe",
             "before.recipe",

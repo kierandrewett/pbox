@@ -13,8 +13,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use nix::sys::termios::{LocalFlags, SetArg, cfmakeraw, tcgetattr, tcsetattr};
 use pbox_agent_client::{AgentClient, ExecInput, ExecResult, exec_event};
 use pbox_core::{
-    Config, ConfigStore, LxcConfigUpdateRequest, LxcCreateRequest, LxcSnapshotRequest, PboxId,
-    PboxMetadata, PboxRecipeProvenance, PveApi, PveClient, PveClientConfig, PveError,
+    Config, ConfigStore, LxcConfigUpdateRequest, LxcCreateRequest, LxcSnapshot, LxcSnapshotRequest,
+    PboxId, PboxMetadata, PboxRecipeProvenance, PveApi, PveClient, PveClientConfig, PveError,
     PveTaskResponse, encode_metadata, parse_duration, parse_metadata, preserve_metadata,
     select_lxc_ipv4,
 };
@@ -91,6 +91,8 @@ enum Command {
     Forward(ForwardCommand),
     /// Discover and apply Ansible recipes.
     Recipe(RecipeCommand),
+    /// Manage PVE snapshots for a pbox.
+    Snapshot(SnapshotCommand),
     /// List pbox-managed containers discovered from PVE metadata.
     List,
     /// Show one pbox discovered from PVE metadata.
@@ -241,6 +243,51 @@ enum RecipeSubcommand {
 }
 
 #[derive(Debug, Args)]
+struct SnapshotCommand {
+    #[command(subcommand)]
+    command: SnapshotSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SnapshotSubcommand {
+    /// List snapshots, including PVE's synthetic current entry.
+    List { id: String },
+    /// Create a snapshot of a pbox.
+    Create {
+        /// Public pbox identifier.
+        id: String,
+        /// Snapshot name.
+        name: String,
+        /// Optional snapshot description.
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Roll back a pbox to a snapshot.
+    Rollback {
+        /// Public pbox identifier.
+        id: String,
+        /// Snapshot name.
+        name: String,
+        /// Start the container after a successful rollback.
+        #[arg(long)]
+        start: bool,
+        /// Confirm the destructive operation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Delete a snapshot from a pbox.
+    Delete {
+        /// Public pbox identifier.
+        id: String,
+        /// Snapshot name.
+        name: String,
+        /// Confirm the destructive operation.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Args)]
 struct ConfigCommand {
     #[command(subcommand)]
     command: ConfigSubcommand,
@@ -311,6 +358,15 @@ struct ForwardOutput {
     remote: String,
 }
 
+#[derive(Debug, Serialize)]
+struct SnapshotActionOutput {
+    id: PboxId,
+    name: String,
+    action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started: Option<bool>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum RunOutcome {
     Success,
@@ -322,7 +378,8 @@ fn main() {
         Ok(RunOutcome::Success) => {}
         Ok(RunOutcome::Exit(code)) => std::process::exit(code),
         Err(error) => {
-            eprintln!("error: {error:#}");
+            let message = safe_terminal_text(&format!("{error:#}"));
+            eprintln!("error: {message}");
             std::process::exit(1);
         }
     }
@@ -362,6 +419,9 @@ fn run() -> Result<RunOutcome> {
         }
         Command::Recipe(command) => {
             run_recipe(command.command, &store, cli.json, cli.color).map(|_| RunOutcome::Success)
+        }
+        Command::Snapshot(command) => {
+            run_snapshot(command.command, &store, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
         Command::List => run_list(&store, cli.json, cli.color).map(|_| RunOutcome::Success),
         Command::Info { id } => {
@@ -2320,6 +2380,246 @@ fn run_delete(
     Ok(())
 }
 
+fn run_snapshot(
+    command: SnapshotSubcommand,
+    store: &ConfigStore,
+    json: bool,
+    color: ColorChoice,
+) -> Result<()> {
+    match command {
+        SnapshotSubcommand::List { id } => run_snapshot_list(store, &id, json, color),
+        SnapshotSubcommand::Create {
+            id,
+            name,
+            description,
+        } => run_snapshot_create(store, &id, &name, description.as_deref(), json, color),
+        SnapshotSubcommand::Rollback {
+            id,
+            name,
+            start,
+            yes,
+        } => run_snapshot_rollback(store, &id, &name, start, yes, json, color),
+        SnapshotSubcommand::Delete { id, name, yes } => {
+            run_snapshot_delete(store, &id, &name, yes, json, color)
+        }
+    }
+}
+
+fn run_snapshot_list(
+    store: &ConfigStore,
+    requested_id: &str,
+    json: bool,
+    color: ColorChoice,
+) -> Result<()> {
+    let client = client_from_store(store)?;
+    let record = find_box(&client, requested_id)?;
+    let snapshots = client
+        .list_lxc_snapshots(&record.node, record.vmid)
+        .with_context(|| format!("list snapshots for box {}", record.id))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&snapshots)?);
+    } else {
+        print_snapshot_list(&snapshots, color_enabled(color, json));
+    }
+    Ok(())
+}
+
+fn run_snapshot_create(
+    store: &ConfigStore,
+    requested_id: &str,
+    name: &str,
+    description: Option<&str>,
+    json: bool,
+    color: ColorChoice,
+) -> Result<()> {
+    validate_snapshot_arguments(name, description)?;
+    let client = client_from_store(store)?;
+    let record = find_box(&client, requested_id)?;
+    create_box_snapshot(&client, &record, name, description)?;
+    print_snapshot_action(
+        &SnapshotActionOutput {
+            id: record.id,
+            name: name.to_owned(),
+            action: "created".to_owned(),
+            started: None,
+        },
+        json,
+        color,
+    )
+}
+
+fn run_snapshot_rollback(
+    store: &ConfigStore,
+    requested_id: &str,
+    name: &str,
+    start: bool,
+    confirmed: bool,
+    json: bool,
+    color: ColorChoice,
+) -> Result<()> {
+    if !confirmed {
+        return Err(anyhow!(
+            "rolling back a snapshot changes guest state; repeat the command with --yes"
+        ));
+    }
+    validate_snapshot_arguments(name, None)?;
+    let client = client_from_store(store)?;
+    let record = find_box(&client, requested_id)?;
+    rollback_box_snapshot(&client, &record, name, start)?;
+    print_snapshot_action(
+        &SnapshotActionOutput {
+            id: record.id,
+            name: name.to_owned(),
+            action: "rolled back".to_owned(),
+            started: Some(start),
+        },
+        json,
+        color,
+    )
+}
+
+fn run_snapshot_delete(
+    store: &ConfigStore,
+    requested_id: &str,
+    name: &str,
+    confirmed: bool,
+    json: bool,
+    color: ColorChoice,
+) -> Result<()> {
+    if !confirmed {
+        return Err(anyhow!(
+            "deleting a snapshot is permanent; repeat the command with --yes"
+        ));
+    }
+    validate_snapshot_arguments(name, None)?;
+    let client = client_from_store(store)?;
+    let record = find_box(&client, requested_id)?;
+    delete_box_snapshot(&client, &record, name)?;
+    print_snapshot_action(
+        &SnapshotActionOutput {
+            id: record.id,
+            name: name.to_owned(),
+            action: "deleted".to_owned(),
+            started: None,
+        },
+        json,
+        color,
+    )
+}
+
+fn validate_snapshot_arguments(name: &str, description: Option<&str>) -> Result<()> {
+    if name.contains('\0') {
+        bail!("snapshot name cannot contain NUL bytes");
+    }
+    if description.is_some_and(|value| value.contains('\0')) {
+        bail!("snapshot description cannot contain NUL bytes");
+    }
+    Ok(())
+}
+
+fn create_box_snapshot(
+    client: &impl PveApi,
+    record: &BoxRecord,
+    name: &str,
+    description: Option<&str>,
+) -> Result<()> {
+    let request = LxcSnapshotRequest {
+        snapname: name.to_owned(),
+        description: description.map(str::to_owned),
+    };
+    let task = client
+        .create_lxc_snapshot(&record.node, record.vmid, &request)
+        .with_context(|| format!("create snapshot {name} for box {}", record.id))?;
+    wait_for_task(client, &record.node, task)
+        .with_context(|| format!("PVE did not finish creating snapshot {name}"))?;
+    Ok(())
+}
+
+fn rollback_box_snapshot(
+    client: &impl PveApi,
+    record: &BoxRecord,
+    name: &str,
+    start: bool,
+) -> Result<()> {
+    let task = client
+        .rollback_lxc_snapshot(&record.node, record.vmid, name, start)
+        .with_context(|| format!("roll back box {} to snapshot {name}", record.id))?;
+    wait_for_task(client, &record.node, task)
+        .with_context(|| format!("PVE did not finish rolling back snapshot {name}"))?;
+    Ok(())
+}
+
+fn delete_box_snapshot(client: &impl PveApi, record: &BoxRecord, name: &str) -> Result<()> {
+    let task = client
+        .delete_lxc_snapshot(&record.node, record.vmid, name)
+        .with_context(|| format!("delete snapshot {name} from box {}", record.id))?;
+    wait_for_task(client, &record.node, task)
+        .with_context(|| format!("PVE did not finish deleting snapshot {name}"))?;
+    Ok(())
+}
+
+fn print_snapshot_action(
+    output: &SnapshotActionOutput,
+    json: bool,
+    color: ColorChoice,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(output)?);
+        return Ok(());
+    }
+    let colour = color_enabled(color, json);
+    let action = safe_terminal_text(&output.action);
+    let name = safe_terminal_text(&output.name);
+    let id = safe_terminal_text(&output.id.to_string());
+    if colour {
+        println!("\x1b[1;32m{action}\x1b[0m snapshot {name} on {id}");
+    } else {
+        println!("{action} snapshot {name} on {id}");
+    }
+    if output.started == Some(true) {
+        println!("started {}", id);
+    }
+    Ok(())
+}
+
+fn print_snapshot_list(snapshots: &[LxcSnapshot], colour: bool) {
+    println!(
+        "{:<24} {:<24} {:<20} DESCRIPTION",
+        "NAME", "CREATED", "PARENT"
+    );
+    for snapshot in snapshots {
+        let name = safe_terminal_text(&snapshot.name);
+        let name = format!("{name:<24}");
+        let name = if colour {
+            format!("\x1b[1;36m{name}\x1b[0m")
+        } else {
+            name
+        };
+        println!(
+            "{name} {:<24} {:<20} {}",
+            format_snapshot_time(snapshot.snaptime),
+            safe_terminal_text(snapshot.parent.as_deref().unwrap_or("-")),
+            safe_terminal_text(snapshot.description.as_deref().unwrap_or("-")),
+        );
+    }
+    if snapshots.is_empty() {
+        println!("No snapshots found.");
+    }
+}
+
+fn format_snapshot_time(timestamp: Option<u64>) -> String {
+    let Some(timestamp) = timestamp else {
+        return "-".to_owned();
+    };
+    let Ok(timestamp) = i64::try_from(timestamp) else {
+        return timestamp.to_string();
+    };
+    OffsetDateTime::from_unix_timestamp(timestamp)
+        .ok()
+        .and_then(|time| time.format(&Rfc3339).ok())
+        .unwrap_or_else(|| timestamp.to_string())
+}
+
 fn generate_unique_id(existing: &[BoxRecord]) -> Result<PboxId> {
     for _ in 0..16 {
         let id = PboxId::generate();
@@ -2713,16 +3013,18 @@ fn color_enabled(color: ColorChoice, json: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnsibleRun, BoxRecord, ForwardCommand, RecipeSnapshot, SshCommand, create_recipe_snapshot,
-        delete_recipe_snapshot, exec_exit_code, finish_recipe_failure, finish_recipe_success,
-        parse_env_entry, parse_recipe_sync_ttl, parse_remote_path, record_recipe_provenance,
-        ssh_command_argv, validate_forward_arguments, validate_ssh_arguments, write_download,
+        AnsibleRun, BoxRecord, ForwardCommand, RecipeSnapshot, SshCommand, create_box_snapshot,
+        create_recipe_snapshot, delete_box_snapshot, delete_recipe_snapshot, exec_exit_code,
+        finish_recipe_failure, finish_recipe_success, format_snapshot_time, parse_env_entry,
+        parse_recipe_sync_ttl, parse_remote_path, record_recipe_provenance, rollback_box_snapshot,
+        safe_terminal_text, ssh_command_argv, validate_forward_arguments,
+        validate_snapshot_arguments, validate_ssh_arguments, write_download,
     };
     use anyhow::anyhow;
     use pbox_agent_client::ExecResult;
     use pbox_core::ui::ColorMode;
     use pbox_core::{
-        Config, LxcConfig, LxcConfigUpdateRequest, LxcCreateRequest, LxcInterface,
+        Config, LxcConfig, LxcConfigUpdateRequest, LxcCreateRequest, LxcInterface, LxcSnapshot,
         LxcSnapshotRequest, PboxId, PboxMetadata, PveApi, PveError, PveTaskResponse, PveTaskStatus,
         encode_metadata, parse_metadata,
     };
@@ -2732,6 +3034,7 @@ mod tests {
 
     struct FakePve {
         config: RefCell<LxcConfig>,
+        snapshots: RefCell<Vec<LxcSnapshot>>,
         events: RefCell<Vec<String>>,
         fail_next_task: RefCell<bool>,
         fail_create: RefCell<bool>,
@@ -2753,6 +3056,7 @@ mod tests {
                     net0: None,
                     extra: serde_json::Map::new(),
                 }),
+                snapshots: RefCell::new(Vec::new()),
                 events: RefCell::new(Vec::new()),
                 fail_create: RefCell::new(false),
                 fail_next_task: RefCell::new(false),
@@ -2800,6 +3104,14 @@ mod tests {
             _vmid: u64,
         ) -> Result<Vec<LxcInterface>, PveError> {
             Err(Self::unsupported())
+        }
+
+        fn list_lxc_snapshots(
+            &self,
+            _node: &str,
+            _vmid: u64,
+        ) -> Result<Vec<LxcSnapshot>, PveError> {
+            Ok(self.snapshots.borrow().clone())
         }
 
         fn get_task_status(&self, _node: &str, upid: &str) -> Result<PveTaskStatus, PveError> {
@@ -2875,6 +3187,13 @@ mod tests {
             if *self.fail_create.borrow() {
                 return Err(Self::unsupported());
             }
+            self.snapshots.borrow_mut().push(LxcSnapshot {
+                name: request.snapname.clone(),
+                description: request.description.clone(),
+                snaptime: Some(1_724_520_000),
+                parent: None,
+                extra: serde_json::Map::new(),
+            });
             Ok(Self::task("snapshot-create"))
         }
 
@@ -2898,6 +3217,9 @@ mod tests {
             snapname: &str,
         ) -> Result<PveTaskResponse, PveError> {
             self.events.borrow_mut().push(format!("delete:{snapname}"));
+            self.snapshots
+                .borrow_mut()
+                .retain(|snapshot| snapshot.name != snapname);
             Ok(Self::task("snapshot-delete"))
         }
     }
@@ -2917,6 +3239,62 @@ mod tests {
 
     fn test_metadata(record: &BoxRecord) -> PboxMetadata {
         PboxMetadata::new(record.id.clone(), record.vmid).with_node(record.node.clone())
+    }
+
+    #[test]
+    fn snapshot_lifecycle_uses_pve_tasks_and_authoritative_state() {
+        let record = test_record();
+        let metadata = test_metadata(&record);
+        let fake = FakePve::new(&metadata, "user note");
+
+        create_box_snapshot(&fake, &record, "checkpoint", Some("before change")).unwrap();
+        let snapshots = fake.list_lxc_snapshots(&record.node, record.vmid).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].name, "checkpoint");
+        assert_eq!(snapshots[0].description.as_deref(), Some("before change"));
+
+        rollback_box_snapshot(&fake, &record, "checkpoint", true).unwrap();
+        delete_box_snapshot(&fake, &record, "checkpoint").unwrap();
+        assert!(
+            fake.list_lxc_snapshots(&record.node, record.vmid)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            &*fake.events.borrow(),
+            &[
+                "create:checkpoint".to_owned(),
+                "wait:snapshot-create".to_owned(),
+                "rollback:checkpoint:true".to_owned(),
+                "wait:snapshot-rollback".to_owned(),
+                "delete:checkpoint".to_owned(),
+                "wait:snapshot-delete".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_inputs_reject_nul_without_contacting_pve() {
+        assert!(validate_snapshot_arguments("checkpoint\0", None).is_err());
+        assert!(validate_snapshot_arguments("checkpoint", Some("bad\0description")).is_err());
+        assert!(validate_snapshot_arguments("checkpoint", Some("safe description")).is_ok());
+    }
+
+    #[test]
+    fn terminal_text_replaces_control_sequences() {
+        assert_eq!(
+            safe_terminal_text("pve error\u{1b}[31m\nnext"),
+            "pve error [31m next"
+        );
+    }
+
+    #[test]
+    fn snapshot_times_format_as_rfc3339_or_dash() {
+        assert_eq!(format_snapshot_time(None), "-");
+        assert_eq!(
+            format_snapshot_time(Some(1_724_520_000)),
+            "2024-08-24T17:20:00Z"
+        );
     }
     #[test]
     fn provenance_failure_preserves_snapshot_for_manual_recovery() {
