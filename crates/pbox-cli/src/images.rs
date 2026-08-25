@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use pbox_core::{PveApi, PveError, PveTaskResponse};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -138,6 +138,32 @@ pub fn oci_reference_for_image(input: &str) -> String {
     value.to_owned()
 }
 
+#[derive(Debug, Deserialize)]
+struct LocalOciTags {
+    #[serde(rename = "Tags")]
+    tags: Vec<String>,
+}
+
+fn parse_local_oci_tags(value: &str, limit: usize) -> Result<Vec<String>> {
+    let mut tags = serde_json::from_str::<LocalOciTags>(value)
+        .context("parse local OCI tag response")?
+        .tags;
+    tags.sort();
+    tags.dedup();
+    tags.truncate(limit);
+    Ok(tags)
+}
+
+fn search_local_oci_repository(repository: &str, limit: usize) -> Result<Vec<String>> {
+    let reference = format!("docker://{repository}");
+    let output = run_local_command_output(
+        "skopeo",
+        &["list-tags", reference.as_str()],
+        "query OCI tags with local skopeo",
+    )?;
+    parse_local_oci_tags(&output, limit)
+}
+
 pub fn search_oci_repository(
     client: &impl PveApi,
     node: &str,
@@ -148,9 +174,9 @@ pub fn search_oci_repository(
     let repository = reference.repository();
     let mut tags = match client.list_oci_repo_tags(node, &repository) {
         Ok(tags) => tags,
-        Err(error) if is_missing_skopeo_error(&error) => bail!(
-            "PVE node '{node}' cannot query OCI registries because skopeo is not installed; install skopeo on the PVE node"
-        ),
+        Err(error) if is_missing_skopeo_error(&error) => {
+            search_local_oci_repository(&repository, limit)?
+        }
         Err(error) => {
             return Err(error).with_context(|| format!("search OCI repository {repository}"));
         }
@@ -617,5 +643,11 @@ mod tests {
         assert!(!is_missing_skopeo_error(&PveError::Unsupported(
             "OCI registry unavailable".to_owned(),
         )));
+    }
+
+    #[test]
+    fn parses_local_skopeo_tags_sorted_and_limited() {
+        let tags = parse_local_oci_tags(r#"{"Tags":["latest","13","latest","12"]}"#, 2).unwrap();
+        assert_eq!(tags, ["12", "13"]);
     }
 }
