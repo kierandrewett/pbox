@@ -46,6 +46,9 @@ const FORWARD_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const EXEC_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const EXEC_STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const EXEC_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const EXEC_COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const CONNECTION_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+const CONNECTION_MAX_AGE_GRACE: Duration = Duration::from_secs(30);
 static NEXT_UPLOAD_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Parser)]
@@ -525,6 +528,7 @@ async fn run_piped_command(
     requests: Streaming<ExecRequest>,
     sender: mpsc::Sender<Result<ExecEvent, Status>>,
 ) {
+    let deadline = tokio::time::Instant::now() + EXEC_COMMAND_TIMEOUT;
     let mut command = command_for_request(&request);
     command
         .stdin(Stdio::piped())
@@ -564,9 +568,15 @@ async fn run_piped_command(
         false,
         output_failure.clone(),
     ));
-    let (status, input_error, input_finished) =
-        wait_for_child_with_input(&mut child, &sender, &mut input_task, true, &output_failure)
-            .await;
+    let (status, input_error, input_finished) = wait_for_child_with_input(
+        &mut child,
+        &sender,
+        &mut input_task,
+        true,
+        &output_failure,
+        deadline,
+    )
+    .await;
     if !input_finished {
         input_task.abort();
         let _ = input_task.await;
@@ -585,6 +595,7 @@ async fn run_pty_command(
     requests: Streaming<ExecRequest>,
     sender: mpsc::Sender<Result<ExecEvent, Status>>,
 ) {
+    let deadline = tokio::time::Instant::now() + EXEC_COMMAND_TIMEOUT;
     let pty = match nix::pty::openpty(None, None) {
         Ok(pty) => pty,
         Err(error) => {
@@ -658,9 +669,15 @@ async fn run_pty_command(
         true,
         output_failure.clone(),
     ));
-    let (status, input_error, input_finished) =
-        wait_for_child_with_input(&mut child, &sender, &mut input_task, true, &output_failure)
-            .await;
+    let (status, input_error, input_finished) = wait_for_child_with_input(
+        &mut child,
+        &sender,
+        &mut input_task,
+        true,
+        &output_failure,
+        deadline,
+    )
+    .await;
     if !input_finished {
         input_task.abort();
         let _ = input_task.await;
@@ -776,22 +793,32 @@ async fn wait_for_child(
     sender: &mpsc::Sender<Result<ExecEvent, Status>>,
     process_group: bool,
     output_failure: &Notify,
-) -> std::io::Result<std::process::ExitStatus> {
+    deadline: tokio::time::Instant,
+) -> (std::io::Result<std::process::ExitStatus>, Option<Status>) {
+    let deadline_sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(deadline_sleep);
     let process_group_id = child.id();
     tokio::select! {
         status = child.wait() => {
             if process_group && let Some(process_group_id) = process_group_id {
                 kill_process_group(process_group_id);
             }
-            status
+            (status, None)
         }
         _ = sender.closed() => {
             terminate_child(child, process_group).await;
-            child.wait().await
+            (child.wait().await, None)
         }
         _ = output_failure.notified() => {
             terminate_child(child, process_group).await;
-            child.wait().await
+            (child.wait().await, None)
+        }
+        _ = &mut deadline_sleep => {
+            terminate_child(child, process_group).await;
+            (
+                child.wait().await,
+                Some(Status::deadline_exceeded("command execution timed out")),
+            )
         }
     }
 }
@@ -819,20 +846,25 @@ async fn wait_for_child_with_input(
     input_task: &mut tokio::task::JoinHandle<Result<(), Status>>,
     process_group: bool,
     output_failure: &Notify,
+    deadline: tokio::time::Instant,
 ) -> (
     std::io::Result<std::process::ExitStatus>,
     Option<Status>,
     bool,
 ) {
     tokio::select! {
-        status = wait_for_child(child, sender, process_group, output_failure) => (status, None, false),
+        wait_result = wait_for_child(child, sender, process_group, output_failure, deadline) => {
+            let (status, error) = wait_result;
+            (status, error, false)
+        }
         input_result = &mut *input_task => {
             match input_result {
-                Ok(Ok(())) => (
-                    wait_for_child(child, sender, process_group, output_failure).await,
-                    None,
-                    true,
-                ),
+                Ok(Ok(())) => {
+                    let (status, error) =
+                        wait_for_child(child, sender, process_group, output_failure, deadline)
+                            .await;
+                    (status, error, true)
+                }
                 Ok(Err(error)) => {
                     terminate_child(child, process_group).await;
                     (child.wait().await, Some(error), true)
@@ -1325,6 +1357,8 @@ async fn main() -> Result<()> {
     let incoming = LimitedIncoming::new(listener, connection_slots, tls);
     println!("pbox-agent listening on {}", args.listen);
     Server::builder()
+        .max_connection_age(CONNECTION_MAX_AGE)
+        .max_connection_age_grace(CONNECTION_MAX_AGE_GRACE)
         .add_service(AgentServer::new(AgentService {
             box_id: args.box_id,
             handshake_slots,
@@ -1535,5 +1569,28 @@ mod tests {
     #[tokio::test]
     async fn completed_output_task_cleanup_does_not_poll_handle_twice() {
         await_output_task(tokio::spawn(async {})).await;
+    }
+    #[tokio::test]
+    async fn long_running_exec_is_terminated_by_deadline() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 60"]);
+        set_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let (sender, _receiver) = mpsc::channel(1);
+        let output_failure = Notify::new();
+        let (status, error) = wait_for_child(
+            &mut child,
+            &sender,
+            true,
+            &output_failure,
+            tokio::time::Instant::now() + Duration::from_millis(25),
+        )
+        .await;
+
+        assert_eq!(
+            error.expect("deadline should return an error").code(),
+            tonic::Code::DeadlineExceeded
+        );
+        assert!(status.is_ok());
     }
 }

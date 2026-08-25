@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use bootstrap::{
     AgentProbeRequest, BootstrapKey, BootstrapOperation, BootstrapRequest, bootstrap_box,
-    cleanup_bootstrap, cleanup_bootstrap_authenticated, wait_for_agent,
+    cleanup_bootstrap_with_fallback, wait_for_agent,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(unix)]
@@ -1467,7 +1467,15 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         "record authenticated guest agent readiness",
         &id_text,
     )?;
-    cleanup_bootstrap(ip, &key).with_context(|| format_bootstrap_repair_path(&key, &id_text))?;
+    let probe = AgentProbeRequest {
+        box_id: &id_text,
+        ip,
+        port: config.agent.port,
+        client_ca: &materials.ca,
+        client_subject: &materials.client_subject,
+    };
+    cleanup_bootstrap_with_fallback(&probe, &key)
+        .with_context(|| format_bootstrap_repair_path(&key, &id_text))?;
     operation.phase = "guest-cleaned".to_owned();
     save_bootstrap_operation(&key, &operation, "record guest bootstrap cleanup", &id_text)?;
     key.cleanup().with_context(|| {
@@ -1559,17 +1567,13 @@ fn run_repair(
 
     if operation.phase == "guest-cleaned" {
         wait_for_agent(&probe).context("verify the guest agent after bootstrap cleanup")?;
-        if let Err(ssh_error) = cleanup_bootstrap(ip, &key) {
-            cleanup_bootstrap_authenticated(&probe, &key)
-                .with_context(|| format!("SSH bootstrap cleanup failed: {ssh_error}"))?;
-        }
+        cleanup_bootstrap_with_fallback(&probe, &key)
+            .with_context(|| format_bootstrap_repair_path(&key, &id_text))?;
     } else {
         let agent_ready = operation.phase == "agent-ready" && wait_for_agent(&probe).is_ok();
         if agent_ready {
-            if let Err(ssh_error) = cleanup_bootstrap(ip, &key) {
-                cleanup_bootstrap_authenticated(&probe, &key)
-                    .with_context(|| format!("SSH bootstrap cleanup failed: {ssh_error}"))?;
-            }
+            cleanup_bootstrap_with_fallback(&probe, &key)
+                .with_context(|| format_bootstrap_repair_path(&key, &id_text))?;
             operation.node = record.node.clone();
             operation.vmid = Some(record.vmid);
             operation.ip = Some(ip);
@@ -1611,7 +1615,7 @@ fn run_repair(
                 "record repaired guest agent readiness",
                 &id_text,
             )?;
-            cleanup_bootstrap(ip, &key)
+            cleanup_bootstrap_with_fallback(&probe, &key)
                 .with_context(|| format_bootstrap_repair_path(&key, &id_text))?;
             operation.phase = "guest-cleaned".to_owned();
             save_bootstrap_operation(&key, &operation, "record guest bootstrap cleanup", &id_text)?;

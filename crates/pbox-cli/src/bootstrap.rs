@@ -498,6 +498,17 @@ pub fn cleanup_bootstrap_authenticated(
     Ok(())
 }
 
+pub fn cleanup_bootstrap_with_fallback(
+    request: &AgentProbeRequest<'_>,
+    key: &BootstrapKey,
+) -> Result<()> {
+    if let Err(ssh_error) = cleanup_bootstrap(request.ip, key) {
+        cleanup_bootstrap_authenticated(request, key)
+            .with_context(|| format!("SSH bootstrap cleanup failed: {ssh_error}"))?;
+    }
+    Ok(())
+}
+
 struct SshSession<'a> {
     ip: Ipv4Addr,
     key: &'a BootstrapKey,
