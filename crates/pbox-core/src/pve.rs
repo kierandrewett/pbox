@@ -13,6 +13,14 @@ const PVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub trait PveApi {
     fn list_cluster_resources(&self) -> Result<Vec<ClusterResource>, PveError>;
+    fn list_nodes(&self) -> Result<Vec<PveNode>, PveError>;
+    fn list_node_storages(&self, node: &str) -> Result<Vec<PveStorage>, PveError>;
+    fn list_storage_content(
+        &self,
+        node: &str,
+        storage: &str,
+        content: &str,
+    ) -> Result<Vec<PveStorageContent>, PveError>;
     fn get_lxc_config(&self, node: &str, vmid: u64) -> Result<LxcConfig, PveError>;
     fn list_lxc_interfaces(&self, node: &str, vmid: u64) -> Result<Vec<LxcInterface>, PveError>;
     fn list_lxc_snapshots(&self, node: &str, vmid: u64) -> Result<Vec<LxcSnapshot>, PveError>;
@@ -196,6 +204,29 @@ impl PveApi for PveClient {
         validate_path_segment(node, "node")?;
         validate_path_segment(upid, "UPID")?;
         self.get(&format!("/nodes/{node}/tasks/{upid}/status"))
+    }
+
+    fn list_nodes(&self) -> Result<Vec<PveNode>, PveError> {
+        self.get("/nodes")
+    }
+
+    fn list_node_storages(&self, node: &str) -> Result<Vec<PveStorage>, PveError> {
+        validate_path_segment(node, "node")?;
+        self.get(&format!("/nodes/{node}/storage"))
+    }
+
+    fn list_storage_content(
+        &self,
+        node: &str,
+        storage: &str,
+        content: &str,
+    ) -> Result<Vec<PveStorageContent>, PveError> {
+        validate_path_segment(node, "node")?;
+        validate_path_segment(storage, "storage")?;
+        validate_path_segment(content, "content")?;
+        self.get(&format!(
+            "/nodes/{node}/storage/{storage}/content?content={content}"
+        ))
     }
 
     fn create_lxc(
@@ -386,6 +417,35 @@ fn decode_task_response(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PveNode {
+    pub node: String,
+    pub status: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PveStorage {
+    pub storage: String,
+    pub content: Option<String>,
+    pub active: Option<u64>,
+    pub enabled: Option<u64>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PveStorageContent {
+    pub volid: String,
+    pub content: Option<String>,
+    pub format: Option<String>,
+    #[serde(rename = "isBase")]
+    pub is_base: Option<u64>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+
 pub struct ClusterResource {
     #[serde(rename = "type")]
     pub resource_type: String,
@@ -672,6 +732,32 @@ mod tests {
         let response: PveResponse<serde_json::Value> =
             serde_json::from_str(r#"{"data":null}"#).unwrap();
         assert!(response.data.is_null());
+    }
+
+    #[test]
+    fn provisioning_discovery_responses_decode() {
+        let nodes: Vec<PveNode> =
+            serde_json::from_str(r#"[{"node":"pve-a","status":"online","cpu":0.1}]"#).unwrap();
+        assert_eq!(nodes[0].node, "pve-a");
+        assert_eq!(nodes[0].status.as_deref(), Some("online"));
+        assert_eq!(nodes[0].extra["cpu"], 0.1);
+
+        let storages: Vec<PveStorage> = serde_json::from_str(
+            r#"[{"storage":"local","content":"iso,vztmpl,rootdir","active":1,"enabled":1}]"#,
+        )
+        .unwrap();
+        assert_eq!(storages[0].storage, "local");
+        assert!(storages[0].content.as_deref().unwrap().contains("vztmpl"));
+
+        let content: Vec<PveStorageContent> = serde_json::from_str(
+            r#"[{"volid":"local:vztmpl/debian-13-standard_13.0-1_amd64.tar.zst","content":"vztmpl","format":"tar.zst","isBase":1}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            content[0].volid,
+            "local:vztmpl/debian-13-standard_13.0-1_amd64.tar.zst"
+        );
+        assert_eq!(content[0].is_base, Some(1));
     }
 
     #[test]

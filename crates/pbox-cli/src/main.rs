@@ -3708,6 +3708,22 @@ mod tests {
         fn list_cluster_resources(&self) -> Result<Vec<pbox_core::ClusterResource>, PveError> {
             Err(Self::unsupported())
         }
+        fn list_nodes(&self) -> Result<Vec<pbox_core::PveNode>, PveError> {
+            Err(Self::unsupported())
+        }
+
+        fn list_node_storages(&self, _node: &str) -> Result<Vec<pbox_core::PveStorage>, PveError> {
+            Err(Self::unsupported())
+        }
+
+        fn list_storage_content(
+            &self,
+            _node: &str,
+            _storage: &str,
+            _content: &str,
+        ) -> Result<Vec<pbox_core::PveStorageContent>, PveError> {
+            Err(Self::unsupported())
+        }
 
         fn get_lxc_config(&self, _node: &str, _vmid: u64) -> Result<LxcConfig, PveError> {
             Ok(self.config.borrow().clone())
