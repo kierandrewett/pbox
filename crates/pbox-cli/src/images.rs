@@ -2,6 +2,9 @@ use anyhow::{Context, Result, bail};
 use pbox_core::{PveApi, PveError, PveTaskResponse};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageReference {
@@ -193,9 +196,9 @@ pub fn prepare_oci_template(
                 });
             }
         }
-        Err(error) if is_missing_skopeo_error(&error) => bail!(
-            "PVE node '{node}' cannot pull OCI images because skopeo is not installed; install skopeo on the PVE node or pass --ostemplate"
-        ),
+        Err(error) if is_missing_skopeo_error(&error) => {
+            return prepare_local_oci_template(client, node, storage, &canonical, &filename);
+        }
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("pull OCI image {canonical} into PVE storage {storage}"));
@@ -207,6 +210,155 @@ pub fn prepare_oci_template(
         volume,
         task,
     })
+}
+
+fn prepare_local_oci_template(
+    client: &impl PveApi,
+    node: &str,
+    storage: &str,
+    reference: &str,
+    filename: &str,
+) -> Result<OciTemplate> {
+    let archive = build_local_oci_archive(reference, filename)?;
+    let result = upload_local_oci_template(client, node, storage, reference, filename, &archive);
+    if let Some(workspace) = archive.parent() {
+        let _ = fs::remove_dir_all(workspace);
+    }
+    result
+}
+
+pub fn upload_local_oci_template(
+    client: &impl PveApi,
+    node: &str,
+    storage: &str,
+    reference: &str,
+    filename: &str,
+    archive: &Path,
+) -> Result<OciTemplate> {
+    let volume = format!("{storage}:vztmpl/{filename}.tar.zst");
+    if oci_template_present(client, node, storage, &volume)? {
+        return Ok(OciTemplate {
+            reference: reference.to_owned(),
+            filename: filename.to_owned(),
+            volume,
+            task: None,
+        });
+    }
+    let task = client
+        .upload_storage_template(node, storage, &format!("{filename}.tar.zst"), archive)
+        .with_context(|| {
+            format!("upload local OCI template {reference} to PVE storage {storage}")
+        })?;
+    Ok(OciTemplate {
+        reference: reference.to_owned(),
+        filename: filename.to_owned(),
+        volume,
+        task: Some(task),
+    })
+}
+
+fn build_local_oci_archive(reference: &str, filename: &str) -> Result<PathBuf> {
+    let workspace = create_local_oci_workspace(filename)?;
+    let result = (|| {
+        let image = ImageReference::parse(reference)?.canonical();
+        run_local_command(
+            "podman",
+            &["pull", "--quiet", image.as_str()],
+            "pull OCI image with podman",
+        )?;
+        let container = run_local_command_output(
+            "podman",
+            &["create", "--quiet", image.as_str()],
+            "create temporary OCI container",
+        )?;
+        let tar = workspace.join(format!("{filename}.tar"));
+        let compressed = workspace.join(format!("{filename}.tar.zst"));
+        let tar_text = path_text(&tar)?;
+        let compressed_text = path_text(&compressed)?;
+        let export_result = run_local_command(
+            "podman",
+            &["export", "--output", tar_text.as_str(), container.as_str()],
+            "export OCI container rootfs",
+        );
+        let cleanup_result = run_local_command(
+            "podman",
+            &["rm", "--force", container.as_str()],
+            "remove temporary OCI container",
+        );
+        export_result?;
+        cleanup_result?;
+        run_local_command(
+            "zstd",
+            &[
+                "--quiet",
+                "--threads=0",
+                "--force",
+                tar_text.as_str(),
+                "-o",
+                compressed_text.as_str(),
+            ],
+            "compress OCI rootfs template",
+        )?;
+        Ok(compressed)
+    })();
+    match result {
+        Ok(path) => Ok(path),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&workspace);
+            Err(error)
+        }
+    }
+}
+
+fn create_local_oci_workspace(filename: &str) -> Result<PathBuf> {
+    let root = std::env::temp_dir();
+    let pid = std::process::id();
+    for attempt in 0..100 {
+        let workspace = root.join(format!("pbox-oci-{filename}-{pid}-{attempt}"));
+        match fs::create_dir(&workspace) {
+            Ok(()) => return Ok(workspace),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("create local OCI workspace {}", workspace.display())
+                });
+            }
+        }
+    }
+    bail!("could not allocate a local OCI workspace for {filename}")
+}
+
+fn path_text(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("local OCI path is not valid UTF-8: {}", path.display()))
+}
+
+fn run_local_command(program: &str, args: &[&str], action: &str) -> Result<()> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("{action}; command '{program}' is unavailable"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    bail!("{action} failed with exit status {}", output.status)
+}
+
+fn run_local_command_output(program: &str, args: &[&str], action: &str) -> Result<String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("{action}; command '{program}' is unavailable"))?;
+    if !output.status.success() {
+        bail!("{action} failed with exit status {}", output.status);
+    }
+    let value = String::from_utf8(output.stdout).context("read local OCI command output")?;
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("{action} returned no container identifier");
+    }
+    Ok(value.to_owned())
 }
 
 pub fn oci_template_present(

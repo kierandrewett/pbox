@@ -4320,6 +4320,19 @@ mod tests {
             Ok(Self::task("oci-pull"))
         }
 
+        fn upload_storage_template(
+            &self,
+            node: &str,
+            storage: &str,
+            filename: &str,
+            _path: &std::path::Path,
+        ) -> Result<PveTaskResponse, PveError> {
+            self.events
+                .borrow_mut()
+                .push(format!("oci-upload:{node}:{storage}:{filename}"));
+            Ok(Self::task("oci-upload"))
+        }
+
         fn get_lxc_config(&self, _node: &str, _vmid: u64) -> Result<LxcConfig, PveError> {
             Ok(self.config.borrow().clone())
         }
@@ -4669,6 +4682,35 @@ mod tests {
                 .borrow()
                 .iter()
                 .any(|event| event.contains("oci-pull:pve01:local:docker.io/library/debian:13"))
+        );
+    }
+
+    #[test]
+    fn local_oci_template_upload_uses_pve_upload_task() {
+        let metadata = PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007);
+        let fake = FakePve::new(&metadata, "user note");
+        let archive =
+            std::env::temp_dir().join(format!("pbox-upload-test-{}.tar.zst", std::process::id()));
+        fs::write(&archive, b"test archive").unwrap();
+
+        let template = crate::images::upload_local_oci_template(
+            &fake,
+            "pve01",
+            "local",
+            "docker.io/library/debian:13",
+            "pbox-oci-test",
+            &archive,
+        )
+        .unwrap();
+        let _ = fs::remove_file(&archive);
+
+        assert_eq!(template.volume, "local:vztmpl/pbox-oci-test.tar.zst");
+        assert_eq!(template.task.unwrap().upid, "oci-upload");
+        assert!(
+            fake.events
+                .borrow()
+                .iter()
+                .any(|event| event == "oci-upload:pve01:local:pbox-oci-test.tar.zst")
         );
     }
 
