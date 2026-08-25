@@ -117,6 +117,24 @@ pub fn is_oci_reference(input: &str) -> bool {
             .is_some_and(|position| position > slash && position + 1 < value.len())
 }
 
+/// Convert a pbox image value into an OCI reference when the local PVE template is absent.
+pub fn oci_reference_for_image(input: &str) -> String {
+    let value = input.trim();
+    if is_oci_reference(value) {
+        return value.to_owned();
+    }
+    if let Some((repository, tag)) = value.rsplit_once('-')
+        && !repository.is_empty()
+        && !tag.is_empty()
+        && tag
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return format!("{repository}:{tag}");
+    }
+    value.to_owned()
+}
+
 pub fn search_oci_repository(
     client: &impl PveApi,
     node: &str,
@@ -125,9 +143,15 @@ pub fn search_oci_repository(
 ) -> Result<OciSearchResult> {
     let reference = ImageReference::parse(input)?;
     let repository = reference.repository();
-    let mut tags = client
-        .list_oci_repo_tags(node, &repository)
-        .with_context(|| format!("search OCI repository {repository}"))?;
+    let mut tags = match client.list_oci_repo_tags(node, &repository) {
+        Ok(tags) => tags,
+        Err(error) if is_missing_skopeo_error(&error) => bail!(
+            "PVE node '{node}' cannot query OCI registries because skopeo is not installed; install skopeo on the PVE node"
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| format!("search OCI repository {repository}"));
+        }
+    };
     tags.sort();
     tags.dedup();
     tags.truncate(limit);
@@ -169,6 +193,9 @@ pub fn prepare_oci_template(
                 });
             }
         }
+        Err(error) if is_missing_skopeo_error(&error) => bail!(
+            "PVE node '{node}' cannot pull OCI images because skopeo is not installed; install skopeo on the PVE node or pass --ostemplate"
+        ),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("pull OCI image {canonical} into PVE storage {storage}"));
@@ -206,6 +233,14 @@ fn is_existing_oci_template_message(message: &str) -> bool {
     message.contains("refusing to override existing file")
         || message.contains("file already exists")
         || message.contains("file exists")
+}
+
+fn is_missing_skopeo_error(error: &PveError) -> bool {
+    let PveError::Http { message, .. } = error else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    message.contains("skopeo") && (message.contains("install") || message.contains("not found"))
 }
 
 fn is_registry_host(value: &str) -> bool {
@@ -347,6 +382,16 @@ mod tests {
     }
 
     #[test]
+    fn maps_versioned_pve_aliases_to_oci_tags() {
+        assert_eq!(oci_reference_for_image("debian-13"), "debian:13");
+        assert_eq!(oci_reference_for_image("ubuntu-24.04"), "ubuntu:24.04");
+        assert_eq!(
+            oci_reference_for_image("ghcr.io/example/base:latest"),
+            "ghcr.io/example/base:latest"
+        );
+    }
+
+    #[test]
     fn parses_registry_port() {
         let reference = ImageReference::parse("localhost:5000/pbox/base:dev").unwrap();
         assert_eq!(reference.repository(), "localhost:5000/pbox/base");
@@ -372,5 +417,17 @@ mod tests {
         assert!(!is_existing_oci_template_message(
             "manifest is not supported"
         ));
+    }
+
+    #[test]
+    fn detects_missing_skopeo_pve_errors() {
+        let error = PveError::Http {
+            status: "500".parse().unwrap(),
+            message: "Install 'skopeo' to list tags from OCI registries.".to_owned(),
+        };
+        assert!(is_missing_skopeo_error(&error));
+        assert!(!is_missing_skopeo_error(&PveError::Unsupported(
+            "OCI registry unavailable".to_owned(),
+        )));
     }
 }

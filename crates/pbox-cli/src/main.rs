@@ -10,7 +10,9 @@ use bootstrap::{
     cleanup_bootstrap_with_fallback, wait_for_agent,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use images::{is_oci_reference, oci_template_present, prepare_oci_template, search_oci_repository};
+use images::{
+    oci_reference_for_image, oci_template_present, prepare_oci_template, search_oci_repository,
+};
 #[cfg(unix)]
 use nix::sys::signal::Signal;
 #[cfg(unix)]
@@ -135,7 +137,7 @@ struct NewCommand {
     /// PVE node. Defaults to automatic selection from online nodes.
     #[arg(long)]
     node: Option<String>,
-    /// PVE template alias or explicit OCI image reference.
+    /// PVE template alias or OCI image reference. Missing templates are pulled through PVE.
     #[arg(long)]
     image: Option<String>,
     /// Raw PVE template volume override.
@@ -637,7 +639,8 @@ fn run_image(
             let storage =
                 select_pve_storage(&storages, configured_storage, "vztmpl", "OCI templates")?
                     .to_owned();
-            let mut prepared = prepare_oci_template(&client, &node, &storage, &command.reference)?;
+            let image = oci_reference_for_image(&command.reference);
+            let mut prepared = prepare_oci_template(&client, &node, &storage, &image)?;
             let downloaded = prepared.task.is_some();
             if let Some(task) = prepared.task.take() {
                 wait_for_oci_template_task(
@@ -2806,6 +2809,28 @@ fn resolve_new_command(
     resolve_new_command_with_template(client, config, command, None, None)
 }
 
+fn find_pve_template(
+    client: &impl PveApi,
+    node: &str,
+    storage: &str,
+    image: &str,
+) -> Result<Option<String>> {
+    let contents = client
+        .list_storage_content(node, storage, "vztmpl")
+        .with_context(|| format!("list PVE templates in storage {storage}"))?;
+    let matches: Vec<&PveStorageContent> = contents
+        .iter()
+        .filter(|content| template_matches(content, image))
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [content] => Ok(Some(content.volid.clone())),
+        _ => bail!(
+            "image '{image}' matches multiple PVE templates in storage '{storage}'; use --ostemplate to select one"
+        ),
+    }
+}
+
 fn resolve_new_command_with_template(
     client: &impl PveApi,
     config: &Config,
@@ -2860,22 +2885,11 @@ fn resolve_new_command_with_template(
                 "vztmpl",
                 "templates",
             )?;
-            let contents = client
-                .list_storage_content(&node, storage, "vztmpl")
-                .with_context(|| format!("list PVE templates in storage {storage}"))?;
-            let matches: Vec<&PveStorageContent> = contents
-                .iter()
-                .filter(|content| template_matches(content, &image))
-                .collect();
-            match matches.as_slice() {
-                [] => bail!(
+            find_pve_template(client, &node, storage, &image)?.ok_or_else(|| {
+                anyhow!(
                     "could not find image '{image}' in PVE storage '{storage}'; use --ostemplate or set images.default"
-                ),
-                [content] => content.volid.clone(),
-                _ => bail!(
-                    "image '{image}' matches multiple PVE templates in storage '{storage}'; use --ostemplate to select one"
-                ),
-            }
+                )
+            })?
         }
     };
 
@@ -2982,6 +2996,51 @@ fn is_vmid_conflict(error: &PveError) -> bool {
     }
 }
 
+fn prepare_new_template(
+    client: &impl PveApi,
+    config: &Config,
+    command: &NewCommand,
+) -> Result<(Option<String>, Option<String>)> {
+    if command.ostemplate.is_some() {
+        return Ok((None, None));
+    }
+
+    let image = non_empty_new_value(
+        "--image",
+        command
+            .image
+            .as_deref()
+            .unwrap_or(config.images.default.as_str()),
+    )?;
+    let node = resolve_new_node(client, config, command, None)?;
+    let storages = client
+        .list_node_storages(&node)
+        .with_context(|| format!("discover PVE storage on node {node}"))?;
+    let storage = select_pve_storage(
+        &storages,
+        &config.pve.template_storage,
+        "vztmpl",
+        "templates",
+    )?;
+    if let Some(template) = find_pve_template(client, &node, storage, &image)? {
+        return Ok((Some(node), Some(template)));
+    }
+
+    let oci_image = oci_reference_for_image(&image);
+    let mut prepared = prepare_oci_template(client, &node, storage, &oci_image)?;
+    if let Some(task) = prepared.task.take() {
+        wait_for_oci_template_task(
+            client,
+            &node,
+            storage,
+            &prepared.reference,
+            &prepared.volume,
+            task,
+        )?;
+    }
+    Ok((Some(node), Some(prepared.volume)))
+}
+
 fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorChoice) -> Result<()> {
     let config = load_config(store)?;
     let agent_binary = resolve_agent_binary(&config)?;
@@ -2992,40 +3051,7 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         ));
     }
     let client = client_from_config(&config)?;
-    let (prepared_node, prepared_ostemplate) = if command.ostemplate.is_none() {
-        let image = command
-            .image
-            .as_deref()
-            .unwrap_or(config.images.default.as_str());
-        if is_oci_reference(image) {
-            let node = resolve_new_node(&client, &config, &command, None)?;
-            let storages = client
-                .list_node_storages(&node)
-                .with_context(|| format!("discover PVE storage on node {node}"))?;
-            let storage = select_pve_storage(
-                &storages,
-                &config.pve.template_storage,
-                "vztmpl",
-                "OCI templates",
-            )?;
-            let mut prepared = prepare_oci_template(&client, &node, storage, image)?;
-            if let Some(task) = prepared.task.take() {
-                wait_for_oci_template_task(
-                    &client,
-                    &node,
-                    storage,
-                    &prepared.reference,
-                    &prepared.volume,
-                    task,
-                )?;
-            }
-            (Some(node), Some(prepared.volume))
-        } else {
-            (None, None)
-        }
-    } else {
-        (None, None)
-    };
+    let (prepared_node, prepared_ostemplate) = prepare_new_template(&client, &config, &command)?;
     let resolved = resolve_new_command_with_template(
         &client,
         &config,
@@ -4605,6 +4631,44 @@ mod tests {
         let mut bare = unrelated.clone();
         bare.volid = "local:vztmpl/debian-13.tar.zst".to_owned();
         assert!(!template_matches(&bare, "debian-13"));
+    }
+
+    #[test]
+    fn new_image_falls_back_to_oci_when_pve_template_is_missing() {
+        let metadata = PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007);
+        let fake = FakePve::new(&metadata, "user note");
+        fake.storage_content.borrow_mut().clear();
+
+        let (node, template) = super::prepare_new_template(
+            &fake,
+            &Config::default(),
+            &NewCommand {
+                node: None,
+                image: Some("debian-13".to_owned()),
+                ostemplate: None,
+                rootfs: None,
+                net0: None,
+                name: None,
+                memory: None,
+                swap: None,
+                cores: None,
+                stopped: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(node.as_deref(), Some("pve01"));
+        assert!(
+            template
+                .as_deref()
+                .is_some_and(|value| value.starts_with("local:vztmpl/pbox-oci-"))
+        );
+        assert!(
+            fake.events
+                .borrow()
+                .iter()
+                .any(|event| event.contains("oci-pull:pve01:local:docker.io/library/debian:13"))
+        );
     }
 
     #[test]
