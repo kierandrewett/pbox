@@ -1121,6 +1121,165 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbox_agent_client::AgentClient;
+    use pbox_crypto::{
+        CertificatePurpose, derive_context_seed, generate_context_ca, issue_certificate,
+        server_subject,
+    };
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+
+    async fn spawn_test_agent(
+        box_id: &str,
+        server_certificate: pbox_crypto::CertificateMaterial,
+        client_ca: &pbox_crypto::CertificateMaterial,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = AgentService {
+            box_id: box_id.to_owned(),
+            handshake_slots: Arc::new(Semaphore::new(4)),
+            forward_slots: Arc::new(Semaphore::new(4)),
+            file_slots: Arc::new(Semaphore::new(4)),
+            forward_allow: vec!["127.0.0.0/8".parse().unwrap()],
+            exec_slots: Arc::new(Semaphore::new(4)),
+        };
+        let tls = ServerTlsConfig::new()
+            .identity(Identity::from_pem(
+                server_certificate.certificate_pem,
+                server_certificate.private_key_pem,
+            ))
+            .client_ca_root(Certificate::from_pem(client_ca.certificate_pem.clone()));
+        let incoming = TcpListenerStream::new(listener);
+        let task = tokio::spawn(async move {
+            Server::builder()
+                .tls_config(tls)
+                .unwrap()
+                .add_service(AgentServer::new(service))
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+        (format!("https://{address}"), task)
+    }
+
+    async fn stop_test_agent(task: tokio::task::JoinHandle<()>) {
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn local_agent_supports_authenticated_info_and_exec() {
+        let box_id = "pbx_t3yzd9y3";
+        let seed = derive_context_seed("pbox@pve!cli", "secret");
+        let ca = generate_context_ca(&seed).unwrap();
+        let server = issue_certificate(
+            &ca,
+            &server_subject(box_id).unwrap(),
+            CertificatePurpose::Server,
+        )
+        .unwrap();
+        let client = issue_certificate(
+            &ca,
+            "pbox.cwd.dev/context/test-client",
+            CertificatePurpose::Client,
+        )
+        .unwrap();
+        let (endpoint, task) = spawn_test_agent(box_id, server, &ca).await;
+        let mut agent = AgentClient::connect(&endpoint, box_id, &ca.certificate_pem, &client)
+            .await
+            .unwrap();
+
+        let info = agent.info().await.unwrap();
+        assert_eq!(info.protocol_version, PROTOCOL);
+        assert_eq!(info.box_id, box_id);
+        assert!(
+            info.capabilities
+                .iter()
+                .any(|capability| capability == "exec")
+        );
+
+        let result = agent
+            .exec(
+                vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf agent-smoke".to_owned(),
+                ],
+                "/tmp",
+                [],
+                "root",
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.stdout, b"agent-smoke");
+        assert!(result.stderr.is_empty());
+        assert_eq!(result.code, 0);
+        assert!(result.exited);
+
+        stop_test_agent(task).await;
+    }
+
+    #[tokio::test]
+    async fn wrong_context_cannot_connect_to_agent() {
+        let box_id = "pbx_t3yzd9y3";
+        let server_seed = derive_context_seed("pbox@pve!cli", "secret");
+        let server_ca = generate_context_ca(&server_seed).unwrap();
+        let server = issue_certificate(
+            &server_ca,
+            &server_subject(box_id).unwrap(),
+            CertificatePurpose::Server,
+        )
+        .unwrap();
+        let client_seed = derive_context_seed("pbox@pve!cli", "other-secret");
+        let client_ca = generate_context_ca(&client_seed).unwrap();
+        let client = issue_certificate(
+            &client_ca,
+            "pbox.cwd.dev/context/wrong/client",
+            CertificatePurpose::Client,
+        )
+        .unwrap();
+        let (endpoint, task) = spawn_test_agent(box_id, server, &server_ca).await;
+
+        let result =
+            AgentClient::connect(&endpoint, box_id, &client_ca.certificate_pem, &client).await;
+        assert!(result.is_err());
+
+        stop_test_agent(task).await;
+    }
+
+    #[tokio::test]
+    async fn info_rejects_a_server_with_the_wrong_box_identity() {
+        let expected_box_id = "pbx_t3yzd9y3";
+        let served_box_id = "pbx_91mk2aa7";
+        let seed = derive_context_seed("pbox@pve!cli", "secret");
+        let ca = generate_context_ca(&seed).unwrap();
+        let server = issue_certificate(
+            &ca,
+            &server_subject(expected_box_id).unwrap(),
+            CertificatePurpose::Server,
+        )
+        .unwrap();
+        let client = issue_certificate(
+            &ca,
+            "pbox.cwd.dev/context/test-client",
+            CertificatePurpose::Client,
+        )
+        .unwrap();
+        let (endpoint, task) = spawn_test_agent(served_box_id, server, &ca).await;
+        let mut agent =
+            AgentClient::connect(&endpoint, expected_box_id, &ca.certificate_pem, &client)
+                .await
+                .unwrap();
+
+        let result = agent.info().await;
+        assert!(matches!(
+            result,
+            Err(pbox_agent_client::AgentClientError::Identity(_))
+        ));
+
+        stop_test_agent(task).await;
+    }
 
     #[test]
     fn default_forward_policy_allows_only_loopback() {

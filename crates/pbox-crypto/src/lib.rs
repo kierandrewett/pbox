@@ -243,6 +243,15 @@ mod tests {
         assert_ne!(first, other);
         assert_eq!(context_fingerprint(&first), context_fingerprint(&second));
     }
+
+    #[test]
+    fn context_derivation_binds_token_id_as_well_as_secret() {
+        let first = derive_context_seed("pbox@pve!cli", "secret");
+        let other = derive_context_seed("pbox@other!cli", "secret");
+
+        assert_ne!(first, other);
+        assert_ne!(context_fingerprint(&first), context_fingerprint(&other));
+    }
     #[test]
     fn client_subject_is_bound_to_context_seed() {
         let seed = derive_context_seed("pbox@pve!cli", "secret");
