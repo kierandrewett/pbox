@@ -1,0 +1,376 @@
+use anyhow::{Context, Result, bail};
+use pbox_core::{PveApi, PveError, PveTaskResponse};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageReference {
+    registry: String,
+    repository: String,
+    tag: Option<String>,
+    digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OciSearchResult {
+    pub repository: String,
+    pub tags: Vec<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OciTemplate {
+    pub reference: String,
+    pub filename: String,
+    pub volume: String,
+    pub task: Option<PveTaskResponse>,
+}
+
+impl ImageReference {
+    pub fn parse(input: &str) -> Result<Self> {
+        let trimmed = input.trim();
+        let value = trimmed.strip_prefix("docker://").unwrap_or(trimmed);
+        if value.is_empty() || value.chars().any(|character| character.is_ascii_control()) {
+            bail!("OCI image reference cannot be empty or contain control characters");
+        }
+
+        let (name, tag, digest) = if let Some((name, digest)) = value.split_once('@') {
+            if digest.is_empty() || value.matches('@').count() != 1 {
+                bail!("OCI image digest reference is invalid: {input}");
+            }
+            let slash = name.rfind('/').unwrap_or(0);
+            if name.rfind(':').is_some_and(|position| position > slash) {
+                bail!("OCI image reference cannot contain both a tag and a digest");
+            }
+            (name, None, Some(validate_digest(digest)?))
+        } else {
+            let slash = value.rfind('/').unwrap_or(0);
+            let colon = value.rfind(':');
+            if colon.is_some_and(|position| position > slash) {
+                let position = colon.expect("colon position exists");
+                let (name, tag) = value.split_at(position);
+                (name, Some(validate_tag(&tag[1..])?), None)
+            } else {
+                (value, Some("latest".to_owned()), None)
+            }
+        };
+
+        let parts: Vec<&str> = name.split('/').collect();
+        let has_path = parts.len() > 1;
+        let first = parts.first().copied().unwrap_or_default();
+        let (registry, repository) = if has_path && is_registry_host(first) {
+            let mut repository = parts[1..].join("/");
+            if first.eq_ignore_ascii_case("docker.io") && !repository.contains('/') {
+                repository = format!("library/{repository}");
+            }
+            (first.to_owned(), repository)
+        } else {
+            let repository = if has_path {
+                name.to_owned()
+            } else {
+                format!("library/{name}")
+            };
+            ("docker.io".to_owned(), repository)
+        };
+        let registry = validate_name_component(&registry, "registry")?;
+        let repository = validate_repository(&repository.to_ascii_lowercase())?;
+
+        Ok(Self {
+            registry,
+            repository,
+            tag,
+            digest,
+        })
+    }
+
+    pub fn repository(&self) -> String {
+        format!("{}/{}", self.registry, self.repository)
+    }
+
+    pub fn canonical(&self) -> String {
+        match (&self.tag, &self.digest) {
+            (_, Some(digest)) => format!("{}@{digest}", self.repository()),
+            (Some(tag), None) => format!("{}:{tag}", self.repository()),
+            (None, None) => format!("{}:latest", self.repository()),
+        }
+    }
+
+    pub fn is_digest(&self) -> bool {
+        self.digest.is_some()
+    }
+
+    pub fn filename(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(self.canonical().as_bytes());
+        format!("pbox-oci-{}", hex_lower(&digest.finalize()))
+    }
+}
+
+pub fn is_oci_reference(input: &str) -> bool {
+    let value = input.trim();
+    if value.starts_with("docker://") {
+        return true;
+    }
+    let slash = value.rfind('/').unwrap_or(0);
+    value.contains('/')
+        || value.contains('@')
+        || value
+            .rfind(':')
+            .is_some_and(|position| position > slash && position + 1 < value.len())
+}
+
+pub fn search_oci_repository(
+    client: &impl PveApi,
+    node: &str,
+    input: &str,
+    limit: usize,
+) -> Result<OciSearchResult> {
+    let reference = ImageReference::parse(input)?;
+    let repository = reference.repository();
+    let mut tags = client
+        .list_oci_repo_tags(node, &repository)
+        .with_context(|| format!("search OCI repository {repository}"))?;
+    tags.sort();
+    tags.dedup();
+    tags.truncate(limit);
+    Ok(OciSearchResult { repository, tags })
+}
+
+pub fn prepare_oci_template(
+    client: &impl PveApi,
+    node: &str,
+    storage: &str,
+    input: &str,
+) -> Result<OciTemplate> {
+    let reference = ImageReference::parse(input)?;
+    if reference.is_digest() {
+        bail!(
+            "PVE OCI registry pull requires a tagged image reference; use {}:tag",
+            reference.repository()
+        );
+    }
+    let canonical = reference.canonical();
+    let filename = reference.filename();
+    let volume = format!("{storage}:vztmpl/{filename}.tar");
+    if storage_contains_template(client, node, storage, &volume)? {
+        return Ok(OciTemplate {
+            reference: canonical,
+            filename,
+            volume,
+            task: None,
+        });
+    }
+    let task = match client.pull_oci_registry(node, storage, &canonical, &filename) {
+        Ok(task) => Some(task),
+        Err(error) if is_existing_oci_template_error(&error) => {
+            if storage_contains_template(client, node, storage, &volume)? {
+                None
+            } else {
+                return Err(error).with_context(|| {
+                    format!("pull OCI image {canonical} into PVE storage {storage}")
+                });
+            }
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("pull OCI image {canonical} into PVE storage {storage}"));
+        }
+    };
+    Ok(OciTemplate {
+        reference: canonical,
+        filename,
+        volume,
+        task,
+    })
+}
+
+fn storage_contains_template(
+    client: &impl PveApi,
+    node: &str,
+    storage: &str,
+    volume: &str,
+) -> Result<bool> {
+    let contents = client
+        .list_storage_content(node, storage, "vztmpl")
+        .with_context(|| format!("inspect OCI templates in PVE storage {storage}"))?;
+    Ok(contents.iter().any(|content| content.volid == volume))
+}
+
+fn is_existing_oci_template_error(error: &PveError) -> bool {
+    let PveError::Http { message, .. } = error else {
+        return false;
+    };
+    is_existing_oci_template_message(message)
+}
+
+fn is_existing_oci_template_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("refusing to override existing file")
+        || message.contains("file already exists")
+        || message.contains("file exists")
+}
+
+fn is_registry_host(value: &str) -> bool {
+    value == "localhost" || value.contains('.') || value.contains(':')
+}
+
+fn validate_name_component(value: &str, label: &str) -> Result<String> {
+    let (host, port) = value
+        .rsplit_once(':')
+        .map_or((value, None), |(host, port)| (host, Some(port)));
+    if host.is_empty()
+        || host.split('.').any(|component| {
+            let bytes = component.as_bytes();
+            bytes.is_empty()
+                || !bytes[0].is_ascii_alphanumeric()
+                || !bytes[bytes.len() - 1].is_ascii_alphanumeric()
+                || !bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        })
+    {
+        bail!("OCI {label} is invalid: {value}");
+    }
+    if let Some(port) = port
+        && port.parse::<u16>().ok().filter(|port| *port > 0).is_none()
+    {
+        bail!("OCI registry is invalid: {value}");
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn validate_repository(value: &str) -> Result<String> {
+    if value.is_empty()
+        || value
+            .split('/')
+            .any(|component| !valid_repository_component(component))
+    {
+        bail!("OCI repository is invalid: {value}");
+    }
+    Ok(value.to_owned())
+}
+
+fn valid_repository_component(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_alphanumeric() {
+        return false;
+    }
+    let mut index = 1;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_alphanumeric() {
+            index += 1;
+            continue;
+        }
+        match bytes[index] {
+            b'.' => index += 1,
+            b'_' => {
+                index += 1;
+                if index < bytes.len() && bytes[index] == b'_' {
+                    index += 1;
+                }
+            }
+            b'-' => {
+                while index < bytes.len() && bytes[index] == b'-' {
+                    index += 1;
+                }
+            }
+            _ => return false,
+        }
+        if index >= bytes.len() || !bytes[index].is_ascii_alphanumeric() {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn validate_tag(value: &str) -> Result<String> {
+    if value.is_empty()
+        || value.len() > 128
+        || value.chars().enumerate().any(|(index, character)| {
+            (!character.is_ascii_alphanumeric() && !matches!(character, '.' | '-' | '_'))
+                || (index == 0 && !character.is_ascii_alphanumeric() && character != '_')
+        })
+    {
+        bail!("OCI image tag is invalid: {value}");
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_digest(value: &str) -> Result<String> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        bail!("OCI image digest must use sha256");
+    };
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("OCI image digest is invalid: {value}");
+    }
+    Ok(format!("sha256:{hex}"))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_docker_hub_equivalents_and_rejects_trailing_paths() {
+        let shorthand = ImageReference::parse("debian:13").unwrap();
+        let explicit = ImageReference::parse("docker.io/debian:13").unwrap();
+        assert_eq!(shorthand.canonical(), explicit.canonical());
+        assert!(ImageReference::parse("ghcr.io/example/base/:latest").is_err());
+    }
+
+    #[test]
+    fn parses_explicit_registry_and_digest() {
+        let reference = ImageReference::parse(
+            "ghcr.io/KieranAndrewett/pbox-base@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        assert_eq!(reference.repository(), "ghcr.io/kieranandrewett/pbox-base");
+        assert!(reference.is_digest());
+        assert!(reference.canonical().contains("@sha256:"));
+    }
+
+    #[test]
+    fn identifies_only_explicit_oci_references() {
+        assert!(!is_oci_reference("debian-13"));
+        assert!(is_oci_reference("docker://debian-13"));
+        assert!(is_oci_reference("debian:13"));
+        assert!(is_oci_reference("ghcr.io/example/base"));
+    }
+
+    #[test]
+    fn parses_registry_port() {
+        let reference = ImageReference::parse("localhost:5000/pbox/base:dev").unwrap();
+        assert_eq!(reference.repository(), "localhost:5000/pbox/base");
+        assert_eq!(reference.canonical(), "localhost:5000/pbox/base:dev");
+    }
+
+    #[test]
+    fn rejects_invalid_tags_and_repositories() {
+        assert!(ImageReference::parse("debian: bad").is_err());
+        assert!(ImageReference::parse("ghcr.io/example//base").is_err());
+        assert!(ImageReference::parse("ghcr.io/example-/base:latest").is_err());
+        assert!(ImageReference::parse("ghcr.io/example/base:latest?x").is_err());
+        assert!(ImageReference::parse(
+            "ghcr.io/example/base:latest@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        )
+        .is_err());
+    }
+    #[test]
+    fn detects_existing_template_pull_errors() {
+        assert!(is_existing_oci_template_message(
+            "refusing to override existing file 'pbox.tar'"
+        ));
+        assert!(!is_existing_oci_template_message(
+            "manifest is not supported"
+        ));
+    }
+}

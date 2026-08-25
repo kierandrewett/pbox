@@ -1,5 +1,6 @@
 mod ansible;
 mod bootstrap;
+mod images;
 mod recipes;
 use ansible::{AnsibleRun, apply_recipe};
 use anyhow::{Context, Result, anyhow, bail};
@@ -9,6 +10,7 @@ use bootstrap::{
     cleanup_bootstrap_with_fallback, wait_for_agent,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use images::{is_oci_reference, prepare_oci_template, search_oci_repository};
 #[cfg(unix)]
 use nix::sys::signal::Signal;
 #[cfg(unix)]
@@ -88,6 +90,8 @@ enum Command {
     Setup(SetupCommand),
     /// Manage local pbox configuration.
     Config(ConfigCommand),
+    /// Manage OCI images through the PVE registry integration.
+    Image(ImageCommand),
     /// Create a pbox-managed LXC container.
     New(NewCommand),
     /// Resume an interrupted guest-agent bootstrap.
@@ -131,7 +135,7 @@ struct NewCommand {
     /// PVE node. Defaults to automatic selection from online nodes.
     #[arg(long)]
     node: Option<String>,
-    /// Image name to find in the configured PVE template storage.
+    /// PVE template alias or explicit OCI image reference.
     #[arg(long)]
     image: Option<String>,
     /// Raw PVE template volume override.
@@ -159,7 +163,52 @@ struct NewCommand {
     #[arg(long)]
     stopped: bool,
 }
+#[derive(Debug, Args)]
+struct ImageCommand {
+    #[command(subcommand)]
+    command: ImageSubcommand,
+}
 
+#[derive(Debug, Subcommand)]
+enum ImageSubcommand {
+    /// List tags from an OCI repository through PVE.
+    Search(ImageSearchCommand),
+    /// Pull a tagged OCI image into PVE template storage.
+    Pull(ImagePullCommand),
+}
+
+#[derive(Debug, Args)]
+struct ImageSearchCommand {
+    /// OCI repository or image reference, for example ghcr.io/example/base.
+    repository: String,
+    /// PVE node used for the registry request.
+    #[arg(long)]
+    node: Option<String>,
+    /// Maximum number of tags to print.
+    #[arg(long, default_value_t = 25)]
+    limit: usize,
+}
+
+#[derive(Debug, Args)]
+struct ImagePullCommand {
+    /// OCI image reference, for example ghcr.io/example/base:latest. Defaults to :latest.
+    reference: String,
+    /// PVE node used for the pull.
+    #[arg(long)]
+    node: Option<String>,
+    /// PVE storage for the downloaded template. Defaults to pve.template-storage.
+    #[arg(long)]
+    storage: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ImagePullOutput {
+    reference: String,
+    node: String,
+    storage: String,
+    volume: String,
+    downloaded: bool,
+}
 #[derive(Debug, Args)]
 struct SshCommand {
     /// Public pbox identifier.
@@ -423,6 +472,9 @@ fn run() -> Result<RunOutcome> {
         Command::Config(command) => {
             run_config(command.command, &store, cli.json).map(|_| RunOutcome::Success)
         }
+        Command::Image(command) => {
+            run_image(command.command, &store, cli.json, cli.color).map(|_| RunOutcome::Success)
+        }
         Command::Setup(command) => {
             run_setup(&store, command, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
@@ -531,6 +583,74 @@ fn run_config(command: ConfigSubcommand, store: &ConfigStore, json: bool) -> Res
                         .get_redacted(&key)
                         .unwrap_or_else(|| "<unset>".to_owned())
                 );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_image(
+    command: ImageSubcommand,
+    store: &ConfigStore,
+    json: bool,
+    color: ColorChoice,
+) -> Result<()> {
+    let config = load_config(store)?;
+    let client = client_from_config(&config)?;
+    match command {
+        ImageSubcommand::Search(command) => {
+            if command.limit == 0 {
+                bail!("--limit must be greater than zero");
+            }
+            let node = resolve_pve_node(&client, &config.pve.node, command.node.as_deref())?;
+            let result = search_oci_repository(&client, &node, &command.repository, command.limit)?;
+            if json {
+                print_value(&result, true, color)?;
+            } else {
+                println!("repository: {}", result.repository);
+                if result.tags.is_empty() {
+                    println!("tags:       <none>");
+                } else {
+                    println!("tags:");
+                    for tag in result.tags {
+                        println!("  {tag}");
+                    }
+                }
+            }
+        }
+        ImageSubcommand::Pull(command) => {
+            let node = resolve_pve_node(&client, &config.pve.node, command.node.as_deref())?;
+            let storages = client
+                .list_node_storages(&node)
+                .with_context(|| format!("discover PVE storage on node {node}"))?;
+            let configured_storage = command
+                .storage
+                .as_deref()
+                .unwrap_or(config.pve.template_storage.as_str());
+            let storage =
+                select_pve_storage(&storages, configured_storage, "vztmpl", "OCI templates")?
+                    .to_owned();
+            let prepared = prepare_oci_template(&client, &node, &storage, &command.reference)?;
+            let downloaded = prepared.task.is_some();
+            if let Some(task) = prepared.task {
+                wait_for_task(&client, &node, task)
+                    .with_context(|| format!("wait for OCI image {}", prepared.reference))?;
+            }
+            let output = ImagePullOutput {
+                reference: prepared.reference,
+                node,
+                storage,
+                volume: prepared.volume,
+                downloaded,
+            };
+            if json {
+                print_value(&output, true, color)?;
+            } else if output.downloaded {
+                println!("pulled {}", output.reference);
+                println!("volume: {}", output.volume);
+            } else {
+                println!("already present {}", output.reference);
+                println!("volume: {}", output.volume);
             }
         }
     }
@@ -708,6 +828,7 @@ fn setup_pve_error_message(error: &PveError) -> String {
         PveError::InvalidBaseUrl => "the PVE URL is invalid".to_owned(),
         PveError::InvalidPathSegment { .. } => "the PVE request path is invalid".to_owned(),
         PveError::InvalidSnapshotName { .. } => "the PVE snapshot name is invalid".to_owned(),
+        PveError::Unsupported(message) => format!("PVE does not support this operation: {message}"),
     }
 }
 
@@ -2555,6 +2676,9 @@ fn template_matches(content: &PveStorageContent, image: &str) -> bool {
     let filename = filename.to_ascii_lowercase();
     let stem = filename
         .strip_suffix(".tar.zst")
+        .or_else(|| filename.strip_suffix(".tar.gz"))
+        .or_else(|| filename.strip_suffix(".tar.xz"))
+        .or_else(|| filename.strip_suffix(".tar.bz2"))
         .or_else(|| filename.strip_suffix(".tar"))
         .unwrap_or(&filename);
     let versionless = stem.split('_').next().unwrap_or(stem);
@@ -2567,8 +2691,12 @@ fn template_matches(content: &PveStorageContent, image: &str) -> bool {
     canonical != versionless && (canonical == image || versionless == image)
 }
 
-fn resolve_new_node(client: &impl PveApi, config: &Config, command: &NewCommand) -> Result<String> {
-    let requested = command.node.as_deref().unwrap_or(config.pve.node.as_str());
+fn resolve_pve_node(
+    client: &impl PveApi,
+    configured: &str,
+    requested: Option<&str>,
+) -> Result<String> {
+    let requested = requested.unwrap_or(configured);
     if requested != "auto" {
         return non_empty_new_value("PVE node", requested);
     }
@@ -2582,13 +2710,73 @@ fn resolve_new_node(client: &impl PveApi, config: &Config, command: &NewCommand)
         .ok_or_else(|| anyhow!("no online PVE node found; pass --node or set pve.node"))
 }
 
+fn resolve_new_node(
+    client: &impl PveApi,
+    config: &Config,
+    command: &NewCommand,
+    prepared_ostemplate: Option<&str>,
+) -> Result<String> {
+    let requested = command.node.as_deref().unwrap_or(config.pve.node.as_str());
+    if requested != "auto" {
+        return non_empty_new_value("PVE node", requested);
+    }
+
+    let needs_rootfs_storage = command.rootfs.is_none();
+    let needs_template_storage = command.ostemplate.is_none() && prepared_ostemplate.is_none();
+    let mut nodes = client.list_nodes().context("discover PVE nodes")?;
+    nodes.retain(|node| node.status.as_deref() == Some("online"));
+    nodes.sort_by(|left, right| left.node.cmp(&right.node));
+    if !needs_rootfs_storage && !needs_template_storage {
+        return nodes
+            .first()
+            .map(|node| node.node.clone())
+            .ok_or_else(|| anyhow!("no online PVE node found; pass --node or set pve.node"));
+    }
+    for node in nodes {
+        let storages = client
+            .list_node_storages(&node.node)
+            .with_context(|| format!("discover PVE storage on node {}", node.node))?;
+        let rootfs_available = !needs_rootfs_storage
+            || storage_matches_requirement(&storages, &config.pve.storage, "rootdir");
+        let template_available = !needs_template_storage
+            || storage_matches_requirement(&storages, &config.pve.template_storage, "vztmpl");
+        if rootfs_available && template_available {
+            return Ok(node.node);
+        }
+    }
+    bail!(
+        "no online PVE node has the configured storage for this box; pass --node or adjust pve.storage and pve.template-storage"
+    );
+}
+
+fn storage_matches_requirement(storages: &[PveStorage], configured: &str, content: &str) -> bool {
+    storages.iter().any(|storage| {
+        (configured == "auto" || storage.storage == configured)
+            && storage_supports(storage, content)
+    })
+}
+#[cfg(test)]
 fn resolve_new_command(
     client: &impl PveApi,
     config: &Config,
     command: &NewCommand,
 ) -> Result<ResolvedNew> {
-    let node = resolve_new_node(client, config, command)?;
-    let needs_storages = command.rootfs.is_none() || command.ostemplate.is_none();
+    resolve_new_command_with_template(client, config, command, None, None)
+}
+
+fn resolve_new_command_with_template(
+    client: &impl PveApi,
+    config: &Config,
+    command: &NewCommand,
+    prepared_ostemplate: Option<&str>,
+    prepared_node: Option<&str>,
+) -> Result<ResolvedNew> {
+    let node = match prepared_node {
+        Some(node) => non_empty_new_value("PVE node", node)?,
+        None => resolve_new_node(client, config, command, prepared_ostemplate)?,
+    };
+    let needs_storages =
+        command.rootfs.is_none() || (command.ostemplate.is_none() && prepared_ostemplate.is_none());
     let storages = if needs_storages {
         Some(
             client
@@ -2610,9 +2798,10 @@ fn resolve_new_command(
         }
     };
 
-    let ostemplate = match command.ostemplate.as_deref() {
-        Some(ostemplate) => new_volume_override("--ostemplate", ostemplate)?,
-        None => {
+    let ostemplate = match (command.ostemplate.as_deref(), prepared_ostemplate) {
+        (Some(ostemplate), _) => new_volume_override("--ostemplate", ostemplate)?,
+        (None, Some(ostemplate)) => ostemplate.to_owned(),
+        (None, None) => {
             let image = non_empty_new_value(
                 "--image",
                 command
@@ -2761,7 +2950,41 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         ));
     }
     let client = client_from_config(&config)?;
-    let resolved = resolve_new_command(&client, &config, &command)?;
+    let (prepared_node, prepared_ostemplate) = if command.ostemplate.is_none() {
+        let image = command
+            .image
+            .as_deref()
+            .unwrap_or(config.images.default.as_str());
+        if is_oci_reference(image) {
+            let node = resolve_new_node(&client, &config, &command, None)?;
+            let storages = client
+                .list_node_storages(&node)
+                .with_context(|| format!("discover PVE storage on node {node}"))?;
+            let storage = select_pve_storage(
+                &storages,
+                &config.pve.template_storage,
+                "vztmpl",
+                "OCI templates",
+            )?;
+            let prepared = prepare_oci_template(&client, &node, storage, image)?;
+            if let Some(task) = prepared.task {
+                wait_for_task(&client, &node, task)
+                    .with_context(|| format!("wait for OCI image {}", prepared.reference))?;
+            }
+            (Some(node), Some(prepared.volume))
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+    let resolved = resolve_new_command_with_template(
+        &client,
+        &config,
+        &command,
+        prepared_ostemplate.as_deref(),
+        prepared_node.as_deref(),
+    )?;
     let existing = discover_boxes(&client)?;
     let id = generate_unique_id(&existing)?;
     let id_text = id.to_string();
@@ -3885,6 +4108,7 @@ mod tests {
         created: RefCell<Vec<(String, u64, LxcCreateRequest)>>,
         create_conflicts: RefCell<usize>,
         events: RefCell<Vec<String>>,
+        oci_tags: RefCell<Vec<String>>,
         fail_next_task: RefCell<bool>,
         fail_create: RefCell<bool>,
         fail_updates: RefCell<bool>,
@@ -3928,6 +4152,7 @@ mod tests {
                 created: RefCell::new(Vec::new()),
                 create_conflicts: RefCell::new(0),
                 events: RefCell::new(Vec::new()),
+                oci_tags: RefCell::new(Vec::new()),
                 fail_create: RefCell::new(false),
                 fail_next_task: RefCell::new(false),
                 fail_updates: RefCell::new(false),
@@ -3978,6 +4203,26 @@ mod tests {
             _content: &str,
         ) -> Result<Vec<pbox_core::PveStorageContent>, PveError> {
             Ok(self.storage_content.borrow().clone())
+        }
+
+        fn list_oci_repo_tags(&self, node: &str, reference: &str) -> Result<Vec<String>, PveError> {
+            self.events
+                .borrow_mut()
+                .push(format!("oci-tags:{node}:{reference}"));
+            Ok(self.oci_tags.borrow().clone())
+        }
+
+        fn pull_oci_registry(
+            &self,
+            node: &str,
+            storage: &str,
+            reference: &str,
+            filename: &str,
+        ) -> Result<PveTaskResponse, PveError> {
+            self.events
+                .borrow_mut()
+                .push(format!("oci-pull:{node}:{storage}:{reference}:{filename}"));
+            Ok(Self::task("oci-pull"))
         }
 
         fn get_lxc_config(&self, _node: &str, _vmid: u64) -> Result<LxcConfig, PveError> {
@@ -4217,6 +4462,47 @@ mod tests {
         assert_eq!(resolved.cores, 2);
         assert!(resolved.unprivileged);
     }
+    #[test]
+    fn new_resolution_rejects_nodes_without_required_storage() {
+        let metadata = PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007);
+        let fake = FakePve::new(&metadata, "user note");
+        fake.storages.borrow_mut()[0].content = Some("rootdir".to_owned());
+        let error = resolve_new_command(
+            &fake,
+            &Config::default(),
+            &NewCommand {
+                node: None,
+                image: None,
+                ostemplate: None,
+                rootfs: None,
+                net0: None,
+                name: None,
+                memory: None,
+                swap: None,
+                cores: None,
+                stopped: false,
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no online PVE node has the configured storage")
+        );
+    }
+    #[test]
+    fn template_matching_accepts_all_pve_template_compressions() {
+        let metadata = PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007);
+        let fake = FakePve::new(&metadata, "user note");
+        let mut content = fake.storage_content.borrow()[0].clone();
+
+        for extension in ["tar", "tar.gz", "tar.xz", "tar.zst", "tar.bz2"] {
+            content.volid = format!("local:vztmpl/debian-13-standard_13.0-1_amd64.{extension}");
+            assert!(template_matches(&content, "debian-13"));
+        }
+    }
+
     #[test]
     fn template_matching_requires_an_exact_pve_image_alias() {
         let metadata = PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007);
@@ -5041,5 +5327,144 @@ mod tests {
 
         assert_eq!(message, "the PVE URL is invalid");
         assert!(!message.contains("secret"));
+    }
+    #[test]
+    fn image_commands_parse_with_expected_defaults() {
+        let cli = Cli::try_parse_from([
+            "pbox",
+            "image",
+            "search",
+            "ghcr.io/example/base",
+            "--limit",
+            "10",
+        ])
+        .unwrap();
+        let Command::Image(command) = cli.command else {
+            panic!("expected image command");
+        };
+        let super::ImageSubcommand::Search(command) = command.command else {
+            panic!("expected image search command");
+        };
+        assert_eq!(command.repository, "ghcr.io/example/base");
+        assert_eq!(command.limit, 10);
+        assert!(command.node.is_none());
+
+        let cli = Cli::try_parse_from(["pbox", "image", "pull", "ghcr.io/example/base"]).unwrap();
+        let Command::Image(command) = cli.command else {
+            panic!("expected image command");
+        };
+        let super::ImageSubcommand::Pull(command) = command.command else {
+            panic!("expected image pull command");
+        };
+        assert_eq!(command.reference, "ghcr.io/example/base");
+        assert!(command.storage.is_none());
+    }
+
+    #[test]
+    fn oci_search_sorts_deduplicates_and_limits_tags() {
+        let fake = FakePve::new(
+            &PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007),
+            "user note",
+        );
+        *fake.oci_tags.borrow_mut() = vec![
+            "z".to_owned(),
+            "a".to_owned(),
+            "z".to_owned(),
+            "m".to_owned(),
+        ];
+        let result =
+            super::search_oci_repository(&fake, "pve01", "ghcr.io/example/base", 2).unwrap();
+
+        assert_eq!(result.repository, "ghcr.io/example/base");
+        assert_eq!(result.tags, ["a", "m"]);
+        assert_eq!(
+            fake.events.borrow().as_slice(),
+            ["oci-tags:pve01:ghcr.io/example/base"]
+        );
+    }
+
+    #[test]
+    fn oci_template_pull_is_idempotent_and_rejects_digests() {
+        let fake = FakePve::new(
+            &PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007),
+            "user note",
+        );
+        let first =
+            super::prepare_oci_template(&fake, "pve01", "local", "ghcr.io/example/base:latest")
+                .unwrap();
+        assert!(first.task.is_some());
+        assert_eq!(first.volume, format!("local:vztmpl/{}.tar", first.filename));
+        assert!(fake
+            .events
+            .borrow()
+            .iter()
+            .any(|event| event.starts_with("oci-pull:pve01:local:ghcr.io/example/base:latest:")));
+
+        fake.storage_content.borrow_mut().push(PveStorageContent {
+            volid: first.volume.clone(),
+            content: Some("vztmpl".to_owned()),
+            format: Some("tar".to_owned()),
+            is_base: None,
+            extra: serde_json::Map::new(),
+        });
+        let second =
+            super::prepare_oci_template(&fake, "pve01", "local", "ghcr.io/example/base:latest")
+                .unwrap();
+        assert!(second.task.is_none());
+        assert_eq!(second.volume, first.volume);
+
+        let error = super::prepare_oci_template(
+            &fake,
+            "pve01",
+            "local",
+            "ghcr.io/example/base@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires a tagged image reference")
+        );
+    }
+
+    #[test]
+    fn prepared_template_is_preserved_and_explicit_template_wins() {
+        let fake = FakePve::new(
+            &PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007),
+            "user note",
+        );
+        let command = NewCommand {
+            node: Some("pve01".to_owned()),
+            image: Some("ghcr.io/example/base:latest".to_owned()),
+            ostemplate: None,
+            rootfs: Some("local:8G".to_owned()),
+            net0: None,
+            name: None,
+            memory: None,
+            swap: None,
+            cores: None,
+            stopped: false,
+        };
+        let resolved = super::resolve_new_command_with_template(
+            &fake,
+            &Config::default(),
+            &command,
+            Some("local:vztmpl/pbox-oci.tar"),
+            Some("pve01"),
+        )
+        .unwrap();
+        assert_eq!(resolved.ostemplate, "local:vztmpl/pbox-oci.tar");
+
+        let mut explicit = command;
+        explicit.ostemplate = Some("local:vztmpl/custom.tar".to_owned());
+        let resolved = super::resolve_new_command_with_template(
+            &fake,
+            &Config::default(),
+            &explicit,
+            Some("local:vztmpl/pbox-oci.tar"),
+            Some("pve01"),
+        )
+        .unwrap();
+        assert_eq!(resolved.ostemplate, "local:vztmpl/custom.tar");
     }
 }
