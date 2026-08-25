@@ -4,7 +4,9 @@ use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::fs::File;
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
 const API_PREFIX: &str = "/api2/json";
@@ -39,6 +41,20 @@ pub trait PveApi {
         let _ = (node, storage, reference, filename);
         Err(PveError::Unsupported(
             "this PVE client does not support OCI registry pulls".to_owned(),
+        ))
+    }
+
+    /// Upload a compressed LXC template archive to PVE storage.
+    fn upload_storage_template(
+        &self,
+        node: &str,
+        storage: &str,
+        filename: &str,
+        path: &Path,
+    ) -> Result<PveTaskResponse, PveError> {
+        let _ = (node, storage, filename, path);
+        Err(PveError::Unsupported(
+            "this PVE client does not support storage template uploads".to_owned(),
         ))
     }
     fn get_lxc_config(&self, node: &str, vmid: u64) -> Result<LxcConfig, PveError>;
@@ -277,6 +293,32 @@ impl PveApi for PveClient {
             &format!("/nodes/{node}/storage/{storage}/oci-registry-pull"),
             &form,
         )
+    }
+
+    fn upload_storage_template(
+        &self,
+        node: &str,
+        storage: &str,
+        filename: &str,
+        path: &Path,
+    ) -> Result<PveTaskResponse, PveError> {
+        validate_path_segment(node, "node")?;
+        validate_path_segment(storage, "storage")?;
+        validate_path_segment(filename, "filename")?;
+        let file = File::open(path).map_err(PveError::UploadFile)?;
+        let part = reqwest::blocking::multipart::Part::reader(file).file_name(filename.to_owned());
+        let form = reqwest::blocking::multipart::Form::new()
+            .text("content", "vztmpl")
+            .part("filename", part);
+        let response = self
+            .request(
+                Method::POST,
+                &format!("/nodes/{node}/storage/{storage}/upload"),
+            )
+            .multipart(form)
+            .send()
+            .map_err(PveError::Request)?;
+        decode_task_response(response)
     }
 
     fn create_lxc(
@@ -745,6 +787,8 @@ pub enum PveError {
     Client(#[source] reqwest::Error),
     #[error("could not reach PVE API: {0}")]
     Request(#[source] reqwest::Error),
+    #[error("could not read PVE upload file: {0}")]
+    UploadFile(#[source] std::io::Error),
     #[error("invalid PVE API response: {0}")]
     Decode(#[source] serde_json::Error),
     #[error("PVE API returned HTTP {status}: {message}")]

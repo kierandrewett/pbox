@@ -839,6 +839,7 @@ fn setup_pve_error_message(error: &PveError) -> String {
     match error {
         PveError::Client(_) => "could not build the PVE HTTP client".to_owned(),
         PveError::Request(_) => "could not reach the PVE API".to_owned(),
+        PveError::UploadFile(_) => "could not read the PVE upload file".to_owned(),
         PveError::Decode(_) => "PVE returned an invalid response".to_owned(),
         PveError::Http { status, .. } => format!("PVE returned HTTP status {status}"),
         PveError::InvalidBaseUrl => "the PVE URL is invalid".to_owned(),
