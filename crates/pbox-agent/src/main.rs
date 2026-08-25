@@ -9,8 +9,12 @@ use pbox_proto::agent::{
     GetFileRequest, InfoRequest, InfoResponse, PingRequest, PingResponse, exec_event,
     forward_event,
 };
+use rustls::RootCertStore;
+use rustls::server::WebPkiClientVerifier;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
-use std::net::IpAddr;
+use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -20,18 +24,23 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
-use tokio::sync::{Notify, Semaphore, mpsc};
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
+use tokio_stream::{Stream, wrappers::ReceiverStream};
+use tonic::transport::Server;
+use tonic::transport::server::{Connected, TcpConnectInfo};
 use tonic::{Request, Response, Status, Streaming};
 const MAX_FILE_SIZE: u64 = 64 * 1024 * 1024;
 const FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const FILE_STREAM_POST_EOF_TIMEOUT: Duration = Duration::from_millis(10);
 const FORWARD_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const FORWARD_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const EXEC_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -66,6 +75,159 @@ struct Args {
     max_file: usize,
     #[arg(long, default_value_t = 64)]
     max_handshakes: usize,
+}
+type TlsHandshake =
+    Pin<Box<dyn Future<Output = Result<TlsStream<LimitedTcpStream>, io::Error>> + Send>>;
+
+struct LimitedIncoming {
+    listener: TcpListener,
+    permits: Arc<Semaphore>,
+    tls_config: Arc<rustls::ServerConfig>,
+    acquire: Option<
+        Pin<
+            Box<
+                dyn Future<Output = Result<OwnedSemaphorePermit, tokio::sync::AcquireError>> + Send,
+            >,
+        >,
+    >,
+    permit: Option<OwnedSemaphorePermit>,
+    handshake: Option<TlsHandshake>,
+}
+
+impl LimitedIncoming {
+    fn new(
+        listener: TcpListener,
+        permits: Arc<Semaphore>,
+        tls_config: Arc<rustls::ServerConfig>,
+    ) -> Self {
+        Self {
+            listener,
+            permits,
+            tls_config,
+            acquire: None,
+            permit: None,
+            handshake: None,
+        }
+    }
+}
+
+fn poll_tls_handshake(
+    incoming: &mut LimitedIncoming,
+    context: &mut TaskContext<'_>,
+) -> Poll<Option<Result<TlsStream<LimitedTcpStream>, io::Error>>> {
+    match incoming
+        .handshake
+        .as_mut()
+        .expect("TLS handshake future exists")
+        .as_mut()
+        .poll(context)
+    {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(result) => {
+            incoming.handshake = None;
+            Poll::Ready(Some(result))
+        }
+    }
+}
+
+impl Stream for LimitedIncoming {
+    type Item = Result<TlsStream<LimitedTcpStream>, io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.handshake.is_some() {
+            return poll_tls_handshake(this, context);
+        }
+        if this.permit.is_none() {
+            if this.acquire.is_none() {
+                this.acquire = Some(Box::pin(this.permits.clone().acquire_owned()));
+            }
+            match this
+                .acquire
+                .as_mut()
+                .expect("acquire future exists")
+                .as_mut()
+                .poll(context)
+            {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(permit)) => {
+                    this.acquire = None;
+                    this.permit = Some(permit);
+                }
+                Poll::Ready(Err(_)) => return Poll::Ready(None),
+            }
+        }
+        match this.listener.poll_accept(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok((stream, _))) => {
+                let limited_stream = LimitedTcpStream {
+                    inner: stream,
+                    _permit: this.permit.take().expect("connection permit exists"),
+                };
+                let acceptor = TlsAcceptor::from(this.tls_config.clone());
+                this.handshake = Some(Box::pin(async move {
+                    tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(limited_stream))
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out")
+                        })?
+                        .map_err(io::Error::other)
+                }));
+                poll_tls_handshake(this, context)
+            }
+            Poll::Ready(Err(error)) => {
+                this.permit = None;
+                Poll::Ready(Some(Err(error)))
+            }
+        }
+    }
+}
+
+struct LimitedTcpStream {
+    inner: TcpStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsyncRead for LimitedTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for LimitedTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
+impl Connected for LimitedTcpStream {
+    type ConnectInfo = TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        TcpConnectInfo {
+            local_addr: self.inner.local_addr().ok(),
+            remote_addr: self.inner.peer_addr().ok(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -846,9 +1008,9 @@ async fn receive_upload(
         write_chunk(&mut file, &chunk, &mut size, &mut hasher).await?;
         complete = chunk.eof;
     }
-    if tokio::time::timeout(FILE_STREAM_IDLE_TIMEOUT, stream.message())
+    if tokio::time::timeout(FILE_STREAM_POST_EOF_TIMEOUT, stream.message())
         .await
-        .map_err(|_| Status::deadline_exceeded("file stream idle timeout"))??
+        .map_err(|_| Status::deadline_exceeded("file stream post-EOF check timed out"))??
         .is_some()
     {
         return Err(Status::invalid_argument(
@@ -1071,6 +1233,47 @@ fn hex_digest(digest: impl AsRef<[u8]>) -> String {
 fn internal_io(error: std::io::Error) -> Status {
     Status::internal(error.to_string())
 }
+fn build_server_tls_config(
+    certificate_pem: &str,
+    private_key_pem: &str,
+    client_ca_pem: &str,
+) -> Result<Arc<rustls::ServerConfig>> {
+    let certificate = pem::parse(certificate_pem).context("parse server certificate PEM")?;
+    if certificate.tag() != "CERTIFICATE" {
+        anyhow::bail!("server certificate PEM has an unexpected tag");
+    }
+    let private_key = pem::parse(private_key_pem).context("parse server private key PEM")?;
+    if private_key.tag() != "PRIVATE KEY" {
+        anyhow::bail!("server private key PEM has an unexpected tag");
+    }
+    let mut roots = RootCertStore::empty();
+    for certificate in pem::parse_many(client_ca_pem).context("parse client CA PEM")? {
+        if certificate.tag() != "CERTIFICATE" {
+            continue;
+        }
+        roots
+            .add(CertificateDer::from(certificate.contents().to_vec()))
+            .context("add client CA certificate")?;
+    }
+    if roots.is_empty() {
+        anyhow::bail!("client CA PEM contains no certificates");
+    }
+    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .context("build client certificate verifier")?;
+    let private_key =
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key.contents().to_vec()));
+    let mut config =
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![CertificateDer::from(certificate.contents().to_vec())],
+                private_key,
+            )
+            .context("build server TLS configuration")?;
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(Arc::new(config))
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1103,23 +1306,25 @@ async fn main() -> Result<()> {
     let client_ca = tokio::fs::read_to_string(&args.client_ca)
         .await
         .with_context(|| format!("read client CA {}", args.client_ca.display()))?;
-    let identity = Identity::from_pem(certificate, private_key);
-    let tls = ServerTlsConfig::new()
-        .identity(identity)
-        // The context CA is the authorization boundary shared by all boxes.
-        // Every client that can derive it from the dedicated PVE token can
-        // control the corresponding pbox estate.
-        .client_ca_root(Certificate::from_pem(client_ca))
-        .timeout(HANDSHAKE_TIMEOUT);
+    let tls = build_server_tls_config(&certificate, &private_key, &client_ca)?;
     let exec_slots = Arc::new(Semaphore::new(args.max_exec));
     let file_slots = Arc::new(Semaphore::new(args.max_file));
     let handshake_slots = Arc::new(Semaphore::new(args.max_handshakes));
     let forward_slots = Arc::new(Semaphore::new(args.max_forward));
-    let address = args.listen.parse().context("parse agent listen address")?;
+    let connection_slots = Arc::new(Semaphore::new(
+        args.max_handshakes
+            .saturating_add(args.max_exec)
+            .saturating_add(args.max_file)
+            .saturating_add(args.max_forward)
+            .max(1),
+    ));
+    let address: SocketAddr = args.listen.parse().context("parse agent listen address")?;
+    let listener = TcpListener::bind(address)
+        .await
+        .context("bind agent listen address")?;
+    let incoming = LimitedIncoming::new(listener, connection_slots, tls);
     println!("pbox-agent listening on {}", args.listen);
     Server::builder()
-        .tls_config(tls)
-        .context("configure agent TLS")?
         .add_service(AgentServer::new(AgentService {
             box_id: args.box_id,
             handshake_slots,
@@ -1128,7 +1333,7 @@ async fn main() -> Result<()> {
             forward_allow: args.forward_allow,
             exec_slots,
         }))
-        .serve(address)
+        .serve_with_incoming(incoming)
         .await
         .context("run pbox-agent server")?;
     Ok(())
@@ -1142,7 +1347,6 @@ mod tests {
         server_subject,
     };
     use tokio::net::TcpListener;
-    use tokio_stream::wrappers::TcpListenerStream;
 
     async fn spawn_test_agent(
         box_id: &str,
@@ -1159,17 +1363,15 @@ mod tests {
             forward_allow: vec!["127.0.0.0/8".parse().unwrap()],
             exec_slots: Arc::new(Semaphore::new(4)),
         };
-        let tls = ServerTlsConfig::new()
-            .identity(Identity::from_pem(
-                server_certificate.certificate_pem,
-                server_certificate.private_key_pem,
-            ))
-            .client_ca_root(Certificate::from_pem(client_ca.certificate_pem.clone()));
-        let incoming = TcpListenerStream::new(listener);
+        let tls = build_server_tls_config(
+            &server_certificate.certificate_pem,
+            &server_certificate.private_key_pem,
+            &client_ca.certificate_pem,
+        )
+        .unwrap();
+        let incoming = LimitedIncoming::new(listener, Arc::new(Semaphore::new(16)), tls);
         let task = tokio::spawn(async move {
             Server::builder()
-                .tls_config(tls)
-                .unwrap()
                 .add_service(AgentServer::new(service))
                 .serve_with_incoming(incoming)
                 .await

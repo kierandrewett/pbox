@@ -1125,8 +1125,12 @@ dependencies = [
  "pbox-agent-client",
  "pbox-crypto",
  "pbox-proto",
+ "pem",
+ "rustls",
+ "rustls-pki-types",
  "sha2",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tonic",
 ]
@@ -1135,10 +1139,15 @@ dependencies = [
 name = "pbox-agent-client"
 version = "0.1.0"
 dependencies = [
+ "hyper-util",
  "pbox-crypto",
  "pbox-proto",
+ "pem",
+ "rustls",
+ "rustls-pki-types",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tonic",
 ]
@@ -1151,6 +1160,7 @@ dependencies = [
  "base64",
  "clap",
  "dirs",
+ "nix",
  "pbox-agent-client",
  "pbox-core",
  "pbox-crypto",

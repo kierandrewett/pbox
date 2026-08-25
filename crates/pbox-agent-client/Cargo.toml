@@ -10,5 +10,10 @@ thiserror.workspace = true
 pbox-crypto = { path = "../pbox-crypto" }
 pbox-proto = { path = "../pbox-proto" }
 tonic.workspace = true
+rustls.workspace = true
+pem.workspace = true
+hyper-util.workspace = true
+rustls-pki-types.workspace = true
+tokio-rustls.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
