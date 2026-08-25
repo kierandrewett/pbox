@@ -1,10 +1,9 @@
 use crate::Secret;
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::{Method, StatusCode};
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::de::{DeserializeOwned, Deserializer, Error as DeError};
+use serde::{Deserialize, Serialize, Serializer};
 use std::fmt;
-use std::fs::File;
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::time::Duration;
@@ -228,7 +227,9 @@ impl PveApi for PveClient {
 
     fn list_lxc_interfaces(&self, node: &str, vmid: u64) -> Result<Vec<LxcInterface>, PveError> {
         validate_path_segment(node, "node")?;
-        self.get(&format!("/nodes/{node}/lxc/{vmid}/interfaces"))
+        let interfaces: Option<Vec<LxcInterface>> =
+            self.get(&format!("/nodes/{node}/lxc/{vmid}/interfaces"))?;
+        Ok(interfaces.unwrap_or_default())
     }
 
     fn list_lxc_snapshots(&self, node: &str, vmid: u64) -> Result<Vec<LxcSnapshot>, PveError> {
@@ -305,11 +306,10 @@ impl PveApi for PveClient {
         validate_path_segment(node, "node")?;
         validate_path_segment(storage, "storage")?;
         validate_path_segment(filename, "filename")?;
-        let file = File::open(path).map_err(PveError::UploadFile)?;
-        let part = reqwest::blocking::multipart::Part::reader(file).file_name(filename.to_owned());
         let form = reqwest::blocking::multipart::Form::new()
             .text("content", "vztmpl")
-            .part("filename", part);
+            .file("filename", path)
+            .map_err(PveError::UploadFile)?;
         let response = self
             .request(
                 Method::POST,
@@ -583,6 +583,47 @@ pub struct ClusterResource {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+fn serialize_optional_bool_as_int<S>(value: &Option<bool>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        Some(value) => serializer.serialize_some(&u8::from(*value)),
+        None => serializer.serialize_none(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PveBoolValue {
+    Bool(bool),
+    Integer(u64),
+    Text(String),
+}
+
+fn deserialize_optional_bool_from_pve<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<PveBoolValue>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(PveBoolValue::Bool(value)) => Ok(Some(value)),
+        Some(PveBoolValue::Integer(0)) => Ok(Some(false)),
+        Some(PveBoolValue::Integer(1)) => Ok(Some(true)),
+        Some(PveBoolValue::Integer(value)) => Err(D::Error::custom(format!(
+            "PVE boolean integer must be 0 or 1, got {value}"
+        ))),
+        Some(PveBoolValue::Text(value)) => match value.as_str() {
+            "0" | "false" => Ok(Some(false)),
+            "1" | "true" => Ok(Some(true)),
+            _ => Err(D::Error::custom(format!(
+                "invalid PVE boolean value: {value}"
+            ))),
+        },
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct LxcCreateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -599,15 +640,24 @@ pub struct LxcCreateRequest {
     pub rootfs: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub net0: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_bool_as_int"
+    )]
     pub unprivileged: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_bool_as_int"
+    )]
     pub onboot: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(rename = "ssh-public-keys", skip_serializing_if = "Option::is_none")]
     pub ssh_public_keys: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_bool_as_int"
+    )]
     pub start: Option<bool>,
 }
 
@@ -627,7 +677,10 @@ pub struct LxcConfigUpdateRequest {
     pub rootfs: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub net0: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_bool_as_int"
+    )]
     pub unprivileged: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -682,6 +735,7 @@ pub struct LxcConfig {
     pub memory: Option<u64>,
     pub swap: Option<u64>,
     pub rootfs: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_bool_from_pve")]
     pub unprivileged: Option<bool>,
     pub net0: Option<String>,
     #[serde(flatten)]
@@ -768,7 +822,11 @@ pub struct PveTaskStatus {
 
 impl PveTaskStatus {
     pub fn is_successful(&self) -> bool {
-        self.status == "stopped" && self.exitstatus.as_deref() == Some("OK")
+        self.status == "stopped"
+            && self
+                .exitstatus
+                .as_deref()
+                .is_some_and(|status| status == "OK" || status.starts_with("WARNINGS:"))
     }
 }
 
@@ -929,6 +987,16 @@ mod tests {
     }
 
     #[test]
+    fn lxc_config_accepts_pve_integer_booleans() {
+        let enabled: LxcConfig = serde_json::from_str(r#"{"unprivileged":1}"#).unwrap();
+        let disabled: LxcConfig = serde_json::from_str(r#"{"unprivileged":0}"#).unwrap();
+        let boolean: LxcConfig = serde_json::from_str(r#"{"unprivileged":true}"#).unwrap();
+
+        assert_eq!(enabled.unprivileged, Some(true));
+        assert_eq!(disabled.unprivileged, Some(false));
+        assert_eq!(boolean.unprivileged, Some(true));
+    }
+    #[test]
     fn task_status_maps_type_and_success() {
         let status: PveTaskStatus =
             serde_json::from_str(r#"{"status":"stopped","exitstatus":"OK","type":"vzcreate"}"#)
@@ -952,6 +1020,20 @@ mod tests {
     }
 
     #[test]
+    fn task_status_warnings_are_successful() {
+        let status = PveTaskStatus {
+            status: "stopped".to_owned(),
+            exitstatus: Some("WARNINGS: 1".to_owned()),
+            upid: None,
+            node: None,
+            pid: None,
+            starttime: None,
+            type_: None,
+        };
+        assert!(status.is_successful());
+    }
+
+    #[test]
     fn lifecycle_requests_serialize_only_set_values() {
         let request = LxcCreateRequest {
             ostemplate: Some("local:vztmpl/debian-12.tar.zst".to_owned()),
@@ -972,8 +1054,8 @@ mod tests {
         assert_eq!(value["memory"], 1024);
         assert_eq!(value["net0"], "name=eth0,bridge=vmbr0");
         assert_eq!(value["ssh-public-keys"], "ssh-ed25519 AAAA bootstrap");
-        assert_eq!(value["onboot"], true);
-        assert_eq!(value["start"], true);
+        assert_eq!(value["onboot"], 1);
+        assert_eq!(value["start"], 1);
         assert!(value.get("hostname").is_none());
 
         let update = LxcConfigUpdateRequest {

@@ -2639,6 +2639,45 @@ fn new_volume_override(label: &str, value: &str) -> Result<String> {
     Ok(value)
 }
 
+fn normalise_rootfs_size(value: &str) -> String {
+    let value = value.trim();
+    let Some(size) = value.strip_suffix('G') else {
+        return value.to_owned();
+    };
+    if !size.is_empty()
+        && size
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.')
+        && size.parse::<f64>().is_ok()
+    {
+        size.to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
+fn new_rootfs_override(value: &str) -> Result<String> {
+    let value = new_volume_override("--rootfs", value)?;
+    let (storage, size) = value
+        .split_once(':')
+        .ok_or_else(|| anyhow!("--rootfs must use STORAGE:VALUE syntax"))?;
+    Ok(format!("{storage}:{}", normalise_rootfs_size(size)))
+}
+
+fn rootfs_size_for_storage(storages: &[PveStorage], storage: &str, configured: &str) -> String {
+    let is_directory = storages
+        .iter()
+        .find(|candidate| candidate.storage == storage)
+        .and_then(|candidate| candidate.extra.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("dir");
+    if is_directory {
+        "0".to_owned()
+    } else {
+        normalise_rootfs_size(configured)
+    }
+}
+
 fn storage_supports(storage: &PveStorage, content: &str) -> bool {
     storage.active == Some(1)
         && storage.enabled == Some(1)
@@ -2856,13 +2895,16 @@ fn resolve_new_command_with_template(
     };
 
     let rootfs = match command.rootfs.as_deref() {
-        Some(rootfs) => new_volume_override("--rootfs", rootfs)?,
+        Some(rootfs) => new_rootfs_override(rootfs)?,
         None => {
             let storages = storages
                 .as_deref()
                 .ok_or_else(|| anyhow!("internal error: rootfs storage discovery was skipped"))?;
             let storage = select_pve_storage(storages, &config.pve.storage, "rootdir", "rootfs")?;
-            format!("{storage}:{}", config.pve.defaults.disk)
+            format!(
+                "{storage}:{}",
+                rootfs_size_for_storage(storages, storage, &config.pve.defaults.disk)
+            )
         }
     };
 
@@ -4563,12 +4605,41 @@ mod tests {
             resolved.ostemplate,
             "local:vztmpl/debian-13-standard_13.0-1_amd64.tar.zst"
         );
-        assert_eq!(resolved.rootfs, "local:8G");
+        assert_eq!(resolved.rootfs, "local:8");
         assert_eq!(resolved.net0, "name=eth0,bridge=vmbr0,ip=dhcp");
         assert_eq!(resolved.memory, 1024);
         assert_eq!(resolved.swap, 256);
         assert_eq!(resolved.cores, 2);
         assert!(resolved.unprivileged);
+    }
+
+    #[test]
+    fn directory_storage_uses_zero_rootfs_size() {
+        let metadata = PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007);
+        let fake = FakePve::new(&metadata, "user note");
+        fake.storages.borrow_mut()[0]
+            .extra
+            .insert("type".to_owned(), serde_json::json!("dir"));
+
+        let resolved = resolve_new_command(
+            &fake,
+            &Config::default(),
+            &NewCommand {
+                node: None,
+                image: None,
+                ostemplate: None,
+                rootfs: None,
+                net0: None,
+                name: None,
+                memory: None,
+                swap: None,
+                cores: None,
+                stopped: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved.rootfs, "local:0");
     }
     #[test]
     fn image_pull_node_selection_requires_template_storage() {
@@ -4739,7 +4810,7 @@ mod tests {
 
         assert_eq!(resolved.node, "pve01");
         assert_eq!(resolved.ostemplate, "local:vztmpl/custom.tar.zst");
-        assert_eq!(resolved.rootfs, "local-zfs:16G");
+        assert_eq!(resolved.rootfs, "local-zfs:16");
         assert_eq!(resolved.net0, "name=eth0,bridge=vmbr9");
         assert_eq!(resolved.name.as_deref(), Some("custom-name"));
         assert_eq!(resolved.memory, 2048);
