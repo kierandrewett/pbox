@@ -31,11 +31,15 @@ use std::net::Ipv4Addr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 const PVE_TASK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MAX_FORWARD_CONNECTIONS: usize = 64;
 const PVE_TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_FILE_TRANSFER_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -80,6 +84,8 @@ enum Command {
     Exec(ExecCommand),
     /// Copy files between the control machine and a pbox.
     Scp(ScpCommand),
+    /// Forward a local TCP port to a pbox guest.
+    Forward(ForwardCommand),
     /// Discover and apply Ansible recipes.
     Recipe(RecipeCommand),
     /// List pbox-managed containers discovered from PVE metadata.
@@ -162,6 +168,26 @@ struct ScpCommand {
     /// Local or remote destination path.
     destination: String,
 }
+#[derive(Debug, Args)]
+struct ForwardCommand {
+    /// Public pbox identifier.
+    id: String,
+    /// Local TCP port to listen on.
+    local_port: u16,
+    /// Local address to bind. Defaults to loopback.
+    #[arg(long, default_value = "127.0.0.1")]
+    listen: String,
+    /// Agent endpoint override. By default pbox resolves the guest address from PVE.
+    #[arg(long)]
+    endpoint: Option<String>,
+    /// Guest TCP host. Defaults to 127.0.0.1.
+    #[arg(long, default_value = "127.0.0.1")]
+    remote_host: String,
+    /// Guest TCP port. Defaults to the local port.
+    #[arg(long)]
+    remote_port: Option<u16>,
+}
+
 #[derive(Debug, Args)]
 struct RecipeCommand {
     #[command(subcommand)]
@@ -250,9 +276,16 @@ struct ExecOutput {
     stdout_base64: String,
     stderr_base64: String,
     code: i32,
+
     signal: i32,
     exited: bool,
     exit_code: i32,
+}
+#[derive(Debug, Serialize)]
+struct ForwardOutput {
+    id: String,
+    local: String,
+    remote: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -299,6 +332,9 @@ fn run() -> Result<RunOutcome> {
         Command::Exec(command) => run_exec(&store, command, cli.json),
         Command::Scp(command) => {
             run_scp(&store, command, cli.json, cli.color).map(|_| RunOutcome::Success)
+        }
+        Command::Forward(command) => {
+            run_forward(&store, command, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
         Command::Recipe(command) => {
             run_recipe(command.command, &store, cli.json, cli.color).map(|_| RunOutcome::Success)
@@ -1125,6 +1161,133 @@ fn safe_terminal_text(value: &str) -> String {
             }
         })
         .collect()
+}
+
+fn run_forward(
+    store: &ConfigStore,
+    command: ForwardCommand,
+    json: bool,
+    _color: ColorChoice,
+) -> Result<()> {
+    validate_forward_arguments(&command)?;
+    let config = load_config(store)?;
+    let (box_id, endpoint) =
+        resolve_agent_endpoint(&config, &command.id, command.endpoint.as_deref())?;
+    let materials = agent_materials(&config, &box_id)?;
+    let remote_host = command.remote_host;
+    let remote_port = command.remote_port.unwrap_or(command.local_port);
+    let listen = command.listen;
+    let local_port = command.local_port;
+    let ca_pem = materials.ca.certificate_pem;
+    let client_identity = materials.client;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create async runtime for pbox-agent forwarding")?;
+    runtime.block_on(async move {
+        let listener = TcpListener::bind((listen.as_str(), local_port))
+            .await
+            .with_context(|| format!("bind local forwarding address {listen}:{local_port}"))?;
+        let local_address = listener
+            .local_addr()
+            .context("read local forwarding address")?;
+        let output = ForwardOutput {
+            id: box_id.clone(),
+            local: local_address.to_string(),
+            remote: format!("{}:{}", remote_host, remote_port),
+        };
+        if json {
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            println!(
+                "forwarding {} -> {} (press Ctrl-C to stop)",
+                output.local, output.remote
+            );
+        }
+        let connection_slots = Arc::new(Semaphore::new(MAX_FORWARD_CONNECTIONS));
+        let shutdown = tokio::signal::ctrl_c();
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    let (socket, peer) = result.context("accept local forwarding connection")?;
+                    let connection_permit = match connection_slots.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            eprintln!(
+                                "[forward] rejecting {peer}: maximum of {MAX_FORWARD_CONNECTIONS} connections reached"
+                            );
+                            continue;
+                        }
+                    };
+                    let endpoint = endpoint.clone();
+                    let box_id = box_id.clone();
+                    let ca_pem = ca_pem.clone();
+                    let client_identity = client_identity.clone();
+                    let remote_host = remote_host.clone();
+                    tokio::spawn(async move {
+                        let _connection_permit = connection_permit;
+                        let result = async {
+                            let mut client = AgentClient::connect(
+                                &endpoint,
+                                &box_id,
+                                &ca_pem,
+                                &client_identity,
+                            )
+                            .await
+                            .context("connect to pbox-agent")?;
+                            client
+                                .info()
+                                .await
+                                .context("validate pbox-agent identity")?;
+                            client
+                                .forward_tcp(socket, remote_host, remote_port)
+                                .await
+                                .context("forward TCP connection")
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            eprintln!("[forward] {peer}: {error:#}");
+                        }
+                    });
+                }
+                result = &mut shutdown => {
+                    result.context("wait for Ctrl-C")?;
+                    return Ok(());
+                }
+            }
+        }
+    })
+}
+
+fn validate_forward_arguments(command: &ForwardCommand) -> Result<()> {
+    if command.local_port == 0 {
+        bail!("local forwarding port cannot be zero");
+    }
+    if command.remote_port == Some(0) {
+        bail!("remote forwarding port cannot be zero");
+    }
+    for (label, value) in [
+        ("box id", command.id.as_str()),
+        ("listen address", command.listen.as_str()),
+        ("remote host", command.remote_host.as_str()),
+    ] {
+        if value.is_empty() {
+            bail!("{label} cannot be empty");
+        }
+        if value.contains('\0') {
+            bail!("{label} cannot contain NUL bytes");
+        }
+    }
+    if let Some(endpoint) = command.endpoint.as_deref() {
+        if endpoint.is_empty() {
+            bail!("agent endpoint cannot be empty");
+        }
+        if endpoint.contains('\0') {
+            bail!("agent endpoint cannot contain NUL bytes");
+        }
+    }
+    Ok(())
 }
 
 fn run_exec(store: &ConfigStore, command: ExecCommand, json: bool) -> Result<RunOutcome> {
@@ -1968,9 +2131,17 @@ fn agent_materials(config: &Config, box_id: &str) -> Result<AgentMaterials> {
 }
 
 fn resolve_agent_target(config: &Config, command: &ExecCommand) -> Result<(String, String)> {
-    let id: PboxId = command.id.parse().context("parse pbox id")?;
-    if let Some(endpoint) = command.endpoint.as_ref() {
-        return Ok((id.to_string(), endpoint.clone()));
+    resolve_agent_endpoint(config, &command.id, command.endpoint.as_deref())
+}
+
+fn resolve_agent_endpoint(
+    config: &Config,
+    requested_id: &str,
+    endpoint: Option<&str>,
+) -> Result<(String, String)> {
+    let id: PboxId = requested_id.parse().context("parse pbox id")?;
+    if let Some(endpoint) = endpoint {
+        return Ok((id.to_string(), endpoint.to_owned()));
     }
     let client = client_from_config(config)?;
     let record = find_box(&client, &id.to_string())?;
@@ -2218,9 +2389,10 @@ fn color_enabled(color: ColorChoice, json: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnsibleRun, BoxRecord, RecipeSnapshot, create_recipe_snapshot, delete_recipe_snapshot,
-        exec_exit_code, finish_recipe_failure, finish_recipe_success, parse_env_entry,
-        parse_recipe_sync_ttl, parse_remote_path, record_recipe_provenance, write_download,
+        AnsibleRun, BoxRecord, ForwardCommand, RecipeSnapshot, create_recipe_snapshot,
+        delete_recipe_snapshot, exec_exit_code, finish_recipe_failure, finish_recipe_success,
+        parse_env_entry, parse_recipe_sync_ttl, parse_remote_path, record_recipe_provenance,
+        validate_forward_arguments, write_download,
     };
     use anyhow::anyhow;
     use pbox_agent_client::ExecResult;
@@ -2685,6 +2857,27 @@ mod tests {
     fn colour_is_disabled_for_json_and_no_color() {
         assert!(!ColorMode::Always.enabled(true, false, true));
         assert!(!ColorMode::Auto.enabled(true, true, false));
+    }
+    #[test]
+    fn forward_arguments_reject_zero_ports_and_nul_values() {
+        let valid = ForwardCommand {
+            id: "pbx_t3yzd9y3".to_owned(),
+            local_port: 3000,
+            listen: "127.0.0.1".to_owned(),
+            endpoint: Some("https://127.0.0.1:7443".to_owned()),
+            remote_host: "127.0.0.1".to_owned(),
+            remote_port: None,
+        };
+        assert!(validate_forward_arguments(&valid).is_ok());
+
+        let mut zero_local = valid;
+        zero_local.local_port = 0;
+        assert!(validate_forward_arguments(&zero_local).is_err());
+
+        let mut nul_host = zero_local;
+        nul_host.local_port = 3000;
+        nul_host.remote_host.push('\0');
+        assert!(validate_forward_arguments(&nul_host).is_err());
     }
 
     #[test]

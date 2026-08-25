@@ -43,5 +43,5 @@ nix = { version = "0.31.3", features = ["process", "term"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
