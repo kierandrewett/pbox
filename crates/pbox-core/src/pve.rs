@@ -29,6 +29,25 @@ pub trait PveApi {
     fn shutdown_lxc(&self, node: &str, vmid: u64) -> Result<PveTaskResponse, PveError>;
     fn stop_lxc(&self, node: &str, vmid: u64) -> Result<PveTaskResponse, PveError>;
     fn delete_lxc(&self, node: &str, vmid: u64) -> Result<PveTaskResponse, PveError>;
+    fn create_lxc_snapshot(
+        &self,
+        node: &str,
+        vmid: u64,
+        request: &LxcSnapshotRequest,
+    ) -> Result<PveTaskResponse, PveError>;
+    fn rollback_lxc_snapshot(
+        &self,
+        node: &str,
+        vmid: u64,
+        snapname: &str,
+        start: bool,
+    ) -> Result<PveTaskResponse, PveError>;
+    fn delete_lxc_snapshot(
+        &self,
+        node: &str,
+        vmid: u64,
+        snapname: &str,
+    ) -> Result<PveTaskResponse, PveError>;
 }
 
 #[derive(Clone)]
@@ -210,6 +229,54 @@ impl PveApi for PveClient {
         validate_path_segment(node, "node")?;
         self.task_without_form(Method::DELETE, &format!("/nodes/{node}/lxc/{vmid}"))
     }
+
+    fn create_lxc_snapshot(
+        &self,
+        node: &str,
+        vmid: u64,
+        request: &LxcSnapshotRequest,
+    ) -> Result<PveTaskResponse, PveError> {
+        validate_path_segment(node, "node")?;
+        validate_snapshot_name(&request.snapname)?;
+        self.task(
+            Method::POST,
+            &format!("/nodes/{node}/lxc/{vmid}/snapshot"),
+            request,
+        )
+    }
+
+    fn rollback_lxc_snapshot(
+        &self,
+        node: &str,
+        vmid: u64,
+        snapname: &str,
+        start: bool,
+    ) -> Result<PveTaskResponse, PveError> {
+        validate_path_segment(node, "node")?;
+        validate_snapshot_name(snapname)?;
+        let form = LxcSnapshotRollbackForm {
+            start: u8::from(start),
+        };
+        self.task(
+            Method::POST,
+            &format!("/nodes/{node}/lxc/{vmid}/snapshot/{snapname}/rollback"),
+            &form,
+        )
+    }
+
+    fn delete_lxc_snapshot(
+        &self,
+        node: &str,
+        vmid: u64,
+        snapname: &str,
+    ) -> Result<PveTaskResponse, PveError> {
+        validate_path_segment(node, "node")?;
+        validate_snapshot_name(snapname)?;
+        self.task_without_form(
+            Method::DELETE,
+            &format!("/nodes/{node}/lxc/{vmid}/snapshot/{snapname}"),
+        )
+    }
 }
 
 impl PveClient {
@@ -259,6 +326,27 @@ fn validate_path_segment(value: &str, field: &str) -> Result<(), PveError> {
     {
         return Err(PveError::InvalidPathSegment {
             field: field.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_snapshot_name(value: &str) -> Result<(), PveError> {
+    let valid = !value.is_empty()
+        && value.len() <= 40
+        && value != "current"
+        && value != "vzdump"
+        && value
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphabetic())
+        && value
+            .chars()
+            .skip(1)
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'));
+    if !valid {
+        return Err(PveError::InvalidSnapshotName {
+            name: value.to_owned(),
         });
     }
     Ok(())
@@ -350,6 +438,18 @@ pub struct LxcConfigUpdateRequest {
     pub unprivileged: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct LxcSnapshotRequest {
+    pub snapname: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LxcSnapshotRollbackForm {
+    start: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -482,6 +582,8 @@ pub enum PveError {
     InvalidBaseUrl,
     #[error("invalid {field} path segment")]
     InvalidPathSegment { field: String },
+    #[error("invalid PVE snapshot name: {name}")]
+    InvalidSnapshotName { name: String },
 }
 
 #[cfg(test)]
@@ -614,6 +716,37 @@ mod tests {
         assert_eq!(update_value["digest"], "deadbeef");
         assert_eq!(update_value["description"], "managed by pbox");
         assert!(update_value.get("memory").is_none());
+    }
+
+    #[test]
+    fn snapshot_requests_follow_pve_forms() {
+        let request = LxcSnapshotRequest {
+            snapname: "before_recipe".to_owned(),
+            description: Some("Before applying recipe desktop/xfce".to_owned()),
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["snapname"], "before_recipe");
+        assert_eq!(value["description"], "Before applying recipe desktop/xfce");
+
+        let rollback = serde_json::to_value(LxcSnapshotRollbackForm { start: 1 }).unwrap();
+        assert_eq!(rollback["start"], 1);
+    }
+
+    #[test]
+    fn snapshot_names_follow_proxmox_config_id_rules() {
+        assert!(validate_snapshot_name("before_recipe").is_ok());
+        assert!(validate_snapshot_name("A1-test").is_ok());
+        for invalid in [
+            "",
+            "1-before",
+            "before recipe",
+            "before.recipe",
+            "current",
+            "vzdump",
+        ] {
+            assert!(validate_snapshot_name(invalid).is_err(), "{invalid}");
+        }
+        assert!(validate_snapshot_name(&"a".repeat(41)).is_err());
     }
     #[test]
     fn lxc_ipv4_selection_prefers_eth0_and_skips_unusable_addresses() {

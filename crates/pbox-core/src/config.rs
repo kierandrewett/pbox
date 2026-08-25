@@ -865,4 +865,28 @@ mod tests {
         assert!(load_file(&path).is_err());
         fs::remove_file(path).unwrap();
     }
+
+    #[test]
+    fn snapshot_policy_defaults_and_validation_are_explicit() {
+        let mut config = Config::default();
+        assert_eq!(config.recipes.snapshot_before_apply, "auto");
+        assert!(!config.recipes.rollback_on_failure);
+        config
+            .set_value("recipes.snapshot-before-apply", "always")
+            .unwrap();
+        config
+            .set_value("recipes.rollback-on-failure", "true")
+            .unwrap();
+        assert_eq!(config.recipes.snapshot_before_apply, "always");
+        assert!(config.recipes.rollback_on_failure);
+        assert!(
+            config
+                .set_value("recipes.snapshot-before-apply", "sometimes")
+                .is_err()
+        );
+        config.unset_value("recipes.snapshot-before-apply").unwrap();
+        config.unset_value("recipes.rollback-on-failure").unwrap();
+        assert_eq!(config.recipes.snapshot_before_apply, "auto");
+        assert!(!config.recipes.rollback_on_failure);
+    }
 }
