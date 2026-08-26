@@ -16,7 +16,8 @@ pub use metadata::{
 };
 pub use pve::{
     ClusterResource, LxcConfig, LxcConfigUpdateRequest, LxcCreateRequest, LxcInterface,
-    LxcSnapshot, LxcSnapshotRequest, PveApi, PveClient, PveClientConfig, PveError, PveNode,
-    PveStorage, PveStorageContent, PveTaskResponse, PveTaskStatus, select_lxc_ipv4,
+    LxcSnapshot, LxcSnapshotRequest, PveApi, PveClient, PveClientConfig, PveError,
+    PveNetworkInterface, PveNode, PveStorage, PveStorageContent, PveTaskResponse, PveTaskStatus,
+    select_lxc_ipv4,
 };
 pub use vmid::{VmidError, VmidPattern};

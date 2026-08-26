@@ -21,8 +21,8 @@ use pbox_agent_client::{AgentClient, ExecInput, ExecResult, exec_event};
 use pbox_core::{
     Config, ConfigStore, LxcConfigUpdateRequest, LxcCreateRequest, LxcSnapshot, LxcSnapshotRequest,
     PboxId, PboxMetadata, PboxRecipeProvenance, PveApi, PveClient, PveClientConfig, PveError,
-    PveStorage, PveStorageContent, PveTaskResponse, encode_metadata, parse_duration,
-    parse_metadata, preserve_metadata, select_lxc_ipv4,
+    PveNetworkInterface, PveStorage, PveStorageContent, PveTaskResponse, encode_metadata,
+    parse_duration, parse_metadata, preserve_metadata, select_lxc_ipv4,
 };
 use pbox_crypto::{
     CertificateMaterial, CertificatePurpose, client_subject, derive_context_seed,
@@ -688,6 +688,24 @@ struct SetupAnswers {
     recipes_repository: String,
     recipes_reference: String,
 }
+
+#[derive(Debug, Clone)]
+struct SetupChoice {
+    value: String,
+    description: String,
+}
+
+#[derive(Debug)]
+struct SetupDiscovery {
+    nodes: Vec<SetupChoice>,
+}
+
+#[derive(Debug)]
+struct SetupResources {
+    rootfs_storages: Vec<SetupChoice>,
+    template_storages: Vec<SetupChoice>,
+    bridges: Vec<SetupChoice>,
+}
 const SETUP_PROMPT_LABEL_WIDTH: usize = 30;
 const ANSI_BOLD: &str = "\x1b[1m";
 const ANSI_DIM: &str = "\x1b[2m";
@@ -796,15 +814,21 @@ impl SetupStyle {
     }
 }
 
-fn apply_setup_values(config: &mut Config, answers: &SetupAnswers) -> Result<()> {
+fn setup_connection_config(
+    config: &Config,
+    pve_url: &str,
+    token_id: &str,
+    token_secret: Option<&str>,
+    tls_insecure: bool,
+) -> Result<Config> {
     let mut updated = config.clone();
     updated
-        .set_value("pve.url", &answers.pve_url)
+        .set_value("pve.url", pve_url)
         .context("validate PVE API URL")?;
     updated
-        .set_value("pve.token_id", &answers.token_id)
+        .set_value("pve.token_id", token_id)
         .context("validate PVE API token ID")?;
-    if let Some(secret) = &answers.token_secret {
+    if let Some(secret) = token_secret {
         updated
             .set_value("pve.token_secret", secret)
             .context("validate PVE API token secret")?;
@@ -812,6 +836,161 @@ fn apply_setup_values(config: &mut Config, answers: &SetupAnswers) -> Result<()>
     if updated.pve.token_secret.is_none() {
         bail!("PVE API token secret is required");
     }
+    updated
+        .set_value("pve.tls_insecure", &tls_insecure.to_string())
+        .context("validate TLS setting")?;
+    updated
+        .validate()
+        .context("validate PVE connection configuration")?;
+    Ok(updated)
+}
+
+fn discover_setup_nodes(client: &impl PveApi) -> Result<SetupDiscovery> {
+    let mut nodes = client.list_nodes().context("discover PVE nodes")?;
+    nodes.retain(|node| node.status.as_deref() == Some("online"));
+    nodes.sort_by(|left, right| left.node.cmp(&right.node));
+    if nodes.is_empty() {
+        bail!("PVE returned no online nodes");
+    }
+    Ok(SetupDiscovery {
+        nodes: nodes
+            .into_iter()
+            .map(|node| SetupChoice {
+                value: node.node,
+                description: "online".to_owned(),
+            })
+            .collect(),
+    })
+}
+
+fn discover_setup_resources(client: &impl PveApi, node: &str) -> Result<SetupResources> {
+    let storages = client
+        .list_node_storages(node)
+        .with_context(|| format!("discover PVE storage on node {node}"))?;
+    let rootfs_storages = storages
+        .iter()
+        .filter(|storage| storage_supports(storage, "rootdir"))
+        .map(|storage| SetupChoice {
+            value: storage.storage.clone(),
+            description: setup_storage_description(storage),
+        })
+        .collect();
+    let template_storages = storages
+        .iter()
+        .filter(|storage| storage_supports(storage, "vztmpl"))
+        .map(|storage| SetupChoice {
+            value: storage.storage.clone(),
+            description: setup_storage_description(storage),
+        })
+        .collect();
+    let networks = client
+        .list_node_network_interfaces(node)
+        .with_context(|| format!("discover PVE networks on node {node}"))?;
+    let bridges = networks
+        .into_iter()
+        .filter(|network| {
+            matches!(
+                network.interface_type.as_deref(),
+                Some("bridge" | "OVSBridge")
+            )
+        })
+        .map(|network| {
+            let description = setup_network_description(&network);
+            SetupChoice {
+                value: network.iface,
+                description,
+            }
+        })
+        .collect();
+
+    Ok(SetupResources {
+        rootfs_storages,
+        template_storages,
+        bridges,
+    })
+}
+
+fn setup_storage_description(storage: &PveStorage) -> String {
+    let storage_type = storage
+        .extra
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    format!(
+        "type={storage_type}, content={}",
+        storage.content.as_deref().unwrap_or("-")
+    )
+}
+
+fn setup_network_description(network: &PveNetworkInterface) -> String {
+    let interface_type = network.interface_type.as_deref().unwrap_or("unknown");
+    match network.cidr.as_deref() {
+        Some(cidr) => format!("type={interface_type}, cidr={cidr}"),
+        None => format!("type={interface_type}"),
+    }
+}
+
+fn setup_choice_default(configured: &str, choices: &[SetupChoice], allow_auto: bool) -> String {
+    if configured != "auto" && choices.iter().any(|choice| choice.value == configured) {
+        return configured.to_owned();
+    }
+    if allow_auto && choices.len() > 1 {
+        return "auto".to_owned();
+    }
+    choices
+        .first()
+        .map(|choice| choice.value.clone())
+        .unwrap_or_else(|| configured.to_owned())
+}
+
+fn prompt_setup_choice(
+    style: SetupStyle,
+    config: &Config,
+    key: &str,
+    label: &str,
+    configured: &str,
+    choices: &[SetupChoice],
+    allow_auto: bool,
+) -> Result<String> {
+    if choices.is_empty() {
+        return prompt_setup_config_value(style, config, key, label, Some(configured));
+    }
+    let default = setup_choice_default(configured, choices, allow_auto);
+    loop {
+        for (index, choice) in choices.iter().enumerate() {
+            eprintln!(
+                "  {}. {} ({})",
+                index + 1,
+                style.text(&choice.value),
+                style.text(&choice.description)
+            );
+        }
+        let value = prompt_setup_text(style, label, Some(&default))?;
+        if allow_auto && value == "auto" {
+            return Ok(value);
+        }
+        if let Ok(index) = value.parse::<usize>()
+            && let Some(choice) = choices.get(index.saturating_sub(1))
+        {
+            return Ok(choice.value.clone());
+        }
+        if choices.iter().any(|choice| choice.value == value) {
+            return Ok(value);
+        }
+        style.error(&format!(
+            "Invalid {label}: choose a number or an available value."
+        ));
+    }
+}
+
+fn apply_setup_values(config: &mut Config, answers: &SetupAnswers) -> Result<()> {
+    let mut updated = setup_connection_config(
+        config,
+        &answers.pve_url,
+        &answers.token_id,
+        answers.token_secret.as_deref(),
+        answers.tls_insecure,
+    )?;
     updated
         .set_value("pve.node", &answers.pve_node)
         .context("validate PVE node")?;
@@ -824,9 +1003,6 @@ fn apply_setup_values(config: &mut Config, answers: &SetupAnswers) -> Result<()>
     updated
         .set_value("pve.bridge", &answers.pve_bridge)
         .context("validate PVE bridge")?;
-    updated
-        .set_value("pve.tls_insecure", &answers.tls_insecure.to_string())
-        .context("validate TLS setting")?;
     updated
         .set_value("pve.vmid-pattern", &answers.vmid_pattern)
         .context("validate VMID pattern")?;
@@ -903,6 +1079,23 @@ fn run_setup(
         "Disable PVE TLS certificate verification (not recommended)",
         config.pve.tls_insecure,
     )?;
+    let setup_client = if command.skip_verify {
+        None
+    } else {
+        style.progress("Reading nodes, storage, and network options from PVE...");
+        let connection_config = setup_connection_config(
+            &config,
+            &pve_url,
+            &token_id,
+            token_secret.as_deref(),
+            tls_insecure,
+        )?;
+        Some(client_from_config(&connection_config)?)
+    };
+    let setup_nodes = setup_client
+        .as_ref()
+        .map(discover_setup_nodes)
+        .transpose()?;
     let vmid_pattern_default = config.vmid_pattern.to_string();
     let vmid_pattern = prompt_setup_config_value(
         style,
@@ -912,34 +1105,70 @@ fn run_setup(
         Some(&vmid_pattern_default),
     )?;
     let agent_port_default = config.agent.port.to_string();
-    style.hint("Use auto to select a suitable online node or storage.");
-    let pve_node = prompt_setup_config_value(
+    style.section("PVE placement");
+    let node_choices = setup_nodes
+        .as_ref()
+        .map(|discovery| discovery.nodes.as_slice())
+        .unwrap_or(&[]);
+    let pve_node = prompt_setup_choice(
         style,
         &config,
         "pve.node",
         "PVE node",
-        Some(config.pve.node.as_str()),
+        &config.pve.node,
+        node_choices,
+        true,
     )?;
-    let pve_storage = prompt_setup_config_value(
+    let discovery_node = if pve_node == "auto" {
+        node_choices
+            .first()
+            .map(|choice| choice.value.as_str())
+            .unwrap_or("auto")
+    } else {
+        pve_node.as_str()
+    };
+    let setup_resources = setup_client
+        .as_ref()
+        .map(|client| discover_setup_resources(client, discovery_node))
+        .transpose()?;
+    let rootfs_choices = setup_resources
+        .as_ref()
+        .map(|resources| resources.rootfs_storages.as_slice())
+        .unwrap_or(&[]);
+    let pve_storage = prompt_setup_choice(
         style,
         &config,
         "pve.storage",
         "Rootfs storage",
-        Some(config.pve.storage.as_str()),
+        &config.pve.storage,
+        rootfs_choices,
+        true,
     )?;
-    let pve_template_storage = prompt_setup_config_value(
+    let template_choices = setup_resources
+        .as_ref()
+        .map(|resources| resources.template_storages.as_slice())
+        .unwrap_or(&[]);
+    let pve_template_storage = prompt_setup_choice(
         style,
         &config,
         "pve.template-storage",
         "Template storage",
-        Some(config.pve.template_storage.as_str()),
+        &config.pve.template_storage,
+        template_choices,
+        true,
     )?;
-    let pve_bridge = prompt_setup_config_value(
+    let bridge_choices = setup_resources
+        .as_ref()
+        .map(|resources| resources.bridges.as_slice())
+        .unwrap_or(&[]);
+    let pve_bridge = prompt_setup_choice(
         style,
         &config,
         "pve.bridge",
         "PVE bridge",
-        Some(config.pve.bridge.as_str()),
+        &config.pve.bridge,
+        bridge_choices,
+        false,
     )?;
     let agent_port = prompt_setup_config_value(
         style,
@@ -4276,9 +4505,9 @@ mod tests {
     use pbox_core::ui::ColorMode;
     use pbox_core::{
         ClusterResource, Config, LxcConfig, LxcConfigUpdateRequest, LxcCreateRequest, LxcInterface,
-        LxcSnapshot, LxcSnapshotRequest, PboxId, PboxMetadata, PveApi, PveError, PveNode,
-        PveStorage, PveStorageContent, PveTaskResponse, PveTaskStatus, encode_metadata,
-        parse_metadata,
+        LxcSnapshot, LxcSnapshotRequest, PboxId, PboxMetadata, PveApi, PveError,
+        PveNetworkInterface, PveNode, PveStorage, PveStorageContent, PveTaskResponse,
+        PveTaskStatus, encode_metadata, parse_metadata,
     };
     use std::cell::RefCell;
     use std::fs;
@@ -4380,6 +4609,18 @@ mod tests {
 
         fn list_node_storages(&self, _node: &str) -> Result<Vec<pbox_core::PveStorage>, PveError> {
             Ok(self.storages.borrow().clone())
+        }
+
+        fn list_node_network_interfaces(
+            &self,
+            _node: &str,
+        ) -> Result<Vec<PveNetworkInterface>, PveError> {
+            Ok(vec![PveNetworkInterface {
+                iface: "vmbr0".to_owned(),
+                interface_type: Some("bridge".to_owned()),
+                cidr: Some("192.0.2.1/24".to_owned()),
+                extra: serde_json::Map::new(),
+            }])
         }
 
         fn list_storage_content(
@@ -4614,6 +4855,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn setup_discovers_pve_nodes_storages_and_bridges() {
+        let metadata = PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007);
+        let fake = FakePve::new(&metadata, "user note");
+        let discovery = super::discover_setup_nodes(&fake).unwrap();
+        let resources = super::discover_setup_resources(&fake, "pve01").unwrap();
+
+        assert_eq!(discovery.nodes[0].value, "pve01");
+        assert_eq!(resources.rootfs_storages[0].value, "local");
+        assert_eq!(resources.template_storages[0].value, "local");
+        assert_eq!(resources.bridges[0].value, "vmbr0");
+        assert!(resources.bridges[0].description.contains("192.0.2.1/24"));
+    }
     #[test]
     fn new_command_accepts_zero_arguments() {
         let cli = Cli::try_parse_from(["pbox", "new"]).unwrap();

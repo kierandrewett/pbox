@@ -16,6 +16,16 @@ pub trait PveApi {
     fn list_cluster_resources(&self) -> Result<Vec<ClusterResource>, PveError>;
     fn list_nodes(&self) -> Result<Vec<PveNode>, PveError>;
     fn list_node_storages(&self, node: &str) -> Result<Vec<PveStorage>, PveError>;
+    /// List network interfaces configured on a PVE node.
+    fn list_node_network_interfaces(
+        &self,
+        node: &str,
+    ) -> Result<Vec<PveNetworkInterface>, PveError> {
+        let _ = node;
+        Err(PveError::Unsupported(
+            "this PVE client does not support node network discovery".to_owned(),
+        ))
+    }
     fn list_storage_content(
         &self,
         node: &str,
@@ -250,6 +260,16 @@ impl PveApi for PveClient {
     fn list_node_storages(&self, node: &str) -> Result<Vec<PveStorage>, PveError> {
         validate_path_segment(node, "node")?;
         self.get(&format!("/nodes/{node}/storage"))
+    }
+
+    fn list_node_network_interfaces(
+        &self,
+        node: &str,
+    ) -> Result<Vec<PveNetworkInterface>, PveError> {
+        validate_path_segment(node, "node")?;
+        let interfaces: Option<Vec<PveNetworkInterface>> =
+            self.get(&format!("/nodes/{node}/network"))?;
+        Ok(interfaces.unwrap_or_default())
     }
 
     fn list_storage_content(
@@ -550,6 +570,16 @@ pub struct PveStorage {
     pub content: Option<String>,
     pub active: Option<u64>,
     pub enabled: Option<u64>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct PveNetworkInterface {
+    pub iface: String,
+    #[serde(rename = "type")]
+    pub interface_type: Option<String>,
+    pub cidr: Option<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -1034,6 +1064,19 @@ mod tests {
     }
 
     #[test]
+    fn pve_network_interfaces_decode_bridge_data() {
+        let interfaces: Vec<PveNetworkInterface> = serde_json::from_str(
+            r#"[{"iface":"vmbr0","type":"bridge","cidr":"192.0.2.1/24","active":1}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(interfaces[0].iface, "vmbr0");
+        assert_eq!(interfaces[0].interface_type.as_deref(), Some("bridge"));
+        assert_eq!(interfaces[0].cidr.as_deref(), Some("192.0.2.1/24"));
+        assert_eq!(interfaces[0].extra["active"], 1);
+    }
+    #[test]
+
     fn lifecycle_requests_serialize_only_set_values() {
         let request = LxcCreateRequest {
             ostemplate: Some("local:vztmpl/debian-12.tar.zst".to_owned()),
