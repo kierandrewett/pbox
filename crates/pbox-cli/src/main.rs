@@ -678,6 +678,10 @@ struct SetupAnswers {
     pve_url: String,
     token_id: String,
     token_secret: Option<String>,
+    pve_node: String,
+    pve_storage: String,
+    pve_template_storage: String,
+    pve_bridge: String,
     tls_insecure: bool,
     vmid_pattern: String,
     agent_port: String,
@@ -809,6 +813,18 @@ fn apply_setup_values(config: &mut Config, answers: &SetupAnswers) -> Result<()>
         bail!("PVE API token secret is required");
     }
     updated
+        .set_value("pve.node", &answers.pve_node)
+        .context("validate PVE node")?;
+    updated
+        .set_value("pve.storage", &answers.pve_storage)
+        .context("validate PVE storage")?;
+    updated
+        .set_value("pve.template-storage", &answers.pve_template_storage)
+        .context("validate PVE template storage")?;
+    updated
+        .set_value("pve.bridge", &answers.pve_bridge)
+        .context("validate PVE bridge")?;
+    updated
         .set_value("pve.tls_insecure", &answers.tls_insecure.to_string())
         .context("validate TLS setting")?;
     updated
@@ -896,6 +912,35 @@ fn run_setup(
         Some(&vmid_pattern_default),
     )?;
     let agent_port_default = config.agent.port.to_string();
+    style.hint("Use auto to select a suitable online node or storage.");
+    let pve_node = prompt_setup_config_value(
+        style,
+        &config,
+        "pve.node",
+        "PVE node",
+        Some(config.pve.node.as_str()),
+    )?;
+    let pve_storage = prompt_setup_config_value(
+        style,
+        &config,
+        "pve.storage",
+        "Rootfs storage",
+        Some(config.pve.storage.as_str()),
+    )?;
+    let pve_template_storage = prompt_setup_config_value(
+        style,
+        &config,
+        "pve.template-storage",
+        "Template storage",
+        Some(config.pve.template_storage.as_str()),
+    )?;
+    let pve_bridge = prompt_setup_config_value(
+        style,
+        &config,
+        "pve.bridge",
+        "PVE bridge",
+        Some(config.pve.bridge.as_str()),
+    )?;
     let agent_port = prompt_setup_config_value(
         style,
         &config,
@@ -923,6 +968,10 @@ fn run_setup(
         pve_url,
         token_id,
         token_secret,
+        pve_node,
+        pve_storage,
+        pve_template_storage,
+        pve_bridge,
         tls_insecure,
         vmid_pattern,
         agent_port,
@@ -5466,6 +5515,10 @@ mod tests {
             pve_url: "https://pve.example".to_owned(),
             token_id: "user@pam!pbox".to_owned(),
             token_secret: Some("secret-value".to_owned()),
+            pve_node: "pve01".to_owned(),
+            pve_storage: "local-zfs".to_owned(),
+            pve_template_storage: "local".to_owned(),
+            pve_bridge: "vmbr0".to_owned(),
             tls_insecure: false,
             vmid_pattern: "95xx".to_owned(),
             agent_port: "7444".to_owned(),
@@ -5485,6 +5538,10 @@ mod tests {
                 .map(|secret| secret.expose()),
             Some("secret-value")
         );
+        assert_eq!(config.pve.node, "pve01");
+        assert_eq!(config.pve.storage, "local-zfs");
+        assert_eq!(config.pve.template_storage, "local");
+        assert_eq!(config.pve.bridge, "vmbr0");
         assert_eq!(config.vmid_pattern.to_string(), "95xx");
         assert_eq!(config.agent.port, 7444);
         let redacted = serde_json::to_string(&config.redacted()).unwrap();
@@ -5500,6 +5557,10 @@ mod tests {
             pve_url: "https://pve.example".to_owned(),
             token_id: "user@pam!pbox".to_owned(),
             token_secret: None,
+            pve_node: "auto".to_owned(),
+            pve_storage: "auto".to_owned(),
+            pve_template_storage: "local".to_owned(),
+            pve_bridge: "vmbr0".to_owned(),
             tls_insecure: false,
             vmid_pattern: "9xxx".to_owned(),
             agent_port: "7443".to_owned(),
@@ -5528,6 +5589,10 @@ mod tests {
             pve_url: "http://not-https.example".to_owned(),
             token_id: "user@pam!pbox".to_owned(),
             token_secret: Some("secret-value".to_owned()),
+            pve_node: "pve01".to_owned(),
+            pve_storage: "local".to_owned(),
+            pve_template_storage: "local".to_owned(),
+            pve_bridge: "vmbr0".to_owned(),
             tls_insecure: false,
             vmid_pattern: "95xx".to_owned(),
             agent_port: "7444".to_owned(),
@@ -5548,6 +5613,10 @@ mod tests {
             pve_url: "https://pve.example".to_owned(),
             token_id: "old@pam!pbox".to_owned(),
             token_secret: None,
+            pve_node: "auto".to_owned(),
+            pve_storage: "auto".to_owned(),
+            pve_template_storage: "local".to_owned(),
+            pve_bridge: "vmbr0".to_owned(),
             tls_insecure: false,
             vmid_pattern: "9xxx".to_owned(),
             agent_port: "7443".to_owned(),
