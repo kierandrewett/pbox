@@ -37,8 +37,8 @@ use std::net::Ipv4Addr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -723,23 +723,33 @@ const ANSI_RESET: &str = "\x1b[0m";
 #[derive(Clone, Copy)]
 struct SetupStyle {
     enabled: bool,
+    interactive: bool,
 }
 
 impl SetupStyle {
     fn for_stderr(color: ColorChoice, json: bool) -> Self {
+        let terminal = io::stderr().is_terminal();
+        let enabled = color_enabled_for(color, json, terminal);
         Self {
-            enabled: color_enabled_for(color, json, io::stderr().is_terminal()),
+            enabled,
+            interactive: terminal && enabled,
         }
     }
 
     fn for_stdout(color: ColorChoice, json: bool) -> Self {
+        let terminal = io::stdout().is_terminal();
+        let enabled = color_enabled_for(color, json, terminal);
         Self {
-            enabled: color_enabled_for(color, json, io::stdout().is_terminal()),
+            enabled,
+            interactive: terminal && enabled,
         }
     }
 
     fn from_enabled(enabled: bool) -> Self {
-        Self { enabled }
+        Self {
+            enabled,
+            interactive: false,
+        }
     }
 
     fn text(self, value: &str) -> String {
@@ -791,6 +801,21 @@ impl SetupStyle {
 
     fn progress(self, message: &str) {
         eprintln!("{}", self.status(">", ANSI_CYAN, message));
+    }
+    fn progress_live(self, message: &str) {
+        if self.interactive {
+            eprint!("\r\x1b[2K{}", self.status(">", ANSI_CYAN, message));
+            let _ = io::stderr().flush();
+        } else {
+            self.progress(message);
+        }
+    }
+
+    fn clear_progress_line(self) {
+        if self.interactive {
+            eprint!("\r\x1b[2K");
+            let _ = io::stderr().flush();
+        }
     }
 
     fn prompt(self, label: &str, default: Option<&str>) -> Result<()> {
@@ -4274,14 +4299,21 @@ fn generate_unique_id(existing: &[BoxRecord]) -> Result<PboxId> {
 }
 
 const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+struct ProgressHeartbeat {
+    stop: Arc<AtomicBool>,
+    output_lock: Arc<Mutex<()>>,
+    style: SetupStyle,
+}
 
 fn spawn_progress_heartbeat(
     style: Option<SetupStyle>,
     message: impl Into<String>,
-) -> Option<Arc<AtomicBool>> {
+) -> Option<ProgressHeartbeat> {
     let style = style?;
     let stop = Arc::new(AtomicBool::new(false));
+    let output_lock = Arc::new(Mutex::new(()));
     let thread_stop = Arc::clone(&stop);
+    let thread_output_lock = Arc::clone(&output_lock);
     let message = message.into();
     thread::spawn(move || {
         let started = Instant::now();
@@ -4290,18 +4322,31 @@ fn spawn_progress_heartbeat(
             if thread_stop.load(Ordering::Relaxed) {
                 break;
             }
-            style.progress(&format!(
+            let Ok(_guard) = thread_output_lock.lock() else {
+                break;
+            };
+            if thread_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            style.progress_live(&format!(
                 "{message} ({}s elapsed)",
                 started.elapsed().as_secs()
             ));
         }
     });
-    Some(stop)
+    Some(ProgressHeartbeat {
+        stop,
+        output_lock,
+        style,
+    })
 }
 
-fn stop_progress_heartbeat(stop: Option<Arc<AtomicBool>>) {
-    if let Some(stop) = stop {
-        stop.store(true, Ordering::Relaxed);
+fn stop_progress_heartbeat(heartbeat: Option<ProgressHeartbeat>) {
+    if let Some(heartbeat) = heartbeat {
+        heartbeat.stop.store(true, Ordering::Relaxed);
+        if let Ok(_guard) = heartbeat.output_lock.lock() {
+            heartbeat.style.clear_progress_line();
+        }
     }
 }
 

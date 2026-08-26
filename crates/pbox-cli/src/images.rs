@@ -7,7 +7,7 @@ use pbox_core::{PveApi, PveError, PveTaskResponse};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -293,6 +293,15 @@ pub fn upload_local_oci_template(
 }
 
 const OCI_GUEST_PREPARATION: &str = r#"set -eu
+run_timed() {
+    seconds="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout --foreground "${seconds}s" "$@"
+    else
+        "$@"
+    fi
+}
 if [ -x /sbin/init ] && command -v sshd >/dev/null 2>&1; then
     exit 0
 fi
@@ -300,18 +309,22 @@ if command -v apt-get >/dev/null 2>&1; then
     printf '%s\n' '#!/bin/sh' 'exit 101' > /usr/sbin/policy-rc.d
     chmod 755 /usr/sbin/policy-rc.d
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y --no-install-recommends systemd-sysv openssh-server sudo python3 ca-certificates
+    printf '%s\n' '[pbox-image] Updating package metadata'
+    run_timed 120 apt-get -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=1 update
+    printf '%s\n' '[pbox-image] Installing guest packages: systemd, OpenSSH, sudo, Python, CA certificates'
+    run_timed 180 apt-get install -y --no-install-recommends systemd-sysv openssh-server sudo python3 ca-certificates
+    printf '%s\n' '[pbox-image] Cleaning package metadata'
     rm -rf /var/lib/apt/lists/* /usr/sbin/policy-rc.d
 elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y systemd openssh-server sudo python3 ca-certificates
+    printf '%s\n' '[pbox-image] Installing guest packages: systemd, OpenSSH, sudo, Python, CA certificates'
+    run_timed 180 dnf install -y systemd openssh-server sudo python3 ca-certificates
+    printf '%s\n' '[pbox-image] Cleaning package metadata'
     dnf clean all
-elif [ -x /sbin/init ] && command -v sshd >/dev/null 2>&1; then
-    exit 0
 else
     echo 'pbox needs a systemd init and OpenSSH server in the OCI image' >&2
     exit 1
 fi
+printf '%s\n' '[pbox-image] Guest preparation complete'
 "#;
 
 fn build_local_oci_archive(reference: &str, filename: &str) -> Result<PathBuf> {
@@ -346,7 +359,7 @@ fn build_local_oci_archive(reference: &str, filename: &str) -> Result<PathBuf> {
         let operation_result = (|| {
             let tar_text = path_text(&tar)?;
             let compressed_text = path_text(&compressed)?;
-            run_local_command(
+            run_local_command_streaming(
                 "podman",
                 &["start", "--attach", container.as_str()],
                 "Installing guest prerequisites (systemd, OpenSSH, sudo, Python)",
@@ -413,10 +426,16 @@ fn path_text(path: &Path) -> Result<String> {
 }
 
 const LOCAL_OCI_COMMAND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const LOCAL_OCI_GUEST_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 const LOCAL_OCI_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
 fn run_local_command(program: &str, args: &[&str], action: &str) -> Result<()> {
     let output = run_local_process(program, args, action)?;
+    ensure_local_command_success(&output, action)
+}
+
+fn run_local_command_streaming(program: &str, args: &[&str], action: &str) -> Result<()> {
+    let output = run_local_process_streaming(program, args, action)?;
     ensure_local_command_success(&output, action)
 }
 
@@ -443,10 +462,25 @@ fn run_local_command_output(program: &str, args: &[&str], action: &str) -> Resul
 }
 
 fn run_local_process(program: &str, args: &[&str], action: &str) -> Result<Output> {
+    run_local_process_inner(program, args, action, false, LOCAL_OCI_COMMAND_TIMEOUT)
+}
+
+fn run_local_process_streaming(program: &str, args: &[&str], action: &str) -> Result<Output> {
+    run_local_process_inner(program, args, action, true, LOCAL_OCI_GUEST_TIMEOUT)
+}
+
+fn run_local_process_inner(
+    program: &str,
+    args: &[&str],
+    action: &str,
+    report_stdout: bool,
+    timeout: Duration,
+) -> Result<Output> {
     eprintln!("[image] {action}");
     let mut command = Command::new(program);
     command
         .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -468,9 +502,15 @@ fn run_local_process(program: &str, args: &[&str], action: &str) -> Result<Outpu
             bail!("{action} did not expose stderr");
         }
     };
-    let stdout_reader = thread::spawn(move || read_command_stream(stdout));
+    let stdout_reader = thread::spawn(move || {
+        if report_stdout {
+            read_and_report_command_stream(stdout)
+        } else {
+            read_command_stream(stdout)
+        }
+    });
     let stderr_reader = thread::spawn(move || read_command_stream(stderr));
-    let status = wait_for_local_process(&mut child, action)?;
+    let status = wait_for_local_process(&mut child, action, timeout)?;
     let stdout = stdout_reader
         .join()
         .map_err(|_| anyhow::anyhow!("{action} stdout reader stopped unexpectedly"))??;
@@ -489,8 +529,39 @@ fn read_command_stream(mut stream: impl Read) -> Result<Vec<u8>> {
     stream.read_to_end(&mut output)?;
     Ok(output)
 }
+fn read_and_report_command_stream(stream: impl Read) -> Result<Vec<u8>> {
+    let mut reader = io::BufReader::new(stream);
+    let mut output = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        output.extend_from_slice(line.as_bytes());
+        let cleaned = line
+            .trim_end_matches(['\r', '\n'])
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>();
+        if let Some(message) = cleaned.strip_prefix("[pbox-image] ") {
+            eprintln!("[image] {message}");
+        }
+    }
+    Ok(output)
+}
 
-fn wait_for_local_process(child: &mut Child, action: &str) -> Result<ExitStatus> {
+fn wait_for_local_process(
+    child: &mut Child,
+    action: &str,
+    timeout: Duration,
+) -> Result<ExitStatus> {
     let started = Instant::now();
     let mut next_progress = LOCAL_OCI_PROGRESS_INTERVAL;
     loop {
@@ -511,12 +582,12 @@ fn wait_for_local_process(child: &mut Child, action: &str) -> Result<ExitStatus>
             return Ok(status);
         }
         let elapsed = started.elapsed();
-        if elapsed >= LOCAL_OCI_COMMAND_TIMEOUT {
+        if elapsed >= timeout {
             terminate_local_process(child);
             finish_local_progress(action, elapsed, "timed out");
             bail!(
                 "{action} did not finish within {} minutes",
-                LOCAL_OCI_COMMAND_TIMEOUT.as_secs() / 60
+                timeout.as_secs() / 60
             );
         }
         if elapsed >= next_progress {
