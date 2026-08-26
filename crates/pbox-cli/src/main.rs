@@ -38,6 +38,7 @@ use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -863,51 +864,81 @@ fn discover_setup_nodes(client: &impl PveApi) -> Result<SetupDiscovery> {
     })
 }
 
-fn discover_setup_resources(client: &impl PveApi, node: &str) -> Result<SetupResources> {
-    let storages = client
-        .list_node_storages(node)
-        .with_context(|| format!("discover PVE storage on node {node}"))?;
-    let rootfs_storages = storages
-        .iter()
-        .filter(|storage| storage_supports(storage, "rootdir"))
-        .map(|storage| SetupChoice {
-            value: storage.storage.clone(),
-            description: setup_storage_description(storage),
-        })
-        .collect();
-    let template_storages = storages
-        .iter()
-        .filter(|storage| storage_supports(storage, "vztmpl"))
-        .map(|storage| SetupChoice {
-            value: storage.storage.clone(),
-            description: setup_storage_description(storage),
-        })
-        .collect();
-    let networks = client
-        .list_node_network_interfaces(node)
-        .with_context(|| format!("discover PVE networks on node {node}"))?;
-    let bridges = networks
-        .into_iter()
-        .filter(|network| {
-            matches!(
-                network.interface_type.as_deref(),
-                Some("bridge" | "OVSBridge")
-            )
-        })
-        .map(|network| {
-            let description = setup_network_description(&network);
-            SetupChoice {
-                value: network.iface,
-                description,
-            }
-        })
-        .collect();
+fn discover_setup_resources(client: &impl PveApi, nodes: &[String]) -> Result<SetupResources> {
+    if nodes.is_empty() {
+        bail!("PVE returned no nodes for resource discovery");
+    }
+    let mut rootfs_storages = None;
+    let mut template_storages = None;
+    let mut bridges = None;
+    for node in nodes {
+        let storages = client
+            .list_node_storages(node)
+            .with_context(|| format!("discover PVE storage on node {node}"))?;
+        let node_rootfs_storages = storages
+            .iter()
+            .filter(|storage| storage_supports(storage, "rootdir"))
+            .map(|storage| SetupChoice {
+                value: storage.storage.clone(),
+                description: setup_storage_description(storage),
+            })
+            .collect();
+        intersect_setup_choices(&mut rootfs_storages, node_rootfs_storages);
+        let node_template_storages = storages
+            .iter()
+            .filter(|storage| storage_supports(storage, "vztmpl"))
+            .map(|storage| SetupChoice {
+                value: storage.storage.clone(),
+                description: setup_storage_description(storage),
+            })
+            .collect();
+        intersect_setup_choices(&mut template_storages, node_template_storages);
+
+        let networks = client
+            .list_node_network_interfaces(node)
+            .with_context(|| format!("discover PVE networks on node {node}"))?;
+        let node_bridges = networks
+            .into_iter()
+            .filter(|network| {
+                setup_network_is_active(network)
+                    && matches!(
+                        network.interface_type.as_deref(),
+                        Some("bridge" | "OVSBridge")
+                    )
+            })
+            .map(|network| {
+                let description = setup_network_description(&network);
+                SetupChoice {
+                    value: network.iface,
+                    description,
+                }
+            })
+            .collect();
+        intersect_setup_choices(&mut bridges, node_bridges);
+    }
 
     Ok(SetupResources {
-        rootfs_storages,
-        template_storages,
-        bridges,
+        rootfs_storages: rootfs_storages.unwrap_or_default(),
+        template_storages: template_storages.unwrap_or_default(),
+        bridges: bridges.unwrap_or_default(),
     })
+}
+
+fn intersect_setup_choices(current: &mut Option<Vec<SetupChoice>>, discovered: Vec<SetupChoice>) {
+    if let Some(current) = current.as_mut() {
+        current.retain(|choice| discovered.iter().any(|item| item.value == choice.value));
+    } else {
+        *current = Some(discovered);
+    }
+}
+
+fn setup_network_is_active(network: &PveNetworkInterface) -> bool {
+    match network.extra.get("active") {
+        None => true,
+        Some(serde_json::Value::Bool(active)) => *active,
+        Some(serde_json::Value::Number(active)) => active.as_u64() != Some(0),
+        Some(_) => true,
+    }
 }
 
 fn setup_storage_description(storage: &PveStorage) -> String {
@@ -931,10 +962,13 @@ fn setup_network_description(network: &PveNetworkInterface) -> String {
 }
 
 fn setup_choice_default(configured: &str, choices: &[SetupChoice], allow_auto: bool) -> String {
+    if allow_auto && configured == "auto" {
+        return "auto".to_owned();
+    }
     if configured != "auto" && choices.iter().any(|choice| choice.value == configured) {
         return configured.to_owned();
     }
-    if allow_auto && choices.len() > 1 {
+    if allow_auto {
         return "auto".to_owned();
     }
     choices
@@ -956,7 +990,11 @@ fn prompt_setup_choice(
         return prompt_setup_config_value(style, config, key, label, Some(configured));
     }
     let default = setup_choice_default(configured, choices, allow_auto);
+    style.hint("Enter a number or name. Press Enter to accept the default.");
     loop {
+        if allow_auto {
+            eprintln!("  a. auto (select automatically)");
+        }
         for (index, choice) in choices.iter().enumerate() {
             eprintln!(
                 "  {}. {} ({})",
@@ -966,20 +1004,62 @@ fn prompt_setup_choice(
             );
         }
         let value = prompt_setup_text(style, label, Some(&default))?;
-        if allow_auto && value == "auto" {
-            return Ok(value);
+        if allow_auto && matches!(value.to_ascii_lowercase().as_str(), "a" | "auto") {
+            return Ok("auto".to_owned());
         }
         if let Ok(index) = value.parse::<usize>()
-            && let Some(choice) = choices.get(index.saturating_sub(1))
+            && (1..=choices.len()).contains(&index)
         {
-            return Ok(choice.value.clone());
+            return Ok(choices[index - 1].value.clone());
         }
         if choices.iter().any(|choice| choice.value == value) {
             return Ok(value);
         }
+        let auto_hint = if allow_auto { " or a for auto" } else { "" };
         style.error(&format!(
-            "Invalid {label}: choose a number or an available value."
+            "Invalid {label}: enter 1-{} or a choice name{auto_hint}.",
+            choices.len()
         ));
+    }
+}
+
+fn discover_setup_nodes_with_retry(
+    style: SetupStyle,
+    client: &impl PveApi,
+) -> Result<Option<SetupDiscovery>> {
+    loop {
+        style.progress("Discovering online PVE nodes...");
+        match discover_setup_nodes(client) {
+            Ok(discovery) => return Ok(Some(discovery)),
+            Err(error) => {
+                style.error(&format!("PVE node discovery failed: {error}"));
+                if !prompt_setup_bool(style, "Retry PVE node discovery", true)? {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+fn discover_setup_resources_with_retry(
+    style: SetupStyle,
+    client: &impl PveApi,
+    nodes: &[String],
+    scope: &str,
+) -> Result<Option<SetupResources>> {
+    loop {
+        style.progress(&format!(
+            "Discovering storage and bridge options on {scope}..."
+        ));
+        match discover_setup_resources(client, nodes) {
+            Ok(resources) => return Ok(Some(resources)),
+            Err(error) => {
+                style.error(&format!("PVE resource discovery failed: {error}"));
+                if !prompt_setup_bool(style, "Retry PVE resource discovery", true)? {
+                    return Ok(None);
+                }
+            }
+        }
     }
 }
 
@@ -1082,7 +1162,7 @@ fn run_setup(
     let setup_client = if command.skip_verify {
         None
     } else {
-        style.progress("Reading nodes, storage, and network options from PVE...");
+        style.progress("Connecting to PVE...");
         let connection_config = setup_connection_config(
             &config,
             &pve_url,
@@ -1092,10 +1172,10 @@ fn run_setup(
         )?;
         Some(client_from_config(&connection_config)?)
     };
-    let setup_nodes = setup_client
-        .as_ref()
-        .map(discover_setup_nodes)
-        .transpose()?;
+    let setup_nodes = match setup_client.as_ref() {
+        Some(client) => discover_setup_nodes_with_retry(style, client)?,
+        None => None,
+    };
     let vmid_pattern_default = config.vmid_pattern.to_string();
     let vmid_pattern = prompt_setup_config_value(
         style,
@@ -1119,18 +1199,25 @@ fn run_setup(
         node_choices,
         true,
     )?;
-    let discovery_node = if pve_node == "auto" {
+    let resource_nodes: Vec<String> = if pve_node == "auto" {
         node_choices
-            .first()
-            .map(|choice| choice.value.as_str())
-            .unwrap_or("auto")
+            .iter()
+            .map(|choice| choice.value.clone())
+            .collect()
     } else {
-        pve_node.as_str()
+        vec![pve_node.clone()]
     };
-    let setup_resources = setup_client
-        .as_ref()
-        .map(|client| discover_setup_resources(client, discovery_node))
-        .transpose()?;
+    let resource_scope = if pve_node == "auto" {
+        "all online PVE nodes".to_owned()
+    } else {
+        format!("PVE node {pve_node}")
+    };
+    let setup_resources = match setup_client.as_ref() {
+        Some(client) if !resource_nodes.is_empty() => {
+            discover_setup_resources_with_retry(style, client, &resource_nodes, &resource_scope)?
+        }
+        _ => None,
+    };
     let rootfs_choices = setup_resources
         .as_ref()
         .map(|resources| resources.rootfs_storages.as_slice())
@@ -3317,13 +3404,17 @@ fn is_vmid_conflict(error: &PveError) -> bool {
     }
 }
 
-fn prepare_new_template(
+fn prepare_new_template_with_progress(
     client: &impl PveApi,
     config: &Config,
     command: &NewCommand,
+    progress: Option<SetupStyle>,
 ) -> Result<(Option<String>, Option<String>)> {
     if command.ostemplate.is_some() {
         return Ok((None, None));
+    }
+    if let Some(style) = progress {
+        style.progress("Resolving PVE node and image template...");
     }
 
     let image = non_empty_new_value(
@@ -3348,21 +3439,27 @@ fn prepare_new_template(
     }
 
     let oci_image = oci_reference_for_image(&image);
+    if let Some(style) = progress {
+        style.progress(&format!("Preparing OCI image {oci_image} for PVE..."));
+    }
     let mut prepared = prepare_oci_template(client, &node, storage, &oci_image)?;
     if let Some(task) = prepared.task.take() {
-        wait_for_oci_template_task(
+        wait_for_oci_template_task_with_progress(
             client,
             &node,
             storage,
             &prepared.reference,
             &prepared.volume,
             task,
+            progress,
         )?;
     }
     Ok((Some(node), Some(prepared.volume)))
 }
 
 fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorChoice) -> Result<()> {
+    let progress = SetupStyle::for_stderr(color, json);
+    progress.progress("Starting box creation...");
     let config = load_config(store)?;
     let agent_binary = resolve_agent_binary(&config)?;
     if !agent_binary.is_file() {
@@ -3371,8 +3468,11 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
             agent_binary.display()
         ));
     }
+    progress.progress("Connecting to PVE...");
     let client = client_from_config(&config)?;
-    let (prepared_node, prepared_ostemplate) = prepare_new_template(&client, &config, &command)?;
+    let (prepared_node, prepared_ostemplate) =
+        prepare_new_template_with_progress(&client, &config, &command, Some(progress))?;
+    progress.progress("Resolving box resource defaults...");
     let resolved = resolve_new_command_with_template(
         &client,
         &config,
@@ -3380,8 +3480,13 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         prepared_ostemplate.as_deref(),
         prepared_node.as_deref(),
     )?;
+    progress.progress("Checking existing boxes...");
     let existing = discover_boxes(&client)?;
     let id = generate_unique_id(&existing)?;
+    progress.progress(&format!(
+        "Box {id} allocated; creating LXC on node {}...",
+        resolved.node
+    ));
     let id_text = id.to_string();
     let materials = agent_materials(&config, &id_text)?;
     let key = BootstrapKey::generate(&id_text).context("create temporary bootstrap SSH key")?;
@@ -3404,6 +3509,7 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
             Ok(result) => result,
             Err(error) => return Err(cleanup_uncreated_bootstrap(&key, error, &id_text)),
         };
+    progress.progress(&format!("Waiting for PVE to create VMID {vmid}..."));
     operation.vmid = Some(vmid);
     operation.phase = "container-created".to_owned();
     save_bootstrap_operation(
@@ -3412,7 +3518,13 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         "record created container in bootstrap recovery operation",
         &id_text,
     )?;
-    if let Err(error) = wait_for_task(&client, &resolved.node, task) {
+    if let Err(error) = wait_for_task_with_progress(
+        &client,
+        &resolved.node,
+        task,
+        Some(progress),
+        "container creation",
+    ) {
         operation.phase = "container-create-task".to_owned();
         let _ = key.save_operation(&operation);
         return Err(error)
@@ -3430,7 +3542,8 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         &id_text,
     )?;
 
-    let ip = match wait_for_lxc_ip(&client, &resolved.node, vmid) {
+    progress.progress("Waiting for the container IPv4 address...");
+    let ip = match wait_for_lxc_ip_with_progress(&client, &resolved.node, vmid, Some(progress)) {
         Ok(ip) => ip,
         Err(error) => {
             operation.phase = "ip-discovery".to_owned();
@@ -3450,6 +3563,7 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
     )?;
     operation.phase = "bootstrapping".to_owned();
     save_bootstrap_operation(&key, &operation, "record guest bootstrap start", &id_text)?;
+    progress.progress(&format!("Bootstrapping pbox-agent over SSH at {ip}..."));
     let bootstrap_request = BootstrapRequest {
         box_id: &id_text,
         ip,
@@ -3463,6 +3577,7 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
     if let Err(error) = bootstrap_box(&bootstrap_request) {
         return Err(error).context(format_bootstrap_repair_path(&key, &id_text));
     }
+    progress.progress("Verifying authenticated pbox-agent...");
     operation.phase = "agent-ready".to_owned();
     save_bootstrap_operation(
         &key,
@@ -3477,6 +3592,7 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         client_ca: &materials.ca,
         client_subject: &materials.client_subject,
     };
+    progress.progress("Removing temporary bootstrap credentials...");
     cleanup_bootstrap_with_fallback(&probe, &key)
         .with_context(|| format_bootstrap_repair_path(&key, &id_text))?;
     operation.phase = "guest-cleaned".to_owned();
@@ -3488,12 +3604,20 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         )
     })?;
 
+    progress.progress("Box bootstrap complete.");
     let (state, output_ip) = if resolved.stopped {
+        progress.progress(&format!("Stopping box {id}..."));
         let task = client
             .shutdown_lxc(&resolved.node, vmid)
             .with_context(|| format!("stop bootstrapped box {id}"))?;
-        wait_for_task(&client, &resolved.node, task)
-            .with_context(|| format!("PVE did not finish stopping box {id}"))?;
+        wait_for_task_with_progress(
+            &client,
+            &resolved.node,
+            task,
+            Some(progress),
+            "box shutdown",
+        )
+        .with_context(|| format!("PVE did not finish stopping box {id}"))?;
         ("stopped".to_owned(), None)
     } else {
         ("running".to_owned(), Some(ip.to_string()))
@@ -4086,6 +4210,38 @@ fn generate_unique_id(existing: &[BoxRecord]) -> Result<PboxId> {
     Err(anyhow!("could not allocate a unique pbox identifier"))
 }
 
+const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+fn spawn_progress_heartbeat(
+    style: Option<SetupStyle>,
+    message: impl Into<String>,
+) -> Option<Arc<AtomicBool>> {
+    let style = style?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let message = message.into();
+    thread::spawn(move || {
+        let started = Instant::now();
+        while !thread_stop.load(Ordering::Relaxed) {
+            thread::sleep(PROGRESS_HEARTBEAT_INTERVAL);
+            if thread_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            style.progress(&format!(
+                "{message} ({}s elapsed)",
+                started.elapsed().as_secs()
+            ));
+        }
+    });
+    Some(stop)
+}
+
+fn stop_progress_heartbeat(stop: Option<Arc<AtomicBool>>) {
+    if let Some(stop) = stop {
+        stop.store(true, Ordering::Relaxed);
+    }
+}
+
 fn wait_for_oci_template_task(
     client: &impl PveApi,
     node: &str,
@@ -4094,7 +4250,21 @@ fn wait_for_oci_template_task(
     volume: &str,
     task: PveTaskResponse,
 ) -> Result<()> {
-    if let Err(task_error) = wait_for_task(client, node, task) {
+    wait_for_oci_template_task_with_progress(client, node, storage, reference, volume, task, None)
+}
+
+fn wait_for_oci_template_task_with_progress(
+    client: &impl PveApi,
+    node: &str,
+    storage: &str,
+    reference: &str,
+    volume: &str,
+    task: PveTaskResponse,
+    progress: Option<SetupStyle>,
+) -> Result<()> {
+    let description = format!("OCI image {reference}");
+    if let Err(task_error) = wait_for_task_with_progress(client, node, task, progress, &description)
+    {
         if oci_template_present(client, node, storage, volume)
             .with_context(|| format!("recheck OCI template {volume}"))?
         {
@@ -4106,28 +4276,97 @@ fn wait_for_oci_template_task(
 }
 
 fn wait_for_task(client: &impl PveApi, node: &str, task: PveTaskResponse) -> Result<()> {
+    wait_for_task_with_progress(client, node, task, None, "PVE task")
+}
+const TASK_LOG_LIMIT: u64 = 40;
+const TASK_LOG_MAX_CHARS: usize = 8 * 1024;
+
+fn task_error_with_log(
+    client: &impl PveApi,
+    node: &str,
+    upid: &str,
+    message: String,
+) -> anyhow::Error {
+    let Ok(entries) = client.get_task_log(node, upid, 0, TASK_LOG_LIMIT) else {
+        return anyhow!(message);
+    };
+    let mut log = String::new();
+    let mut used = 0;
+    for entry in entries {
+        let line = safe_terminal_text(&entry.t);
+        if line.is_empty() {
+            continue;
+        }
+        for character in line.chars() {
+            if used >= TASK_LOG_MAX_CHARS {
+                break;
+            }
+            log.push(character);
+            used += 1;
+        }
+        if used >= TASK_LOG_MAX_CHARS {
+            break;
+        }
+        log.push('\n');
+        used += 1;
+    }
+    if log.is_empty() {
+        return anyhow!(message);
+    }
+    anyhow!("{message}\nPVE task log:\n{}", log.trim_end())
+}
+
+fn wait_for_task_with_progress(
+    client: &impl PveApi,
+    node: &str,
+    task: PveTaskResponse,
+    progress: Option<SetupStyle>,
+    description: &str,
+) -> Result<()> {
+    let heartbeat = spawn_progress_heartbeat(
+        progress,
+        format!("Waiting for {description} on PVE node {node}"),
+    );
     let started = Instant::now();
-    loop {
-        let status = client
-            .get_task_status(node, &task.upid)
-            .context("read PVE task status")?;
+    let result = loop {
+        let status = match client.get_task_status(node, &task.upid) {
+            Ok(status) => status,
+            Err(error) => break Err(anyhow!("read PVE task status: {error}")),
+        };
         if status.status == "stopped" {
             if status.is_successful() {
-                return Ok(());
+                break Ok(());
             }
-            return Err(anyhow!(
-                "PVE task failed: {}",
-                status
-                    .exitstatus
-                    .as_deref()
-                    .unwrap_or("missing exit status")
+            break Err(task_error_with_log(
+                client,
+                node,
+                &task.upid,
+                format!(
+                    "PVE task failed on node {node} (UPID {}): {}",
+                    task.upid,
+                    status
+                        .exitstatus
+                        .as_deref()
+                        .unwrap_or("missing exit status")
+                ),
             ));
         }
         if started.elapsed() >= PVE_TASK_TIMEOUT {
-            return Err(anyhow!("PVE task did not finish within five minutes"));
+            break Err(task_error_with_log(
+                client,
+                node,
+                &task.upid,
+                format!(
+                    "PVE task {} on node {node} did not finish within {} seconds",
+                    task.upid,
+                    PVE_TASK_TIMEOUT.as_secs(),
+                ),
+            ));
         }
         thread::sleep(PVE_TASK_POLL_INTERVAL);
-    }
+    };
+    stop_progress_heartbeat(heartbeat);
+    result
 }
 
 fn run_list(store: &ConfigStore, json: bool, color: ColorChoice) -> Result<()> {
@@ -4282,28 +4521,44 @@ const LXC_IP_TIMEOUT: Duration = Duration::from_secs(60);
 const LXC_IP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 fn wait_for_lxc_ip(client: &impl PveApi, node: &str, vmid: u64) -> Result<Ipv4Addr> {
+    wait_for_lxc_ip_with_progress(client, node, vmid, None)
+}
+
+fn wait_for_lxc_ip_with_progress(
+    client: &impl PveApi,
+    node: &str,
+    vmid: u64,
+    progress: Option<SetupStyle>,
+) -> Result<Ipv4Addr> {
+    let heartbeat = spawn_progress_heartbeat(
+        progress,
+        format!("Waiting for an IPv4 address for LXC {vmid} on node {node}"),
+    );
     let started = Instant::now();
     let mut last_error = None;
-    while started.elapsed() < LXC_IP_TIMEOUT {
+    let result = loop {
         match discover_lxc_ip(client, node, vmid) {
             Ok(Some(address)) => {
-                return address
+                break address
                     .parse()
                     .with_context(|| format!("parse discovered IPv4 address {address}"));
             }
             Ok(None) => {}
             Err(error) => last_error = Some(error.to_string()),
         }
+        if started.elapsed() >= LXC_IP_TIMEOUT {
+            let reason = last_error.as_deref().unwrap_or(
+                "PVE returned no usable IPv4 address; check DHCP or static network configuration",
+            );
+            break Err(anyhow!(
+                "could not discover an IPv4 address within {} seconds: {reason}",
+                LXC_IP_TIMEOUT.as_secs()
+            ));
+        }
         thread::sleep(LXC_IP_POLL_INTERVAL);
-    }
-    Err(anyhow!(
-        "could not discover an IPv4 address within {} seconds{}",
-        LXC_IP_TIMEOUT.as_secs(),
-        last_error
-            .as_deref()
-            .map(|error| format!(": {error}"))
-            .unwrap_or_default()
-    ))
+    };
+    stop_progress_heartbeat(heartbeat);
+    result
 }
 
 fn discover_lxc_ip(client: &impl PveApi, node: &str, vmid: u64) -> Result<Option<String>> {
@@ -4489,15 +4744,16 @@ fn color_enabled(color: ColorChoice, json: bool) -> bool {
 mod tests {
     use super::{
         ANSI_CYAN, AnsibleRun, BootstrapKey, BoxRecord, Cli, Command, ForwardCommand, NewCommand,
-        RecipeSnapshot, SetupAnswers, SetupCommand, SetupOutput, SetupStyle, SshCommand,
-        agent_identity_changes, apply_setup_values, create_box_snapshot, create_lxc_with_retry,
-        create_recipe_snapshot, delete_box_snapshot, delete_recipe_snapshot, exec_exit_code,
-        finish_recipe_failure, finish_recipe_success, format_snapshot_time, parse_env_entry,
-        parse_recipe_sync_ttl, parse_remote_path, parse_setup_bool, record_recipe_provenance,
-        resolve_new_command, resolve_pve_node_with_storage, rollback_box_snapshot,
-        safe_terminal_text, setup_pve_error_message, ssh_command_argv, template_matches,
-        validate_forward_arguments, validate_snapshot_arguments, validate_ssh_arguments,
-        wait_for_oci_template_task, write_download,
+        RecipeSnapshot, SetupAnswers, SetupChoice, SetupCommand, SetupOutput, SetupStyle,
+        SshCommand, agent_identity_changes, apply_setup_values, create_box_snapshot,
+        create_lxc_with_retry, create_recipe_snapshot, delete_box_snapshot, delete_recipe_snapshot,
+        exec_exit_code, finish_recipe_failure, finish_recipe_success, format_snapshot_time,
+        parse_env_entry, parse_recipe_sync_ttl, parse_remote_path, parse_setup_bool,
+        record_recipe_provenance, resolve_new_command, resolve_pve_node_with_storage,
+        rollback_box_snapshot, safe_terminal_text, setup_choice_default, setup_pve_error_message,
+        ssh_command_argv, template_matches, validate_forward_arguments,
+        validate_snapshot_arguments, validate_ssh_arguments, wait_for_oci_template_task,
+        write_download,
     };
     use anyhow::anyhow;
     use clap::Parser;
@@ -4506,7 +4762,7 @@ mod tests {
     use pbox_core::{
         ClusterResource, Config, LxcConfig, LxcConfigUpdateRequest, LxcCreateRequest, LxcInterface,
         LxcSnapshot, LxcSnapshotRequest, PboxId, PboxMetadata, PveApi, PveError,
-        PveNetworkInterface, PveNode, PveStorage, PveStorageContent, PveTaskResponse,
+        PveNetworkInterface, PveNode, PveStorage, PveStorageContent, PveTaskLog, PveTaskResponse,
         PveTaskStatus, encode_metadata, parse_metadata,
     };
     use std::cell::RefCell;
@@ -4524,6 +4780,7 @@ mod tests {
         create_conflicts: RefCell<usize>,
         events: RefCell<Vec<String>>,
         oci_tags: RefCell<Vec<String>>,
+        task_log: RefCell<Vec<PveTaskLog>>,
         fail_next_task: RefCell<bool>,
         fail_create: RefCell<bool>,
         fail_updates: RefCell<bool>,
@@ -4568,6 +4825,7 @@ mod tests {
                 create_conflicts: RefCell::new(0),
                 events: RefCell::new(Vec::new()),
                 oci_tags: RefCell::new(Vec::new()),
+                task_log: RefCell::new(Vec::new()),
                 fail_create: RefCell::new(false),
                 fail_next_task: RefCell::new(false),
                 fail_updates: RefCell::new(false),
@@ -4576,6 +4834,9 @@ mod tests {
 
         fn fail_next_task(&self) {
             *self.fail_next_task.borrow_mut() = true;
+        }
+        fn set_task_log(&self, entries: Vec<PveTaskLog>) {
+            *self.task_log.borrow_mut() = entries;
         }
 
         fn fail_create(&self) {
@@ -4701,6 +4962,15 @@ mod tests {
                 starttime: None,
                 type_: None,
             })
+        }
+        fn get_task_log(
+            &self,
+            _node: &str,
+            _upid: &str,
+            _start: u64,
+            _limit: u64,
+        ) -> Result<Vec<PveTaskLog>, PveError> {
+            Ok(self.task_log.borrow().clone())
         }
 
         fn create_lxc(
@@ -4860,13 +5130,54 @@ mod tests {
         let metadata = PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007);
         let fake = FakePve::new(&metadata, "user note");
         let discovery = super::discover_setup_nodes(&fake).unwrap();
-        let resources = super::discover_setup_resources(&fake, "pve01").unwrap();
+        let resources = super::discover_setup_resources(&fake, &["pve01".to_owned()]).unwrap();
 
         assert_eq!(discovery.nodes[0].value, "pve01");
         assert_eq!(resources.rootfs_storages[0].value, "local");
         assert_eq!(resources.template_storages[0].value, "local");
         assert_eq!(resources.bridges[0].value, "vmbr0");
         assert!(resources.bridges[0].description.contains("192.0.2.1/24"));
+    }
+
+    #[test]
+    fn setup_choice_default_keeps_explicit_auto() {
+        let choices = vec![
+            SetupChoice {
+                value: "pve01".to_owned(),
+                description: "online".to_owned(),
+            },
+            SetupChoice {
+                value: "pve02".to_owned(),
+                description: "online".to_owned(),
+            },
+        ];
+
+        assert_eq!(setup_choice_default("auto", &choices, true), "auto");
+        assert_eq!(setup_choice_default("pve02", &choices, true), "pve02");
+        assert_eq!(setup_choice_default("missing", &choices, true), "auto");
+        assert_eq!(setup_choice_default("auto", &choices, false), "pve01");
+    }
+
+    #[test]
+    fn task_failure_includes_safe_pve_log() {
+        let metadata = PboxMetadata::new(PboxId::parse("pbx_t3yzd9y3").unwrap(), 9007);
+        let fake = FakePve::new(&metadata, "user note");
+        fake.set_task_log(vec![PveTaskLog {
+            n: 0,
+            t: "ERROR: no space\u{1b}[31m".to_owned(),
+        }]);
+
+        let error = super::task_error_with_log(
+            &fake,
+            "pve01",
+            "UPID:pve01:1:2:3:create",
+            "PVE task failed".to_owned(),
+        );
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains("PVE task log:"));
+        assert!(rendered.contains("ERROR: no space"));
+        assert!(!rendered.contains('\u{1b}'));
     }
     #[test]
     fn new_command_accepts_zero_arguments() {
@@ -5027,7 +5338,7 @@ mod tests {
         let fake = FakePve::new(&metadata, "user note");
         fake.storage_content.borrow_mut().clear();
 
-        let (node, template) = super::prepare_new_template(
+        let (node, template) = super::prepare_new_template_with_progress(
             &fake,
             &Config::default(),
             &NewCommand {
@@ -5042,6 +5353,7 @@ mod tests {
                 cores: None,
                 stopped: false,
             },
+            None,
         )
         .unwrap();
 

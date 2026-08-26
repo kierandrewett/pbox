@@ -1,10 +1,19 @@
 use anyhow::{Context, Result, bail};
+#[cfg(unix)]
+use nix::sys::signal::{Signal, killpg};
+#[cfg(unix)]
+use nix::unistd::Pid;
 use pbox_core::{PveApi, PveError, PveTaskResponse};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageReference {
@@ -328,39 +337,42 @@ fn build_local_oci_archive(reference: &str, filename: &str) -> Result<PathBuf> {
             ],
             "create temporary OCI container",
         )?;
-        run_local_command(
-            "podman",
-            &["start", "--attach", container.as_str()],
-            "install pbox guest prerequisites in OCI container",
-        )?;
         let tar = workspace.join(format!("{filename}.tar"));
         let compressed = workspace.join(format!("{filename}.tar.zst"));
-        let tar_text = path_text(&tar)?;
-        let compressed_text = path_text(&compressed)?;
-        let export_result = run_local_command(
-            "podman",
-            &["export", "--output", tar_text.as_str(), container.as_str()],
-            "export OCI container rootfs",
-        );
+        let operation_result = (|| {
+            let tar_text = path_text(&tar)?;
+            let compressed_text = path_text(&compressed)?;
+            run_local_command(
+                "podman",
+                &["start", "--attach", container.as_str()],
+                "install pbox guest prerequisites in OCI container",
+            )?;
+            run_local_command(
+                "podman",
+                &["export", "--output", tar_text.as_str(), container.as_str()],
+                "export OCI container rootfs",
+            )?;
+            run_local_command(
+                "zstd",
+                &[
+                    "--quiet",
+                    "--threads=0",
+                    "--force",
+                    tar_text.as_str(),
+                    "-o",
+                    compressed_text.as_str(),
+                ],
+                "compress OCI rootfs template",
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })();
         let cleanup_result = run_local_command(
             "podman",
             &["rm", "--force", container.as_str()],
             "remove temporary OCI container",
         );
-        export_result?;
+        operation_result?;
         cleanup_result?;
-        run_local_command(
-            "zstd",
-            &[
-                "--quiet",
-                "--threads=0",
-                "--force",
-                tar_text.as_str(),
-                "-o",
-                compressed_text.as_str(),
-            ],
-            "compress OCI rootfs template",
-        )?;
         Ok(compressed)
     })();
     match result {
@@ -396,31 +408,124 @@ fn path_text(path: &Path) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("local OCI path is not valid UTF-8: {}", path.display()))
 }
 
+const LOCAL_OCI_COMMAND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const LOCAL_OCI_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
 fn run_local_command(program: &str, args: &[&str], action: &str) -> Result<()> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("{action}; command '{program}' is unavailable"))?;
+    let output = run_local_process(program, args, action)?;
+    ensure_local_command_success(&output, action)
+}
+
+fn ensure_local_command_success(output: &Output, action: &str) -> Result<()> {
     if output.status.success() {
         return Ok(());
     }
-    bail!("{action} failed with exit status {}", output.status)
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if detail.is_empty() {
+        bail!("{action} failed: {}", output.status);
+    }
+    bail!("{action} failed: {}: {detail}", output.status);
 }
 
 fn run_local_command_output(program: &str, args: &[&str], action: &str) -> Result<String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("{action}; command '{program}' is unavailable"))?;
-    if !output.status.success() {
-        bail!("{action} failed with exit status {}", output.status);
-    }
+    let output = run_local_process(program, args, action)?;
+    ensure_local_command_success(&output, action)?;
     let value = String::from_utf8(output.stdout).context("read local OCI command output")?;
     let value = value.trim();
     if value.is_empty() {
         bail!("{action} returned no container identifier");
     }
     Ok(value.to_owned())
+}
+
+fn run_local_process(program: &str, args: &[&str], action: &str) -> Result<Output> {
+    eprintln!("[image] {action}");
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("{action}; command '{program}' is unavailable"))?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_local_process(&mut child);
+            bail!("{action} did not expose stdout");
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            terminate_local_process(&mut child);
+            bail!("{action} did not expose stderr");
+        }
+    };
+    let stdout_reader = thread::spawn(move || read_command_stream(stdout));
+    let stderr_reader = thread::spawn(move || read_command_stream(stderr));
+    let status = wait_for_local_process(&mut child, action)?;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("{action} stdout reader stopped unexpectedly"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("{action} stderr reader stopped unexpectedly"))??;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_command_stream(mut stream: impl Read) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    stream.read_to_end(&mut output)?;
+    Ok(output)
+}
+
+fn wait_for_local_process(child: &mut Child, action: &str) -> Result<ExitStatus> {
+    let started = Instant::now();
+    let mut next_progress = LOCAL_OCI_PROGRESS_INTERVAL;
+    loop {
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                terminate_local_process(child);
+                return Err(error).with_context(|| format!("wait for {action}"));
+            }
+        };
+        if let Some(status) = status {
+            return Ok(status);
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= LOCAL_OCI_COMMAND_TIMEOUT {
+            terminate_local_process(child);
+            bail!(
+                "{action} did not finish within {} minutes",
+                LOCAL_OCI_COMMAND_TIMEOUT.as_secs() / 60
+            );
+        }
+        if elapsed >= next_progress {
+            eprintln!(
+                "[image] {action} still running ({}s elapsed)",
+                elapsed.as_secs()
+            );
+            next_progress += LOCAL_OCI_PROGRESS_INTERVAL;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn terminate_local_process(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 pub fn oci_template_present(

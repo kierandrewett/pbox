@@ -70,6 +70,19 @@ pub trait PveApi {
     fn list_lxc_interfaces(&self, node: &str, vmid: u64) -> Result<Vec<LxcInterface>, PveError>;
     fn list_lxc_snapshots(&self, node: &str, vmid: u64) -> Result<Vec<LxcSnapshot>, PveError>;
     fn get_task_status(&self, node: &str, upid: &str) -> Result<PveTaskStatus, PveError>;
+    /// Read a bounded slice of a PVE task log.
+    fn get_task_log(
+        &self,
+        node: &str,
+        upid: &str,
+        start: u64,
+        limit: u64,
+    ) -> Result<Vec<PveTaskLog>, PveError> {
+        let _ = (node, upid, start, limit);
+        Err(PveError::Unsupported(
+            "this PVE client does not support task log queries".to_owned(),
+        ))
+    }
     fn create_lxc(
         &self,
         node: &str,
@@ -251,6 +264,19 @@ impl PveApi for PveClient {
         validate_path_segment(node, "node")?;
         validate_path_segment(upid, "UPID")?;
         self.get(&format!("/nodes/{node}/tasks/{upid}/status"))
+    }
+    fn get_task_log(
+        &self,
+        node: &str,
+        upid: &str,
+        start: u64,
+        limit: u64,
+    ) -> Result<Vec<PveTaskLog>, PveError> {
+        validate_path_segment(node, "node")?;
+        validate_path_segment(upid, "UPID")?;
+        self.get(&format!(
+            "/nodes/{node}/tasks/{upid}/log?start={start}&limit={limit}"
+        ))
     }
 
     fn list_nodes(&self) -> Result<Vec<PveNode>, PveError> {
@@ -860,6 +886,12 @@ impl PveTaskStatus {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct PveTaskLog {
+    pub n: u64,
+    pub t: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct PveResponse<T> {
     data: T,
@@ -943,6 +975,27 @@ mod tests {
         let response: PveResponse<PveTaskResponse> =
             serde_json::from_str(r#"{"data":"UPID:pve:1:2:3:create"}"#).unwrap();
         assert_eq!(response.data.upid, "UPID:pve:1:2:3:create");
+    }
+
+    #[test]
+    fn task_log_response_decodes() {
+        let log: Vec<PveTaskLog> =
+            serde_json::from_str(r#"[{"n":0,"t":"create started"},{"n":1,"t":"ERROR: no space"}]"#)
+                .unwrap();
+
+        assert_eq!(
+            log,
+            vec![
+                PveTaskLog {
+                    n: 0,
+                    t: "create started".to_owned(),
+                },
+                PveTaskLog {
+                    n: 1,
+                    t: "ERROR: no space".to_owned(),
+                },
+            ]
+        );
     }
 
     #[test]
