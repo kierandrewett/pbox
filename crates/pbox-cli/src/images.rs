@@ -323,11 +323,18 @@ fn build_local_oci_archive(reference: &str, filename: &str) -> Result<PathBuf> {
             &["pull", "--quiet", image.as_str()],
             "pull OCI image with podman",
         )?;
-        let container = run_local_command_output(
+        let container = workspace
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("local OCI workspace has no valid container name"))?
+            .to_owned();
+        run_local_command(
             "podman",
             &[
                 "create",
                 "--quiet",
+                "--name",
+                container.as_str(),
                 "--network",
                 "host",
                 image.as_str(),
