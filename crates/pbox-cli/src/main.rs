@@ -125,7 +125,10 @@ enum Command {
         force: bool,
     },
     /// Permanently delete a pbox-managed container.
+    #[command(visible_alias = "rm")]
     Delete {
+        /// Public pbox identifier, or `current` when exactly one box exists.
+        #[arg(value_name = "ID|current")]
         id: String,
         /// Confirm the destructive operation.
         #[arg(long)]
@@ -3925,6 +3928,51 @@ fn cleanup_pending_bootstrap(box_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn is_current_box_reference(value: &str) -> bool {
+    value.eq_ignore_ascii_case("current")
+}
+
+fn find_box_reference(client: &impl PveApi, requested_id: &str) -> Result<BoxRecord> {
+    if !is_current_box_reference(requested_id) {
+        return find_box(client, requested_id);
+    }
+    let boxes = discover_boxes(client)?;
+    match boxes.len() {
+        0 => bail!("current box is not defined; no pbox-managed containers were found"),
+        1 => Ok(boxes
+            .into_iter()
+            .next()
+            .expect("one current box must be present")),
+        _ => {
+            let available = boxes
+                .iter()
+                .map(|record| {
+                    format!(
+                        "{} ({} on node {}, VMID {})",
+                        record.id,
+                        record.name.as_deref().unwrap_or("unnamed"),
+                        record.node,
+                        record.vmid
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("current box is ambiguous; choose an explicit ID: {available}");
+        }
+    }
+}
+
+fn print_delete_target(style: SetupStyle, requested_id: &str, record: &BoxRecord) {
+    style.section("Delete target");
+    style.metadata("reference", requested_id);
+    style.metadata("id", &record.id.to_string());
+    style.metadata("name", record.name.as_deref().unwrap_or("-"));
+    style.metadata("state", &record.state);
+    style.metadata("node", &record.node);
+    style.metadata("vmid", &record.vmid.to_string());
+    style.hint("This operation is permanent. Repeat with --yes to continue.");
+}
+
 fn run_delete(
     store: &ConfigStore,
     requested_id: &str,
@@ -3932,13 +3980,23 @@ fn run_delete(
     json: bool,
     color: ColorChoice,
 ) -> Result<()> {
+    let client = client_from_store(store)?;
+    let record = find_box_reference(&client, requested_id)?;
+    let style = SetupStyle::for_stderr(color, json);
     if !confirmed {
+        print_delete_target(style, requested_id, &record);
         return Err(anyhow!(
-            "deleting a box is permanent; repeat the command with --yes"
+            "deletion not confirmed for box {}; repeat the command with --yes",
+            record.id
         ));
     }
-    let client = client_from_store(store)?;
-    let record = find_box(&client, requested_id)?;
+    style.progress(&format!(
+        "Deleting box {} ({} on node {}, VMID {})...",
+        record.id,
+        record.name.as_deref().unwrap_or("unnamed"),
+        record.node,
+        record.vmid
+    ));
     let task = client
         .delete_lxc(&record.node, record.vmid)
         .with_context(|| format!("delete box {}", record.id))?;
@@ -3954,8 +4012,10 @@ fn run_delete(
     if json {
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        let _ = color_enabled(color, json);
-        println!("deleted {}", output.id);
+        let output_style = SetupStyle::for_stdout(color, json);
+        output_style.stdout_status("ok", ANSI_GREEN, &format!("Deleted box {}.", output.id));
+        output_style.stdout_metadata("vmid", &output.vmid.to_string());
+        output_style.stdout_metadata("node", &output.node);
     }
     Ok(())
 }
@@ -4649,63 +4709,66 @@ fn print_box_info(info: &BoxInfo, json: bool, color: ColorChoice) -> Result<()> 
     if json {
         println!("{}", serde_json::to_string_pretty(info)?);
     } else {
-        let _ = color_enabled(color, json);
-        println!("  id:     {}", safe_terminal_text(&info.id.to_string()));
-        println!("  vmid:   {}", info.vmid);
-        println!("  state:  {}", safe_terminal_text(&info.state));
-        println!("  node:   {}", safe_terminal_text(&info.node));
-        println!(
-            "  ip:     {}",
-            safe_terminal_text(info.ip.as_deref().unwrap_or("-"))
-        );
-        println!(
-            "  name:   {}",
-            safe_terminal_text(info.name.as_deref().unwrap_or("-"))
-        );
+        let style = SetupStyle::for_stdout(color, json);
+        style.stdout_status("box", ANSI_CYAN, &info.id.to_string());
+        style.stdout_metadata("vmid", &info.vmid.to_string());
+        style.stdout_metadata("state", &info.state);
+        style.stdout_metadata("node", &info.node);
+        style.stdout_metadata("ip", info.ip.as_deref().unwrap_or("-"));
+        style.stdout_metadata("name", info.name.as_deref().unwrap_or("-"));
         let recipes = info
             .recipes
             .iter()
             .map(|recipe| safe_terminal_text(&recipe.id))
             .collect::<Vec<_>>()
             .join(", ");
-        println!(
-            "  recipes: {}",
-            if recipes.is_empty() { "-" } else { &recipes }
-        );
+        style.stdout_metadata("recipes", if recipes.is_empty() { "-" } else { &recipes });
         let capabilities = safe_terminal_text(&info.capabilities.join(", "));
-        println!(
-            "  capabilities: {}",
+        style.stdout_metadata(
+            "capabilities",
             if capabilities.is_empty() {
                 "-"
             } else {
                 &capabilities
-            }
+            },
         );
     }
     Ok(())
 }
 
+fn box_state_colour(state: &str) -> &'static str {
+    match state {
+        "running" => ANSI_GREEN,
+        "stopped" => ANSI_YELLOW,
+        _ => ANSI_RED,
+    }
+}
+
+fn format_box_cell(style: SetupStyle, value: &str, width: usize, code: &str) -> String {
+    let value = style.text(value);
+    style.paint(code, &format!("{value:<width$}"))
+}
+
 fn print_box_records(records: &[BoxRecord], colour: bool) {
-    println!(
+    let style = SetupStyle::from_enabled(colour);
+    let header = format!(
         "{:<16} {:<10} {:<16} {:<16} NAME",
         "ID", "STATE", "NODE", "IP"
     );
+    println!("{}", style.paint(ANSI_BOLD_CYAN, &header));
     for record in records {
-        let id = if colour {
-            format!("\x1b[1;36m{}\x1b[0m", record.id)
-        } else {
-            record.id.to_string()
-        };
-        println!(
-            "{id:<16} {:<10} {:<16} {:<16} {}",
-            record.state,
-            record.node,
-            record.ip.as_deref().unwrap_or("-"),
-            record.name.as_deref().unwrap_or("-")
-        );
+        let id = format_box_cell(style, &record.id.to_string(), 16, ANSI_CYAN);
+        let state = format_box_cell(style, &record.state, 10, box_state_colour(&record.state));
+        let node = format_box_cell(style, &record.node, 16, ANSI_CYAN);
+        let ip = format_box_cell(style, record.ip.as_deref().unwrap_or("-"), 16, "");
+        let name = style.text(record.name.as_deref().unwrap_or("-"));
+        println!("{id} {state} {node} {ip} {name}");
     }
     if records.is_empty() {
-        println!("No pbox-managed containers found.");
+        println!(
+            "{}",
+            style.paint(ANSI_DIM, "No pbox-managed containers found.")
+        );
     }
 }
 
@@ -4743,9 +4806,9 @@ fn color_enabled(color: ColorChoice, json: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANSI_CYAN, AnsibleRun, BootstrapKey, BoxRecord, Cli, Command, ForwardCommand, NewCommand,
-        RecipeSnapshot, SetupAnswers, SetupChoice, SetupCommand, SetupOutput, SetupStyle,
-        SshCommand, agent_identity_changes, apply_setup_values, create_box_snapshot,
+        ANSI_CYAN, ANSI_RESET, AnsibleRun, BootstrapKey, BoxRecord, Cli, Command, ForwardCommand,
+        NewCommand, RecipeSnapshot, SetupAnswers, SetupChoice, SetupCommand, SetupOutput,
+        SetupStyle, SshCommand, agent_identity_changes, apply_setup_values, create_box_snapshot,
         create_lxc_with_retry, create_recipe_snapshot, delete_box_snapshot, delete_recipe_snapshot,
         exec_exit_code, finish_recipe_failure, finish_recipe_success, format_snapshot_time,
         parse_env_entry, parse_recipe_sync_ttl, parse_remote_path, parse_setup_bool,
@@ -5179,6 +5242,40 @@ mod tests {
         assert!(rendered.contains("ERROR: no space"));
         assert!(!rendered.contains('\u{1b}'));
     }
+    #[test]
+    fn delete_command_accepts_rm_alias_and_current() {
+        let cli = Cli::try_parse_from(["pbox", "rm", "current", "--yes"]).unwrap();
+        let Command::Delete { id, yes } = cli.command else {
+            panic!("expected delete command");
+        };
+
+        assert_eq!(id, "current");
+        assert!(yes);
+    }
+
+    #[test]
+    fn current_box_reference_resolves_the_only_box() {
+        let record = test_record();
+        let metadata = test_metadata(&record);
+        let fake = FakePve::new(&metadata, "user note");
+        fake.resources
+            .borrow_mut()
+            .push(test_cluster_resource(record.vmid));
+
+        let resolved = super::find_box_reference(&fake, "current").unwrap();
+
+        assert_eq!(resolved.id, record.id);
+        assert_eq!(resolved.vmid, record.vmid);
+    }
+
+    #[test]
+    fn coloured_table_cells_pad_before_ansi_codes() {
+        let style = SetupStyle::from_enabled(true);
+        let cell = super::format_box_cell(style, "pve", 16, ANSI_CYAN);
+
+        assert_eq!(cell, format!("{ANSI_CYAN}{:<16}{ANSI_RESET}", "pve"));
+    }
+
     #[test]
     fn new_command_accepts_zero_arguments() {
         let cli = Cli::try_parse_from(["pbox", "new"]).unwrap();
