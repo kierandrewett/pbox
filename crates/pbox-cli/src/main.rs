@@ -3438,6 +3438,9 @@ fn prepare_new_template_with_progress(
         "templates",
     )?;
     if let Some(template) = find_pve_template(client, &node, storage, &image)? {
+        if let Some(style) = progress {
+            style.progress(&format!("Using existing PVE template {template}..."));
+        }
         return Ok((Some(node), Some(template)));
     }
 

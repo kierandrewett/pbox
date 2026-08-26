@@ -7,7 +7,7 @@ use pbox_core::{PveApi, PveError, PveTaskResponse};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Read;
+use std::io::{self, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -318,11 +318,8 @@ fn build_local_oci_archive(reference: &str, filename: &str) -> Result<PathBuf> {
     let workspace = create_local_oci_workspace(filename)?;
     let result = (|| {
         let image = ImageReference::parse(reference)?.canonical();
-        run_local_command(
-            "podman",
-            &["pull", "--quiet", image.as_str()],
-            "pull OCI image with podman",
-        )?;
+        let pull_action = format!("Pulling OCI image {image}");
+        run_local_command("podman", &["pull", "--quiet", image.as_str()], &pull_action)?;
         let container = workspace
             .file_name()
             .and_then(|name| name.to_str())
@@ -342,7 +339,7 @@ fn build_local_oci_archive(reference: &str, filename: &str) -> Result<PathBuf> {
                 "-c",
                 OCI_GUEST_PREPARATION,
             ],
-            "create temporary OCI container",
+            "Creating temporary OCI container",
         )?;
         let tar = workspace.join(format!("{filename}.tar"));
         let compressed = workspace.join(format!("{filename}.tar.zst"));
@@ -352,12 +349,12 @@ fn build_local_oci_archive(reference: &str, filename: &str) -> Result<PathBuf> {
             run_local_command(
                 "podman",
                 &["start", "--attach", container.as_str()],
-                "install pbox guest prerequisites in OCI container",
+                "Installing guest prerequisites (systemd, OpenSSH, sudo, Python)",
             )?;
             run_local_command(
                 "podman",
                 &["export", "--output", tar_text.as_str(), container.as_str()],
-                "export OCI container rootfs",
+                "Exporting OCI container root filesystem",
             )?;
             run_local_command(
                 "zstd",
@@ -369,14 +366,14 @@ fn build_local_oci_archive(reference: &str, filename: &str) -> Result<PathBuf> {
                     "-o",
                     compressed_text.as_str(),
                 ],
-                "compress OCI rootfs template",
+                "Compressing OCI root filesystem",
             )?;
             Ok::<(), anyhow::Error>(())
         })();
         let cleanup_result = run_local_command(
             "podman",
             &["rm", "--force", container.as_str()],
-            "remove temporary OCI container",
+            "Removing temporary OCI container",
         );
         operation_result?;
         cleanup_result?;
@@ -501,28 +498,58 @@ fn wait_for_local_process(child: &mut Child, action: &str) -> Result<ExitStatus>
             Ok(status) => status,
             Err(error) => {
                 terminate_local_process(child);
+                finish_local_progress(action, started.elapsed(), "failed");
                 return Err(error).with_context(|| format!("wait for {action}"));
             }
         };
         if let Some(status) = status {
+            finish_local_progress(
+                action,
+                started.elapsed(),
+                if status.success() { "done" } else { "failed" },
+            );
             return Ok(status);
         }
         let elapsed = started.elapsed();
         if elapsed >= LOCAL_OCI_COMMAND_TIMEOUT {
             terminate_local_process(child);
+            finish_local_progress(action, elapsed, "timed out");
             bail!(
                 "{action} did not finish within {} minutes",
                 LOCAL_OCI_COMMAND_TIMEOUT.as_secs() / 60
             );
         }
         if elapsed >= next_progress {
-            eprintln!(
-                "[image] {action} still running ({}s elapsed)",
-                elapsed.as_secs()
-            );
+            report_local_progress(action, elapsed);
             next_progress += LOCAL_OCI_PROGRESS_INTERVAL;
         }
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn report_local_progress(action: &str, elapsed: Duration) {
+    if io::stderr().is_terminal() {
+        eprint!("\r\x1b[2K[image] {action} ({}s elapsed)", elapsed.as_secs());
+        let _ = io::stderr().flush();
+    } else {
+        eprintln!(
+            "[image] {action} still running ({}s elapsed)",
+            elapsed.as_secs()
+        );
+    }
+}
+
+fn finish_local_progress(action: &str, elapsed: Duration, outcome: &str) {
+    if io::stderr().is_terminal() {
+        eprintln!(
+            "\r\x1b[2K[image] {action} {outcome} ({}s elapsed)",
+            elapsed.as_secs()
+        );
+    } else {
+        eprintln!(
+            "[image] {action} {outcome} ({}s elapsed)",
+            elapsed.as_secs()
+        );
     }
 }
 
