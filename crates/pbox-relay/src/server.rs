@@ -12,7 +12,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{Mutex, Semaphore, oneshot};
+use tokio::sync::{Mutex, Notify, Semaphore, oneshot};
 
 type Waiting = HashMap<String, (u64, oneshot::Sender<WebSocket>)>;
 
@@ -20,6 +20,8 @@ struct Relay {
     key: String,
     waiting: Mutex<Waiting>,
     slots: Arc<Semaphore>,
+    clients: Arc<Semaphore>,
+    available: Notify,
     next: std::sync::atomic::AtomicU64,
 }
 
@@ -40,6 +42,8 @@ pub fn router(key: String, max_connections: usize) -> anyhow::Result<Router> {
             key,
             waiting: Mutex::new(HashMap::new()),
             slots: Arc::new(Semaphore::new(max_connections)),
+            clients: Arc::new(Semaphore::new(max_connections)),
+            available: Notify::new(),
             next: Default::default(),
         })))
 }
@@ -63,10 +67,28 @@ async fn upgrade(
     }
     let ws = ws.max_message_size(64 * 1024).max_frame_size(64 * 1024);
     if role == "client" {
-        let Some((_, sender)) = state.waiting.lock().await.remove(&box_id) else {
+        let Ok(permit) = state.clients.clone().try_acquire_owned() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        // A busy agent replenishes its waiting socket after handing off a session.
+        // Wait for that socket so simultaneous CLI commands do not race into 503s.
+        let sender = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let notified = state.available.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if let Some((_, sender)) = state.waiting.lock().await.remove(&box_id) {
+                    break sender;
+                }
+                notified.await;
+            }
+        })
+        .await;
+        let Ok(sender) = sender else {
             return (StatusCode::SERVICE_UNAVAILABLE, "agent is not connected").into_response();
         };
         return ws.on_upgrade(move |socket| async move {
+            let _permit = permit;
             let _ = sender.send(socket);
         });
     }
@@ -84,17 +106,26 @@ async fn upgrade(
         }
         waiting.insert(box_id.clone(), (generation, sender));
     }
-    ws.on_upgrade(move |socket| async move {
+    state.available.notify_waiters();
+    let failed_state = state.clone();
+    let failed_box = box_id.clone();
+    ws.on_failed_upgrade(move |_| {
+        tokio::spawn(async move {
+            remove_waiter(&failed_state, &failed_box, generation).await;
+        });
+    })
+    .on_upgrade(move |socket| async move {
         let _permit = permit;
         let _ = wait_and_forward(socket, receiver).await;
-        let mut waiting = state.waiting.lock().await;
-        if waiting
-            .get(&box_id)
-            .is_some_and(|(id, _)| *id == generation)
-        {
-            waiting.remove(&box_id);
-        }
+        remove_waiter(&state, &box_id, generation).await;
     })
+}
+
+async fn remove_waiter(state: &Relay, box_id: &str, generation: u64) {
+    let mut waiting = state.waiting.lock().await;
+    if waiting.get(box_id).is_some_and(|(id, _)| *id == generation) {
+        waiting.remove(box_id);
+    }
 }
 
 async fn wait_and_forward(
@@ -140,7 +171,11 @@ async fn forward(
 }
 
 /// Serve on an existing listener, also used by end-to-end transport tests.
-pub async fn serve(listener: tokio::net::TcpListener, key: String, max_connections: usize) -> anyhow::Result<()> {
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    key: String,
+    max_connections: usize,
+) -> anyhow::Result<()> {
     axum::serve(listener, router(key, max_connections)?).await?;
     Ok(())
 }

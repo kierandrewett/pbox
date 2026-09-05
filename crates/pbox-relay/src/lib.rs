@@ -223,7 +223,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            axum::serve(listener, server::router(KEY.to_owned(), 8).unwrap())
+            axum::serve(listener, server::router(KEY.to_owned(), 32).unwrap())
                 .await
                 .unwrap();
         });
@@ -248,17 +248,11 @@ mod tests {
             url,
             token: scoped_token(KEY, "client", BOX),
         };
-        for _ in 0..2 {
-            let mut stream = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    if let Ok(stream) = connect(&access, BOX).await {
-                        break stream;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
+        futures_util::future::join_all((0..8).map(|_| async {
+            let mut stream = tokio::time::timeout(Duration::from_secs(5), connect(&access, BOX))
+                .await
+                .unwrap()
+                .unwrap();
             let payload: Vec<u8> = (0..200_000).map(|i| (i % 256) as u8).collect();
             let (mut read, mut write) = tokio::io::split(&mut stream);
             let mut received = vec![0; payload.len()];
@@ -269,7 +263,10 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(payload, received);
-        }
+        }))
+        .await;
+        // A later command must still connect after the concurrent batch closes.
+        connect(&access, BOX).await.unwrap();
         agent.abort();
         echo.abort();
         server.abort();
