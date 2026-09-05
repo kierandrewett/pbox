@@ -2175,6 +2175,11 @@ fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOu
     let config = load_config(store)?;
     let (box_id, endpoint) =
         resolve_agent_endpoint(&config, &command.id, command.endpoint.as_deref())?;
+    let box_name = client_from_config(&config)
+        .and_then(|client| find_box(&client, &box_id))
+        .ok()
+        .and_then(|record| record.name)
+        .unwrap_or_else(|| box_id.clone());
     let materials = agent_materials(&config, &box_id)?;
     let env = ssh_environment(&command.env, std::env::var("COLORTERM").ok())?;
     let argv = ssh_command_argv(&command.argv);
@@ -2212,16 +2217,18 @@ fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOu
     }
     let signals = runtime.block_on(install_terminal_signals())?;
     let terminal = TerminalModeGuard::enter()?;
+    let title = ui::TerminalTitleGuard::enter(&box_name);
     let result = runtime.block_on(run_ssh_session_with_signals(
         &mut client,
         argv,
         command.cwd,
         env,
         command.user,
-        terminal.as_ref(),
+        (terminal.as_ref(), title.as_ref()),
         signals,
     ));
     drop(terminal);
+    drop(title);
     let result = result?;
     let exit_code = exec_exit_code(&result);
     if exit_code == 0 {
@@ -2359,7 +2366,7 @@ async fn run_ssh_session_with_signals(
     cwd: String,
     env: Vec<(String, String)>,
     user: String,
-    terminal: Option<&TerminalModeGuard>,
+    terminal: (Option<&TerminalModeGuard>, Option<&ui::TerminalTitleGuard>),
     signals: TerminalSignals,
 ) -> Result<ExecResult> {
     #[cfg(unix)]
@@ -2371,7 +2378,7 @@ async fn run_ssh_session_with_signals(
             mut terminate,
         } = signals;
         tokio::select! {
-            result = run_ssh_session(client, argv, cwd, env, user) => result,
+            result = run_ssh_session(client, argv, cwd, env, user, terminal.1.map(|title| title.name.as_str())) => result,
             _ = interrupt.recv() => terminate_after_signal(terminal, 128 + 2),
             _ = hangup.recv() => terminate_after_signal(terminal, 128 + 1),
             _ = quit.recv() => terminate_after_signal(terminal, 128 + 3),
@@ -2381,16 +2388,27 @@ async fn run_ssh_session_with_signals(
     #[cfg(not(unix))]
     {
         let _ = (terminal, signals);
-        run_ssh_session(client, argv, cwd, env, user).await
+        run_ssh_session(
+            client,
+            argv,
+            cwd,
+            env,
+            user,
+            terminal.1.map(|title| title.name.as_str()),
+        )
+        .await
     }
 }
 
 #[cfg(unix)]
 fn terminate_after_signal(
-    terminal: Option<&TerminalModeGuard>,
+    terminal: (Option<&TerminalModeGuard>, Option<&ui::TerminalTitleGuard>),
     exit_code: i32,
 ) -> Result<ExecResult> {
-    if let Some(terminal) = terminal {
+    if let Some(title) = terminal.1 {
+        title.restore();
+    }
+    if let Some(terminal) = terminal.0 {
         terminal.restore();
     }
     std::process::exit(exit_code);
@@ -2402,6 +2420,7 @@ async fn run_ssh_session(
     cwd: String,
     env: Vec<(String, String)>,
     user: String,
+    title: Option<&str>,
 ) -> Result<ExecResult> {
     let mut session = client
         .exec_pty_session(argv, cwd, env, user)
@@ -2410,6 +2429,7 @@ async fn run_ssh_session(
     let input_sender = session.input.clone();
     let _input_thread = thread::spawn(move || pump_terminal_input(input_sender));
     let mut result = ExecResult::default();
+    let mut titles = ui::TitlePrefix::new(title);
     while let Some(event) = session
         .output
         .message()
@@ -2418,12 +2438,12 @@ async fn run_ssh_session(
     {
         match event.event {
             Some(exec_event::Event::Stdout(data)) => {
-                write_pty_output(data, false)
+                write_pty_output(titles.push(&data), false)
                     .await
                     .context("write pbox-agent PTY output")?;
             }
             Some(exec_event::Event::Stderr(data)) => {
-                write_pty_output(data, true)
+                write_pty_output(titles.push(&data), true)
                     .await
                     .context("write pbox-agent PTY error output")?;
             }
@@ -2436,6 +2456,7 @@ async fn run_ssh_session(
             None => bail!("pbox-agent PTY stream sent an empty event"),
         }
     }
+    write_pty_output(titles.finish(), false).await?;
     if !result.exited {
         bail!("pbox-agent PTY stream ended without exit status");
     }
@@ -4287,12 +4308,27 @@ fn wait_for_task_with_progress(
         progress,
         format!("Waiting for {description} on PVE node {node}"),
     );
+    progress::substep(description);
     let started = Instant::now();
+    let mut log_cursor = 0;
+    let mut last_log = None::<Instant>;
     let result = loop {
         let status = match client.get_task_status(node, &task.upid) {
             Ok(status) => status,
             Err(error) => break Err(anyhow!("read PVE task status: {error}")),
         };
+        if (progress::has_details() || progress::verbose())
+            && (last_log.is_none_or(|time| time.elapsed() >= Duration::from_secs(1))
+                || status.status == "stopped")
+        {
+            if let Ok(lines) = client.get_task_log(node, &task.upid, log_cursor, 100) {
+                for line in lines {
+                    log_cursor = log_cursor.max(line.n);
+                    progress::log(&line.t);
+                }
+            }
+            last_log = Some(Instant::now());
+        }
         if status.status == "stopped" {
             if status.is_successful() {
                 break Ok(());
@@ -4326,6 +4362,7 @@ fn wait_for_task_with_progress(
         thread::sleep(PVE_TASK_POLL_INTERVAL);
     };
     stop_progress_heartbeat(heartbeat);
+    progress::substep_done(description, started.elapsed().as_secs(), result.is_ok());
     result
 }
 

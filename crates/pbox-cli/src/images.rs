@@ -336,7 +336,7 @@ pub fn build_local_oci_archive(
     let result = (|| {
         let image = ImageReference::parse(reference)?.canonical();
         let pull_action = format!("Pulling OCI image {image}");
-        run_local_command("podman", &["pull", "--quiet", image.as_str()], &pull_action)?;
+        run_local_command("podman", &["pull", image.as_str()], &pull_action)?;
         let container = workspace
             .file_name()
             .and_then(|name| name.to_str())
@@ -511,9 +511,7 @@ fn run_local_process_inner(
     report_stdout: bool,
     timeout: Duration,
 ) -> Result<Output> {
-    if super::progress::verbose() {
-        super::ui::stderr().diagnostic(action);
-    }
+    super::progress::substep(action);
     let mut command = Command::new(program);
     command
         .args(args)
@@ -540,13 +538,13 @@ fn run_local_process_inner(
         }
     };
     let stdout_reader = thread::spawn(move || {
-        if report_stdout && super::progress::verbose() {
+        if report_stdout {
             read_and_report_command_stream(stdout)
         } else {
             read_command_stream(stdout)
         }
     });
-    let stderr_reader = thread::spawn(move || read_command_stream(stderr));
+    let stderr_reader = thread::spawn(move || read_and_report_command_stream(stderr));
     let status = wait_for_local_process(&mut child, action, timeout)?;
     let stdout = stdout_reader
         .join()
@@ -577,9 +575,7 @@ fn read_and_report_command_stream(stream: impl Read) -> Result<Vec<u8>> {
         }
         output.extend_from_slice(line.as_bytes());
         let cleaned = line.trim_end_matches(['\r', '\n']);
-        if let Some(message) = cleaned.strip_prefix("[pbox-image] ") {
-            super::ui::stderr().diagnostic(message);
-        }
+        super::progress::log(cleaned.strip_prefix("[pbox-image] ").unwrap_or(cleaned));
     }
     Ok(output)
 }
@@ -632,12 +628,7 @@ fn report_local_progress(action: &str, elapsed: Duration) {
 }
 
 fn finish_local_progress(action: &str, elapsed: Duration, outcome: &str) {
-    if super::progress::verbose() {
-        super::ui::stderr().diagnostic(&format!(
-            "{action} {outcome} ({}s elapsed)",
-            elapsed.as_secs()
-        ));
-    }
+    super::progress::substep_done(action, elapsed.as_secs(), outcome == "done");
 }
 
 fn terminate_local_process(child: &mut Child) {

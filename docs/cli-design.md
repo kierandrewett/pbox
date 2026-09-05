@@ -31,12 +31,18 @@ before human display. Calculate table padding before applying colour.
 - `NO_COLOR` and `--json` disable colour, including command help and usage errors.
 - JSON result schemas stay unchanged. Never insert a heading or success message
   into JSON stdout. `json_text` accepts already-serialised machine output only.
+- Interactive SSH saves the host terminal title, sets the box name, and
+  restores the title on disconnect using the terminal title stack. Guest OSC 0/1/2 title
+  changes receive a `box-name · ` prefix, including across transport chunks. Terminals without title-stack support may not restore it.
 - Guest output from `exec` and `ssh`, transferred files, and Ansible process output
-  are data streams. Preserve their bytes; do not style or sanitise them.
+  are data streams. Preserve their bytes; do not style or sanitise them, except
+  for the interactive SSH title prefix described above.
 - Creation keeps each completed step with a green `ok` and its elapsed time, then
   shows a new spinner for the active step on a capable terminal. Failed steps are
   never marked complete. Redirected output
-  and `TERM=dumb` use separate phase lines. Detailed preparation logs need `--verbose`.
+  and `TERM=dumb` use separate phase lines. The active phase expands to show recent
+  substeps and a bounded live log tail, then collapses on completion. `--verbose`
+  keeps the full preparation logs.
 - Image preparation names the resolved OCI reference, including its registry and tag
   or digest. The creation result repeats it in an `image` metadata row.
 - Normal output describes the user's operation. Put implementation details in

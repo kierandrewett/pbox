@@ -200,14 +200,6 @@ impl CliStyle {
             self.paint(ANSI_DIM, &format!("({elapsed}s)"))
         );
     }
-    pub(crate) fn spinner_frame(self, marker: &str, phase: &str, elapsed: u64) {
-        eprint!(
-            "\r\x1b[2K{} {}",
-            self.status(marker, ANSI_CYAN, phase),
-            self.paint(ANSI_DIM, &format!("({elapsed}s)"))
-        );
-        let _ = io::stderr().flush();
-    }
     pub(crate) fn can_animate(self) -> bool {
         self.interactive
     }
@@ -554,9 +546,318 @@ pub(crate) fn user_access(box_id: &str, user: &str, access: super::guest::UserAc
     style.hint(&format!("pbox ssh {box_id} --user root"));
 }
 
+/// A bounded live block; completing a phase replaces the block with one summary row.
+pub(crate) struct CreationDisplay {
+    style: CliStyle,
+    phase: Option<String>,
+    started: std::time::Instant,
+    active: Option<(String, std::time::Instant)>,
+    completed: std::collections::VecDeque<(String, u64, bool)>,
+    logs: std::collections::VecDeque<String>,
+    drawn: usize,
+    frame: usize,
+    last_draw: std::time::Instant,
+}
+impl CreationDisplay {
+    pub(crate) fn new() -> Self {
+        Self {
+            style: stderr(),
+            phase: None,
+            started: std::time::Instant::now(),
+            active: None,
+            completed: Default::default(),
+            logs: Default::default(),
+            drawn: 0,
+            frame: 0,
+            last_draw: std::time::Instant::now(),
+        }
+    }
+    pub(crate) fn phase(&mut self, phase: String) {
+        self.finish(true);
+        self.phase = Some(phase);
+        self.started = std::time::Instant::now();
+        self.completed.clear();
+        self.logs.clear();
+        self.active = None;
+    }
+    pub(crate) fn substep(&mut self, action: String) {
+        self.active = Some((action, std::time::Instant::now()));
+        self.logs.clear();
+    }
+    pub(crate) fn substep_done(&mut self, action: String, elapsed: u64, success: bool) {
+        self.active = None;
+        self.completed.push_back((action, elapsed, success));
+        while self.completed.len() > 6 {
+            self.completed.pop_front();
+        }
+    }
+    pub(crate) fn log(&mut self, line: String) {
+        if !line.trim().is_empty() {
+            self.logs.push_back(line);
+            while self.logs.len() > 3 {
+                self.logs.pop_front();
+            }
+        }
+    }
+    fn clear(&mut self) {
+        if self.drawn == 0 {
+            return;
+        }
+        eprint!("\r\x1b[2K");
+        for _ in 1..self.drawn {
+            eprint!("\x1b[1A\r\x1b[2K");
+        }
+        self.drawn = 0;
+    }
+    pub(crate) fn tick(&mut self) {
+        if self.phase.is_none()
+            || (self.drawn > 0 && self.last_draw.elapsed() < std::time::Duration::from_millis(120))
+        {
+            return;
+        }
+        self.clear();
+        let width = terminal_columns().saturating_sub(1).max(10);
+        let clipped = |value: &str, reserve: usize| -> String {
+            clip_terminal_text(value, width.saturating_sub(reserve))
+        };
+        let phase = self.phase.as_deref().unwrap_or_default();
+        let marker = ["|", "/", "-", "\\"][self.frame % 4];
+        let mut rows = vec![format!(
+            "{} {}",
+            self.style.status(marker, ANSI_CYAN, &clipped(phase, 12)),
+            self.style.paint(
+                ANSI_DIM,
+                &format!("({}s)", self.started.elapsed().as_secs())
+            )
+        )];
+        for (action, elapsed, success) in &self.completed {
+            rows.push(format!(
+                "  {} {} {}",
+                self.style.paint(
+                    if *success { ANSI_GREEN } else { ANSI_RED },
+                    if *success { "ok" } else { "x" }
+                ),
+                clipped(action, 14),
+                self.style.paint(ANSI_DIM, &format!("({elapsed}s)"))
+            ));
+        }
+        if let Some((action, started)) = &self.active {
+            rows.push(format!(
+                "  {} {} {}",
+                self.style.paint(ANSI_CYAN, marker),
+                clipped(action, 14),
+                self.style
+                    .paint(ANSI_DIM, &format!("({}s)", started.elapsed().as_secs()))
+            ));
+        }
+        for line in &self.logs {
+            rows.push(format!(
+                "    {}",
+                self.style.paint(ANSI_DIM, &clipped(line, 4))
+            ));
+        }
+        self.drawn = rows.len();
+        eprint!("{}", rows.join("\r\n"));
+        let _ = io::stderr().flush();
+        self.frame += 1;
+        self.last_draw = std::time::Instant::now();
+    }
+    pub(crate) fn finish(&mut self, success: bool) {
+        self.clear();
+        if let Some(phase) = self.phase.take() {
+            if success {
+                self.style
+                    .completed_step(&phase, self.started.elapsed().as_secs());
+            } else {
+                self.style.error(&phase);
+                for line in &self.logs {
+                    self.style.hint(line);
+                }
+            }
+        }
+    }
+}
+fn clip_terminal_text(value: &str, width: usize) -> String {
+    let text = safe_terminal_text(value);
+    if text.chars().count() <= width {
+        text
+    } else {
+        format!(
+            "{}...",
+            text.chars()
+                .take(width.saturating_sub(3))
+                .collect::<String>()
+        )
+    }
+}
+fn terminal_columns() -> usize {
+    #[cfg(unix)]
+    {
+        let mut size = nix::libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        if unsafe { nix::libc::ioctl(nix::libc::STDERR_FILENO, nix::libc::TIOCGWINSZ, &mut size) }
+            == 0
+            && size.ws_col > 0
+        {
+            return size.ws_col as usize;
+        }
+    }
+    80
+}
+
+/// Save/restore the host title without consuming terminal replies or guest output.
+/// Guest OSC titles are prefixed separately by TitlePrefix.
+pub(crate) struct TerminalTitleGuard {
+    pub(crate) name: String,
+}
+impl TerminalTitleGuard {
+    pub(crate) fn enter(name: &str) -> Option<Self> {
+        if !io::stdout().is_terminal()
+            || !io::stderr().is_terminal()
+            || std::env::var("TERM").is_ok_and(|term| term == "dumb")
+        {
+            return None;
+        }
+        let mut output = io::stderr().lock();
+        let _ = write!(output, "\x1b[22;0t\x1b]2;{}\x07", safe_terminal_text(name));
+        let _ = output.flush();
+        Some(Self {
+            name: safe_terminal_text(name),
+        })
+    }
+    pub(crate) fn restore(&self) {
+        let mut output = io::stderr().lock();
+        let _ = write!(output, "\x1b[23;0t");
+        let _ = output.flush();
+    }
+}
+
+impl Drop for TerminalTitleGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+/// Recognise only OSC title headers; all other bytes pass through unchanged.
+/// Buffer at most the four-byte header, including across transport chunks.
+pub(crate) struct TitlePrefix {
+    prefix: Option<Vec<u8>>,
+    pending: Vec<u8>,
+    in_osc: bool,
+    escaped: bool,
+}
+impl TitlePrefix {
+    pub(crate) fn new(name: Option<&str>) -> Self {
+        Self {
+            prefix: name.map(|name| format!("{} · ", safe_terminal_text(name)).into_bytes()),
+            pending: Vec::new(),
+            in_osc: false,
+            escaped: false,
+        }
+    }
+    pub(crate) fn push(&mut self, data: &[u8]) -> Vec<u8> {
+        let Some(prefix) = &self.prefix else {
+            return data.to_vec();
+        };
+        let mut output = Vec::with_capacity(data.len());
+        for &byte in data {
+            if self.in_osc {
+                output.push(byte);
+                if byte == 7 || (self.escaped && byte == b'\\') {
+                    self.in_osc = false;
+                }
+                self.escaped = byte == 27;
+                continue;
+            }
+            self.pending.push(byte);
+            if self.pending == b"\x1b"
+                || self.pending == b"\x1b]"
+                || matches!(self.pending.as_slice(), b"\x1b]0" | b"\x1b]1" | b"\x1b]2")
+            {
+                continue;
+            }
+            if matches!(
+                self.pending.as_slice(),
+                b"\x1b]0;" | b"\x1b]1;" | b"\x1b]2;"
+            ) {
+                output.append(&mut self.pending);
+                output.extend_from_slice(prefix);
+                self.in_osc = true;
+                self.escaped = false;
+            } else {
+                // Other OSC commands (hyperlinks, clipboard, colours) are opaque.
+                if self.pending.starts_with(b"\x1b]") {
+                    self.in_osc = byte != 7;
+                    self.escaped = byte == 27;
+                }
+                let trailing_escape = !self.in_osc && self.pending.len() > 1 && byte == 27;
+                if trailing_escape {
+                    self.pending.pop();
+                }
+                output.append(&mut self.pending);
+                if trailing_escape {
+                    self.pending.push(27);
+                }
+            }
+        }
+        output
+    }
+    pub(crate) fn finish(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending)
+    }
+}
+
 #[cfg(test)]
 mod design_tests {
     use super::*;
+
+    #[test]
+    fn titles_are_prefixed_across_every_chunk_boundary() {
+        let input = b"prompt \x1b]0;shell\x07\x1b]2;editor\x1b\\\x1b]1;icon\x07 done";
+        let expected = "prompt \x1b]0;my-box · shell\x07\x1b]2;my-box · editor\x1b\\\x1b]1;my-box · icon\x07 done".as_bytes();
+        for size in 1..=input.len() {
+            let mut filter = TitlePrefix::new(Some("my-box"));
+            let mut output = Vec::new();
+            for chunk in input.chunks(size) {
+                output.extend(filter.push(chunk));
+            }
+            output.extend(filter.finish());
+            assert_eq!(output, expected, "chunk size {size}");
+        }
+    }
+
+    #[test]
+    fn title_proxy_preserves_other_output_and_redirected_streams() {
+        let input = b"\x1b[31mred\x1b[0m\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x07\x1b]52;c;data\x07\xff\x1b";
+        let mut filter = TitlePrefix::new(Some("box"));
+        let mut output = Vec::new();
+        for byte in input {
+            output.extend(filter.push(&[*byte]));
+        }
+        output.extend(filter.finish());
+        assert_eq!(output, input);
+        assert_eq!(
+            TitlePrefix::new(None).push(b"\x1b]2;title\x07"),
+            b"\x1b]2;title\x07"
+        );
+    }
+
+    #[test]
+    fn live_logs_are_bounded_and_cannot_move_the_cursor() {
+        let mut display = CreationDisplay::new();
+        for n in 0..100 {
+            display.log(format!("line {n}"));
+        }
+        assert_eq!(display.logs.len(), 3);
+        assert_eq!(display.logs.front().unwrap(), "line 97");
+        assert_eq!(clip_terminal_text("abc\x1b[2Jdef", 6), "abc...");
+        display.substep("next".to_owned());
+        assert!(display.logs.is_empty());
+    }
 
     #[test]
     fn confirmation_uses_shared_prompt_tokens_in_colour_and_plain_text() {

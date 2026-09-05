@@ -14,12 +14,15 @@ pbox ssh BOX_ID
 With a relay configured, creation keeps completed steps above the active spinner
 and names the resolved image. The result shows that image, available IPv4/IPv6
 addresses, and the exact command to connect. Use
-`pbox new --verbose` for image preparation details. Preparing an OCI image still
+`pbox new --verbose` to retain full logs. While a phase runs, recent substeps and
+live image/PVE logs expand beneath it; they collapse into its completed row. Preparing an OCI image still
 installs the prerequisites needed to boot it as an LXC guest.
 
 `pbox info` and `pbox list` show both address families when assigned; loopback and
 link-local IPv6 addresses are omitted. JSON retains `ip` for IPv4 and adds `ipv6`.
-`pbox ssh` opens the guest user's configured login shell.
+`pbox ssh` opens the guest user's configured login shell. Interactive terminal
+titles are prefixed with `box-name · ` as the shell or apps update them. The previous
+host title is restored on disconnect in terminals that support the title stack.
 
 `pbox rm BOX_ID` asks for confirmation, shuts down a running box, then deletes it.
 Press Enter to cancel, or use `--yes` to skip the prompt in scripts. If shutdown

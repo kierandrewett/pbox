@@ -171,6 +171,7 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
         creation.phase(&format!("Preparing {image}"));
         let archive = super::images::build_local_oci_archive(&image, &filename, Some(&payload))?;
         creation.phase("Creating your box");
+        super::progress::substep(&format!("Uploading image to {node}/{storage}"));
         let upload = client.upload_storage_template(
             &node,
             storage,
@@ -201,7 +202,9 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
         key.save_operation(&operation)?;
         cleanup_template(&client, &key, &mut operation)?;
         creation.phase("Connecting to your box");
+        super::progress::substep("Waiting for the outbound agent");
         wait_ready(config, &box_id)?;
+        super::progress::substep("Checking guest access");
         let access = if !json {
             Some(super::guest::check(config, &box_id, ENDPOINT))
         } else {
