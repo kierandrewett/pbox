@@ -1,10 +1,10 @@
 set shell := ["bash", "-uc"]
 
 check:
-    cargo check --workspace
+    cargo clippy --workspace --all-targets -- -D warnings
 
 test:
-    cargo test -p pbox-core
+    cargo test --workspace
 
 fmt:
     cargo fmt --all

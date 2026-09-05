@@ -33,5 +33,9 @@ Pbox needs Linux, a compatible guest agent binary, and Podman plus zstd for loca
 OCI image preparation. Image authors choose their own LLM tools. No Tailscale
 installation is required when using a reachable relay.
 
+All commands follow the [CLI design system](docs/cli-design.md), enforced by
+shared rendering components and Clippy checks. `just check` runs strict Clippy;
+`just test` runs all workspace tests.
+
 Run `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings`
 to check the workspace. See `GOAL.md`, `PLAN.md`, and `TODO.md` for scope and remaining work.
