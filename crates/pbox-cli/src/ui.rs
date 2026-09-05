@@ -1,0 +1,570 @@
+//! Shared terminal design system. Command handlers must use this module for presentation.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+use super::{
+    BoxInfo, BoxRecord, Cli, ColorChoice, RecipeCatalog, SnapshotActionOutput, box_state_colour,
+    format_snapshot_time, recipes,
+};
+use anyhow::{Context, Result};
+use pbox_core::LxcSnapshot;
+use serde::Serialize;
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::sync::atomic::{AtomicU8, Ordering};
+static MODE: AtomicU8 = AtomicU8::new(0);
+pub(crate) fn configure(color: ColorChoice, json: bool) {
+    MODE.store(
+        if json {
+            3
+        } else {
+            match color {
+                ColorChoice::Auto => 0,
+                ColorChoice::Always => 1,
+                ColorChoice::Never => 2,
+            }
+        },
+        Ordering::Relaxed,
+    );
+}
+fn options() -> (ColorChoice, bool) {
+    match MODE.load(Ordering::Relaxed) {
+        1 => (ColorChoice::Always, false),
+        2 => (ColorChoice::Never, false),
+        3 => (ColorChoice::Never, true),
+        _ => (ColorChoice::Auto, false),
+    }
+}
+pub(crate) fn stderr() -> CliStyle {
+    let (color, json) = options();
+    CliStyle::for_stderr(color, json)
+}
+pub(crate) fn stdout() -> CliStyle {
+    let (color, json) = options();
+    CliStyle::for_stdout(color, json)
+}
+/// Only already-serialised machine output belongs here.
+pub(crate) fn json_text(value: &str) {
+    println!("{value}");
+}
+pub(crate) fn blank_stderr() {
+    eprintln!();
+}
+pub(crate) fn blank_stdout() {
+    println!();
+}
+pub(crate) const PROMPT_LABEL_WIDTH: usize = 30;
+pub(crate) const ANSI_BOLD: &str = "\x1b[1m";
+pub(crate) const ANSI_DIM: &str = "\x1b[2m";
+pub(crate) const ANSI_CYAN: &str = "\x1b[36m";
+pub(crate) const ANSI_BOLD_CYAN: &str = "\x1b[1;36m";
+pub(crate) const ANSI_GREEN: &str = "\x1b[1;32m";
+pub(crate) const ANSI_YELLOW: &str = "\x1b[1;33m";
+pub(crate) const ANSI_RED: &str = "\x1b[1;31m";
+pub(crate) const ANSI_RESET: &str = "\x1b[0m";
+
+#[derive(Clone, Copy)]
+pub(crate) struct CliStyle {
+    enabled: bool,
+    interactive: bool,
+}
+
+impl CliStyle {
+    pub(crate) fn for_stderr(color: ColorChoice, json: bool) -> Self {
+        let terminal = io::stderr().is_terminal();
+        let enabled = color_enabled_for(color, json, terminal);
+        Self {
+            enabled,
+            interactive: terminal && !json && std::env::var("TERM").as_deref() != Ok("dumb"),
+        }
+    }
+
+    pub(crate) fn for_stdout(color: ColorChoice, json: bool) -> Self {
+        let terminal = io::stdout().is_terminal();
+        let enabled = color_enabled_for(color, json, terminal);
+        Self {
+            enabled,
+            interactive: terminal && !json && std::env::var("TERM").as_deref() != Ok("dumb"),
+        }
+    }
+
+    pub(crate) fn from_enabled(enabled: bool) -> Self {
+        Self {
+            enabled,
+            interactive: false,
+        }
+    }
+
+    pub(crate) fn text(self, value: &str) -> String {
+        safe_terminal_text(value)
+    }
+
+    pub(crate) fn paint(self, code: &str, value: &str) -> String {
+        let value = self.text(value);
+        if self.enabled && !code.is_empty() {
+            format!("{code}{value}{ANSI_RESET}")
+        } else {
+            value
+        }
+    }
+
+    pub(crate) fn status(self, marker: &str, code: &str, message: &str) -> String {
+        format!(
+            "{} {}",
+            self.paint(code, marker),
+            self.paint(ANSI_BOLD, message)
+        )
+    }
+
+    pub(crate) fn heading(self, message: &str) {
+        eprintln!("{}", self.paint(ANSI_BOLD_CYAN, message));
+    }
+
+    pub(crate) fn section(self, message: &str) {
+        eprintln!();
+        eprintln!("{}", self.paint(ANSI_BOLD_CYAN, message));
+    }
+
+    pub(crate) fn hint(self, message: &str) {
+        eprintln!("  {}", self.paint(ANSI_DIM, message));
+    }
+
+    pub(crate) fn metadata(self, label: &str, value: &str) {
+        let label = format!("{label:<12}");
+        eprintln!("  {} {}", self.paint(ANSI_DIM, &label), self.text(value));
+    }
+
+    pub(crate) fn warning(self, message: &str) {
+        eprintln!("{}", self.status("!", ANSI_YELLOW, message));
+    }
+
+    pub(crate) fn error(self, message: &str) {
+        eprintln!("{}", self.status("x", ANSI_RED, message));
+    }
+
+    pub(crate) fn progress(self, message: &str) {
+        eprintln!("{}", self.status(">", ANSI_CYAN, message));
+    }
+    pub(crate) fn progress_live(self, message: &str) {
+        if self.interactive {
+            eprint!("\r\x1b[2K{}", self.status(">", ANSI_CYAN, message));
+            let _ = io::stderr().flush();
+        } else {
+            self.progress(message);
+        }
+    }
+
+    pub(crate) fn clear_progress_line(self) {
+        if self.interactive {
+            eprint!("\r\x1b[2K");
+            let _ = io::stderr().flush();
+        }
+    }
+
+    pub(crate) fn prompt_text(self, label: &str, default: Option<&str>) -> String {
+        let label = format!("{label:<PROMPT_LABEL_WIDTH$}");
+        let default = default
+            .filter(|value| !value.is_empty())
+            .map(|value| format!(" {}", self.paint(ANSI_DIM, &format!("[{value}]"))))
+            .unwrap_or_default();
+        format!(
+            "{} {}{default}: ",
+            self.paint(ANSI_CYAN, "?"),
+            self.paint(ANSI_BOLD, &label)
+        )
+    }
+    pub(crate) fn prompt(self, label: &str, default: Option<&str>) -> Result<()> {
+        eprint!("{}", self.prompt_text(label, default));
+        io::stderr().flush().context("flush prompt")
+    }
+    pub(crate) fn success(self, message: &str) {
+        self.stdout_status("ok", ANSI_GREEN, message);
+    }
+    pub(crate) fn stdout_heading(self, message: &str) {
+        println!("{}", self.paint(ANSI_BOLD_CYAN, message));
+    }
+    pub(crate) fn stdout_hint(self, message: &str) {
+        println!("  {}", self.paint(ANSI_DIM, message));
+    }
+    pub(crate) fn command(self, command: &str) {
+        println!(
+            "\n  {} {}",
+            self.paint(ANSI_DIM, "$"),
+            self.paint(ANSI_CYAN, command)
+        );
+    }
+    pub(crate) fn diagnostic(self, message: &str) {
+        self.hint(message);
+    }
+    pub(crate) fn spinner_frame(self, marker: &str, phase: &str, elapsed: u64) {
+        eprint!(
+            "\r\x1b[2K{} {}",
+            self.status(marker, ANSI_CYAN, phase),
+            self.paint(ANSI_DIM, &format!("({elapsed}s)"))
+        );
+        let _ = io::stderr().flush();
+    }
+    pub(crate) fn can_animate(self) -> bool {
+        self.interactive
+    }
+
+    pub(crate) fn stdout_status(self, marker: &str, code: &str, message: &str) {
+        println!("{}", self.status(marker, code, message));
+    }
+
+    pub(crate) fn stdout_fields(self, fields: &std::collections::BTreeMap<String, String>) {
+        let width = fields
+            .keys()
+            .map(|key| key.len())
+            .max()
+            .unwrap_or(12)
+            .max(12);
+        for (label, value) in fields {
+            let label = format!("{label:<width$}");
+            println!("  {} {}", self.paint(ANSI_DIM, &label), self.text(value));
+        }
+    }
+    pub(crate) fn stdout_metadata(self, label: &str, value: &str) {
+        let label = format!("{label:<12}");
+        println!("  {} {}", self.paint(ANSI_DIM, &label), self.text(value));
+    }
+}
+
+pub(crate) fn safe_terminal_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn print_recipe_catalog(
+    catalog: &RecipeCatalog,
+    json: bool,
+    color: ColorChoice,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(catalog)?);
+        return Ok(());
+    }
+    let style = CliStyle::for_stdout(color, json);
+    style.stdout_heading("Recipes");
+    style.stdout_metadata("repository", &catalog.repository);
+    style.stdout_metadata("revision", &catalog.revision);
+    style.stdout_heading(&format!("{:<28} {:<10} DESCRIPTION", "ID", "KIND"));
+    for recipe in &catalog.recipes {
+        println!(
+            "{:<28} {:<10} {}",
+            format_box_cell(style, &recipe.id, 28, ANSI_CYAN),
+            recipe.kind.as_str(),
+            safe_terminal_text(recipe.metadata.description.as_deref().unwrap_or("")),
+        );
+    }
+    if catalog.recipes.is_empty() {
+        style.stdout_hint("No recipes found.");
+    }
+    Ok(())
+}
+
+pub(crate) fn print_recipe_info(recipe: &recipes::Recipe, colour: bool) {
+    let style = CliStyle::from_enabled(colour);
+    style.stdout_heading(&recipe.id);
+    style.stdout_metadata("kind", recipe.kind.as_str());
+    style.stdout_metadata("path", &recipe.path);
+    if let Some(description) = &recipe.metadata.description {
+        style.stdout_metadata("description", description);
+    }
+    for (label, values) in [
+        ("requires", &recipe.metadata.requires),
+        ("supports", &recipe.metadata.supports),
+        ("capabilities", &recipe.metadata.capabilities),
+    ] {
+        if !values.is_empty() {
+            style.stdout_metadata(label, &values.join(", "));
+        }
+    }
+    let resources = &recipe.metadata.resources;
+    if resources.cores.is_some() || resources.memory.is_some() || resources.disk.is_some() {
+        style.stdout_metadata(
+            "resources",
+            &format!(
+                "cores={} memory={} disk={}",
+                resources
+                    .cores
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                resources
+                    .memory
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                safe_terminal_text(resources.disk.as_deref().unwrap_or("-"))
+            ),
+        );
+    }
+}
+
+pub(crate) fn print_snapshot_action(
+    output: &SnapshotActionOutput,
+    json: bool,
+    color: ColorChoice,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(output)?);
+        return Ok(());
+    }
+    let style = CliStyle::for_stdout(color, json);
+    style.success(&format!(
+        "{} snapshot {} on {}",
+        output.action, output.name, output.id
+    ));
+    if output.started == Some(true) {
+        style.success(&format!("Started {}", output.id));
+    }
+    Ok(())
+}
+
+pub(crate) fn print_snapshot_list(snapshots: &[LxcSnapshot], colour: bool) {
+    let style = CliStyle::from_enabled(colour);
+    style.stdout_heading(&format!(
+        "{:<24} {:<24} {:<20} DESCRIPTION",
+        "NAME", "CREATED", "PARENT"
+    ));
+    for snapshot in snapshots {
+        let name = format_box_cell(style, &snapshot.name, 24, ANSI_CYAN);
+        println!(
+            "{name} {:<24} {:<20} {}",
+            format_snapshot_time(snapshot.snaptime),
+            safe_terminal_text(snapshot.parent.as_deref().unwrap_or("-")),
+            safe_terminal_text(snapshot.description.as_deref().unwrap_or("-")),
+        );
+    }
+    if snapshots.is_empty() {
+        style.stdout_hint("No snapshots found.");
+    }
+}
+
+pub(crate) fn print_box_info(info: &BoxInfo, json: bool, color: ColorChoice) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(info)?);
+    } else {
+        let style = CliStyle::for_stdout(color, json);
+        style.stdout_status("box", ANSI_CYAN, &info.id.to_string());
+        style.stdout_metadata("vmid", &info.vmid.to_string());
+        style.stdout_metadata("state", &info.state);
+        style.stdout_metadata("node", &info.node);
+        style.stdout_metadata("ipv4", info.ip.as_deref().unwrap_or("-"));
+        if let Some(ipv6) = &info.ipv6 {
+            style.stdout_metadata("ipv6", ipv6);
+        }
+        style.stdout_metadata("name", info.name.as_deref().unwrap_or("-"));
+        let recipes = info
+            .recipes
+            .iter()
+            .map(|recipe| safe_terminal_text(&recipe.id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        style.stdout_metadata("recipes", if recipes.is_empty() { "-" } else { &recipes });
+        let capabilities = safe_terminal_text(&info.capabilities.join(", "));
+        style.stdout_metadata(
+            "capabilities",
+            if capabilities.is_empty() {
+                "-"
+            } else {
+                &capabilities
+            },
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn format_box_cell(style: CliStyle, value: &str, width: usize, code: &str) -> String {
+    let value = style.text(value);
+    style.paint(code, &format!("{value:<width$}"))
+}
+
+pub(crate) fn print_box_records(records: &[BoxRecord], colour: bool) {
+    let style = CliStyle::from_enabled(colour);
+    let has_ipv6 = records.iter().any(|record| record.ipv6.is_some());
+    let header = format!(
+        "{:<16} {:<10} {:<16} {:<16} {}NAME",
+        "ID",
+        "STATE",
+        "NODE",
+        "IPV4",
+        if has_ipv6 {
+            format!("{:<39} ", "IPV6")
+        } else {
+            String::new()
+        }
+    );
+    println!("{}", style.paint(ANSI_BOLD_CYAN, &header));
+    for record in records {
+        let id = format_box_cell(style, &record.id.to_string(), 16, ANSI_CYAN);
+        let state = format_box_cell(style, &record.state, 10, box_state_colour(&record.state));
+        let node = format_box_cell(style, &record.node, 16, ANSI_CYAN);
+        let ip = format_box_cell(style, record.ip.as_deref().unwrap_or("-"), 16, "");
+        let name = style.text(record.name.as_deref().unwrap_or("-"));
+        let ipv6 = if has_ipv6 {
+            format!(
+                "{} ",
+                format_box_cell(style, record.ipv6.as_deref().unwrap_or("-"), 39, "")
+            )
+        } else {
+            String::new()
+        };
+        println!("{id} {state} {node} {ip} {ipv6}{name}");
+    }
+    if records.is_empty() {
+        println!(
+            "{}",
+            style.paint(ANSI_DIM, "No pbox-managed containers found.")
+        );
+    }
+}
+
+pub(crate) fn print_value<T: Serialize>(value: &T, json: bool, color: ColorChoice) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(value)?);
+        return Ok(());
+    }
+    let value = serde_json::to_value(value)?;
+    if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
+        CliStyle::for_stdout(color, false).stdout_heading(id);
+    } else {
+        println!("{value}");
+    }
+    Ok(())
+}
+
+pub(crate) fn color_enabled_for(color: ColorChoice, json: bool, is_terminal: bool) -> bool {
+    let mode = match color {
+        ColorChoice::Auto => pbox_core::ui::ColorMode::Auto,
+        ColorChoice::Always => pbox_core::ui::ColorMode::Always,
+        ColorChoice::Never => pbox_core::ui::ColorMode::Never,
+    };
+    mode.enabled(is_terminal, std::env::var_os("NO_COLOR").is_some(), json)
+}
+
+pub(crate) fn color_enabled(color: ColorChoice, json: bool) -> bool {
+    color_enabled_for(color, json, io::stdout().is_terminal())
+}
+
+pub(crate) fn confirm_delete(input: &mut impl BufRead, output: &mut impl Write) -> Result<bool> {
+    loop {
+        write!(
+            output,
+            "{}",
+            stderr().prompt_text("Delete permanently?", Some("y/N"))
+        )?;
+        output.flush()?;
+        let mut answer = String::new();
+        if input.read_line(&mut answer)? == 0 {
+            writeln!(output)?;
+            return Ok(false);
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "" | "n" | "no" => return Ok(false),
+            _ => writeln!(
+                output,
+                "{}",
+                stderr().status("!", ANSI_YELLOW, "Enter y or n.")
+            )?,
+        }
+    }
+}
+
+pub(crate) fn help_styles() -> clap::builder::Styles {
+    use clap::builder::styling::AnsiColor;
+    clap::builder::Styles::styled()
+        .header(AnsiColor::Cyan.on_default().bold())
+        .usage(AnsiColor::Cyan.on_default().bold())
+        .literal(AnsiColor::Cyan.on_default())
+        .placeholder(AnsiColor::White.on_default().dimmed())
+        .error(AnsiColor::Red.on_default().bold())
+        .valid(AnsiColor::Green.on_default())
+        .invalid(AnsiColor::Yellow.on_default())
+}
+
+/// Resolve presentation flags before Clap exits early for help or a usage error.
+pub(crate) fn parse_cli() -> Cli {
+    use clap::{CommandFactory, FromArgMatches};
+    let args: Vec<_> = std::env::args_os().collect();
+    let mut color = ColorChoice::Auto;
+    let mut json = false;
+    let mut iter = args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--json" {
+            json = true;
+        }
+        let value = if arg == "--color" {
+            iter.next().and_then(|value| value.to_str())
+        } else {
+            arg.to_str()
+                .and_then(|value| value.strip_prefix("--color="))
+        };
+        if let Some(value) = value {
+            color = match value {
+                "always" => ColorChoice::Always,
+                "never" => ColorChoice::Never,
+                _ => ColorChoice::Auto,
+            };
+        }
+    }
+    configure(color, json);
+    let clap_color = if json || std::env::var_os("NO_COLOR").is_some() {
+        clap::ColorChoice::Never
+    } else {
+        match color {
+            ColorChoice::Auto => clap::ColorChoice::Auto,
+            ColorChoice::Always => clap::ColorChoice::Always,
+            ColorChoice::Never => clap::ColorChoice::Never,
+        }
+    };
+    let matches = Cli::command().color(clap_color).get_matches_from(args);
+    Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+}
+
+#[cfg(test)]
+mod design_tests {
+    use super::*;
+
+    #[test]
+    fn confirmation_uses_shared_prompt_tokens_in_colour_and_plain_text() {
+        let plain = CliStyle::from_enabled(false).prompt_text("Delete permanently?", Some("y/N"));
+        assert_eq!(plain, "? Delete permanently?            [y/N]: ");
+        let colour = CliStyle::from_enabled(true).prompt_text("Delete permanently?", Some("y/N"));
+        assert!(colour.starts_with(&format!("{ANSI_CYAN}?{ANSI_RESET}")));
+        assert!(colour.contains(&format!("{ANSI_DIM}[y/N]{ANSI_RESET}")));
+        assert!(!plain.contains('\x1b'));
+    }
+
+    #[test]
+    fn status_roles_are_distinguishable_without_colour() {
+        let style = CliStyle::from_enabled(false);
+        for (marker, code) in [
+            ("ok", ANSI_GREEN),
+            (">", ANSI_CYAN),
+            ("!", ANSI_YELLOW),
+            ("x", ANSI_RED),
+        ] {
+            assert_eq!(
+                style.status(marker, code, "Message"),
+                format!("{marker} Message")
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_and_prompt_values_cannot_inject_terminal_controls() {
+        let style = CliStyle::from_enabled(true);
+        let rendered = style.prompt_text("Name\x1b[2J", Some("test\nnext"));
+        assert!(!rendered.contains("\x1b[2J"));
+        assert!(!rendered.contains('\n'));
+    }
+}

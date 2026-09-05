@@ -1,7 +1,10 @@
+#![deny(clippy::print_stdout, clippy::print_stderr)]
 mod ansible;
 mod bootstrap;
 mod images;
 mod progress;
+mod ui;
+use ui::*;
 mod recipes;
 mod relay;
 use ansible::{AnsibleRun, apply_recipe};
@@ -21,8 +24,8 @@ use nix::sys::signal::Signal;
 use nix::sys::termios::{LocalFlags, SetArg, cfmakeraw, tcgetattr, tcsetattr};
 use pbox_agent_client::{AgentClient, ExecInput, ExecResult, exec_event};
 use pbox_core::{
-    Config, ConfigStore, LxcConfigUpdateRequest, LxcCreateRequest, LxcSnapshot, LxcSnapshotRequest,
-    PboxId, PboxMetadata, PboxRecipeProvenance, PveApi, PveClient, PveClientConfig, PveError,
+    Config, ConfigStore, LxcConfigUpdateRequest, LxcCreateRequest, LxcSnapshotRequest, PboxId,
+    PboxMetadata, PboxRecipeProvenance, PveApi, PveClient, PveClientConfig, PveError,
     PveNetworkInterface, PveStorage, PveStorageContent, PveTaskResponse, encode_metadata,
     parse_duration, parse_metadata, preserve_metadata, select_lxc_ipv4, select_lxc_ipv6,
 };
@@ -57,6 +60,7 @@ const SSH_POST_EXIT_TIMEOUT: Duration = Duration::from_secs(1);
 #[command(
     name = "pbox",
     about = "Proxmox-backed developer sandbox CLI",
+    styles = ui::help_styles(),
     arg_required_else_help = true
 )]
 struct Cli {
@@ -236,7 +240,7 @@ struct SshCommand {
     /// Environment entry in KEY=VALUE form. May be repeated.
     #[arg(long = "env", value_name = "KEY=VALUE")]
     env: Vec<String>,
-    /// Shell command and arguments. Defaults to /bin/sh -il.
+    /// Shell command and arguments. Defaults to the guest user's login shell.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     argv: Vec<String>,
 }
@@ -461,15 +465,16 @@ fn main() {
         Ok(RunOutcome::Exit(code)) => std::process::exit(code),
         Err(error) => {
             let message = safe_terminal_text(&format!("{error:#}"));
-            eprintln!("error: {message}");
+            ui::stderr().error(&message);
             std::process::exit(1);
         }
     }
 }
 
 fn run() -> Result<RunOutcome> {
-    let cli = Cli::parse();
+    let cli = ui::parse_cli();
     progress::set_verbose(cli.verbose);
+    ui::configure(cli.color, cli.json);
     let store = ConfigStore::new(
         cli.config
             .unwrap_or_else(pbox_core::config::default_config_path),
@@ -536,22 +541,22 @@ fn run_config(command: ConfigSubcommand, store: &ConfigStore, json: bool) -> Res
                 .get_redacted(&key)
                 .ok_or_else(|| anyhow!("unknown config key: {key}"))?;
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({"key": key, "value": value}))?
+                ui::json_text(
+                    &(serde_json::to_string_pretty(
+                        &serde_json::json!({"key": key, "value": value}),
+                    )?),
                 );
             } else {
-                println!("{key} = {value}");
+                ui::stdout().stdout_metadata(&key, &value);
             }
         }
         ConfigSubcommand::List => {
             let config = store.load_file().context("load pbox configuration")?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&config.redacted())?);
+                ui::json_text(&(serde_json::to_string_pretty(&config.redacted())?));
             } else {
-                for (key, value) in config.redacted_pairs() {
-                    println!("{key:<24} {value}");
-                }
+                ui::stdout().stdout_heading("Configuration");
+                ui::stdout().stdout_fields(&config.redacted_pairs());
             }
         }
         ConfigSubcommand::Set { key, value } => {
@@ -562,19 +567,18 @@ fn run_config(command: ConfigSubcommand, store: &ConfigStore, json: bool) -> Res
                 .context("validate configuration value")?;
             store.save(&config).context("save pbox configuration")?;
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &serde_json::json!({"key": key, "value": config.get_redacted(&key)})
-                    )?
+                ui::json_text(
+                    &(serde_json::to_string_pretty(
+                        &serde_json::json!({"key": key, "value": config.get_redacted(&key)}),
+                    )?),
                 );
             } else {
-                println!(
+                ui::stdout().success(&format!(
                     "{key}: {}",
                     config
                         .get_redacted(&key)
                         .unwrap_or_else(|| "<unset>".to_owned())
-                );
+                ));
             }
         }
         ConfigSubcommand::Unset { key } => {
@@ -584,19 +588,18 @@ fn run_config(command: ConfigSubcommand, store: &ConfigStore, json: bool) -> Res
                 .context("reset configuration value")?;
             store.save(&config).context("save pbox configuration")?;
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &serde_json::json!({"key": key, "value": config.get_redacted(&key)})
-                    )?
+                ui::json_text(
+                    &(serde_json::to_string_pretty(
+                        &serde_json::json!({"key": key, "value": config.get_redacted(&key)}),
+                    )?),
                 );
             } else {
-                println!(
+                ui::stdout().success(&format!(
                     "{key}: {}",
                     config
                         .get_redacted(&key)
                         .unwrap_or_else(|| "<unset>".to_owned())
-                );
+                ));
             }
         }
     }
@@ -621,13 +624,13 @@ fn run_image(
             if json {
                 print_value(&result, true, color)?;
             } else {
-                println!("repository: {}", result.repository);
+                ui::stdout().stdout_heading(&result.repository);
                 if result.tags.is_empty() {
-                    println!("tags:       <none>");
+                    ui::stdout().stdout_hint("No tags found.");
                 } else {
-                    println!("tags:");
+                    ui::stdout().stdout_heading("Tags");
                     for tag in result.tags {
-                        println!("  {}", safe_terminal_text(&tag));
+                        ui::stdout().stdout_metadata("tag", &tag);
                     }
                 }
             }
@@ -674,11 +677,11 @@ fn run_image(
             if json {
                 print_value(&output, true, color)?;
             } else if output.downloaded {
-                println!("pulled {}", output.reference);
-                println!("volume: {}", output.volume);
+                ui::stdout().success(&format!("pulled {}", output.reference));
+                ui::stdout().stdout_metadata("volume", &output.volume);
             } else {
-                println!("already present {}", output.reference);
-                println!("volume: {}", output.volume);
+                ui::stdout().success(&format!("already present {}", output.reference));
+                ui::stdout().stdout_metadata("volume", &output.volume);
             }
         }
     }
@@ -717,138 +720,6 @@ struct SetupResources {
     rootfs_storages: Vec<SetupChoice>,
     template_storages: Vec<SetupChoice>,
     bridges: Vec<SetupChoice>,
-}
-const SETUP_PROMPT_LABEL_WIDTH: usize = 30;
-const ANSI_BOLD: &str = "\x1b[1m";
-const ANSI_DIM: &str = "\x1b[2m";
-const ANSI_CYAN: &str = "\x1b[36m";
-const ANSI_BOLD_CYAN: &str = "\x1b[1;36m";
-const ANSI_GREEN: &str = "\x1b[1;32m";
-const ANSI_YELLOW: &str = "\x1b[1;33m";
-const ANSI_RED: &str = "\x1b[1;31m";
-const ANSI_RESET: &str = "\x1b[0m";
-
-#[derive(Clone, Copy)]
-struct SetupStyle {
-    enabled: bool,
-    interactive: bool,
-}
-
-impl SetupStyle {
-    fn for_stderr(color: ColorChoice, json: bool) -> Self {
-        let terminal = io::stderr().is_terminal();
-        let enabled = color_enabled_for(color, json, terminal);
-        Self {
-            enabled,
-            interactive: terminal && enabled,
-        }
-    }
-
-    fn for_stdout(color: ColorChoice, json: bool) -> Self {
-        let terminal = io::stdout().is_terminal();
-        let enabled = color_enabled_for(color, json, terminal);
-        Self {
-            enabled,
-            interactive: terminal && enabled,
-        }
-    }
-
-    fn from_enabled(enabled: bool) -> Self {
-        Self {
-            enabled,
-            interactive: false,
-        }
-    }
-
-    fn text(self, value: &str) -> String {
-        safe_terminal_text(value)
-    }
-
-    fn paint(self, code: &str, value: &str) -> String {
-        let value = self.text(value);
-        if self.enabled && !code.is_empty() {
-            format!("{code}{value}{ANSI_RESET}")
-        } else {
-            value
-        }
-    }
-
-    fn status(self, marker: &str, code: &str, message: &str) -> String {
-        format!(
-            "{} {}",
-            self.paint(code, marker),
-            self.paint(ANSI_BOLD, message)
-        )
-    }
-
-    fn heading(self, message: &str) {
-        eprintln!("{}", self.paint(ANSI_BOLD_CYAN, message));
-    }
-
-    fn section(self, message: &str) {
-        eprintln!();
-        eprintln!("{}", self.paint(ANSI_BOLD_CYAN, message));
-    }
-
-    fn hint(self, message: &str) {
-        eprintln!("  {}", self.paint(ANSI_DIM, message));
-    }
-
-    fn metadata(self, label: &str, value: &str) {
-        let label = format!("{label:<12}");
-        eprintln!("  {} {}", self.paint(ANSI_DIM, &label), self.text(value));
-    }
-
-    fn warning(self, message: &str) {
-        eprintln!("{}", self.status("!", ANSI_YELLOW, message));
-    }
-
-    fn error(self, message: &str) {
-        eprintln!("{}", self.status("x", ANSI_RED, message));
-    }
-
-    fn progress(self, message: &str) {
-        eprintln!("{}", self.status(">", ANSI_CYAN, message));
-    }
-    fn progress_live(self, message: &str) {
-        if self.interactive {
-            eprint!("\r\x1b[2K{}", self.status(">", ANSI_CYAN, message));
-            let _ = io::stderr().flush();
-        } else {
-            self.progress(message);
-        }
-    }
-
-    fn clear_progress_line(self) {
-        if self.interactive {
-            eprint!("\r\x1b[2K");
-            let _ = io::stderr().flush();
-        }
-    }
-
-    fn prompt(self, label: &str, default: Option<&str>) -> Result<()> {
-        let label = format!("{label:<SETUP_PROMPT_LABEL_WIDTH$}");
-        eprint!(
-            "{} {}",
-            self.paint(ANSI_CYAN, "?"),
-            self.paint(ANSI_BOLD, &label)
-        );
-        if let Some(default) = default.filter(|value| !value.is_empty()) {
-            let default = format!("[{}]", self.text(default));
-            eprint!(" {}", self.paint(ANSI_DIM, &default));
-        }
-        eprint!(": ");
-        io::stderr().flush().context("flush setup prompt")
-    }
-
-    fn stdout_status(self, marker: &str, code: &str, message: &str) {
-        println!("{}", self.status(marker, code, message));
-    }
-
-    fn stdout_metadata(self, label: &str, value: &str) {
-        let label = format!("{label:<12}");
-        println!("  {} {}", self.paint(ANSI_DIM, &label), self.text(value));
-    }
 }
 
 fn setup_connection_config(
@@ -1014,7 +885,7 @@ fn setup_choice_default(configured: &str, choices: &[SetupChoice], allow_auto: b
 }
 
 fn prompt_setup_choice(
-    style: SetupStyle,
+    style: CliStyle,
     config: &Config,
     key: &str,
     label: &str,
@@ -1029,15 +900,15 @@ fn prompt_setup_choice(
     style.hint("Enter a number or name. Press Enter to accept the default.");
     loop {
         if allow_auto {
-            eprintln!("  a. auto (select automatically)");
+            ui::stderr().hint("a. auto (select automatically)");
         }
         for (index, choice) in choices.iter().enumerate() {
-            eprintln!(
-                "  {}. {} ({})",
+            ui::stderr().hint(&format!(
+                "{}. {} ({})",
                 index + 1,
                 style.text(&choice.value),
                 style.text(&choice.description)
-            );
+            ));
         }
         let value = prompt_setup_text(style, label, Some(&default))?;
         if allow_auto && matches!(value.to_ascii_lowercase().as_str(), "a" | "auto") {
@@ -1060,7 +931,7 @@ fn prompt_setup_choice(
 }
 
 fn discover_setup_nodes_with_retry(
-    style: SetupStyle,
+    style: CliStyle,
     client: &impl PveApi,
 ) -> Result<Option<SetupDiscovery>> {
     loop {
@@ -1078,7 +949,7 @@ fn discover_setup_nodes_with_retry(
 }
 
 fn discover_setup_resources_with_retry(
-    style: SetupStyle,
+    style: CliStyle,
     client: &impl PveApi,
     nodes: &[String],
     scope: &str,
@@ -1164,7 +1035,7 @@ fn run_setup(
     color: ColorChoice,
 ) -> Result<()> {
     let mut config = store.load_file().context("load pbox configuration")?;
-    let style = SetupStyle::for_stderr(color, json);
+    let style = CliStyle::for_stderr(color, json);
     style.heading("pbox setup");
     style.hint("Connect pbox to Proxmox and set defaults for new guests.");
     let config_path = store.path().display().to_string();
@@ -1360,10 +1231,10 @@ fn run_setup(
         verified,
     };
     if json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ui::json_text(&(serde_json::to_string_pretty(&output)?));
     } else {
-        let output_style = SetupStyle::for_stdout(color, false);
-        println!();
+        let output_style = CliStyle::for_stdout(color, false);
+        ui::blank_stdout();
         output_style.stdout_status("ok", ANSI_GREEN, "Configuration saved");
         output_style.stdout_metadata("config", &output.config_path);
         if verified {
@@ -1381,7 +1252,7 @@ fn run_setup(
 }
 
 fn prompt_setup_config_value(
-    style: SetupStyle,
+    style: CliStyle,
     config: &Config,
     key: &str,
     label: &str,
@@ -1403,7 +1274,7 @@ fn prompt_setup_config_value(
     }
 }
 
-fn prompt_setup_secret(style: SetupStyle, existing: bool) -> Result<Option<String>> {
+fn prompt_setup_secret(style: CliStyle, existing: bool) -> Result<Option<String>> {
     if existing {
         style.hint("Leave blank to keep the current secret.");
     }
@@ -1420,7 +1291,7 @@ fn prompt_setup_secret(style: SetupStyle, existing: bool) -> Result<Option<Strin
     }
 }
 
-fn prompt_setup_bool(style: SetupStyle, label: &str, default: bool) -> Result<bool> {
+fn prompt_setup_bool(style: CliStyle, label: &str, default: bool) -> Result<bool> {
     let default_text = if default { "yes" } else { "no" };
     loop {
         let value = prompt_setup_text(style, label, Some(default_text))?;
@@ -1442,7 +1313,7 @@ fn parse_setup_bool(value: &str) -> Result<bool> {
     }
 }
 
-fn prompt_setup_text(style: SetupStyle, label: &str, default: Option<&str>) -> Result<String> {
+fn prompt_setup_text(style: CliStyle, label: &str, default: Option<&str>) -> Result<String> {
     style.prompt(label, default)?;
     let mut value = String::new();
     let read = io::stdin()
@@ -1553,26 +1424,25 @@ fn run_scp(store: &ConfigStore, command: ScpCommand, json: bool, color: ColorCho
         }
     })?;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+        ui::json_text(
+            &(serde_json::to_string_pretty(&serde_json::json!({
                 "box_id": resolved_box_id,
                 "local": local_path,
                 "remote": remote_path,
                 "direction": if upload { "upload" } else { "download" },
                 "bytes": size,
-            }))?
+            }))?),
         );
     } else {
         let _ = color_enabled(color, json);
-        println!(
+        ui::stdout().success(&format!(
             "{} {} {} {} ({} bytes)",
             if upload { "uploaded" } else { "downloaded" },
             local_path,
             if upload { "to" } else { "from" },
             remote_path,
             size
-        );
+        ));
     }
     Ok(())
 }
@@ -1675,14 +1545,14 @@ fn run_recipe(
             let config = load_config(store)?;
             let catalog = recipe_repository(&config)?.sync()?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&catalog)?);
+                ui::json_text(&(serde_json::to_string_pretty(&catalog)?));
             } else {
-                println!(
+                ui::stdout().success(&format!(
                     "synced {} recipes from {} @ {}",
                     catalog.recipes.len(),
                     safe_terminal_text(&catalog.repository),
                     safe_terminal_text(&catalog.revision)
-                );
+                ));
             }
         }
         RecipeSubcommand::List => {
@@ -1717,7 +1587,7 @@ fn run_recipe(
                 .find(|candidate| candidate.id == recipe)
                 .ok_or_else(|| anyhow!("recipe not found: {recipe}"))?;
             if json {
-                println!("{}", serde_json::to_string_pretty(result)?);
+                ui::json_text(&(serde_json::to_string_pretty(result)?));
             } else {
                 print_recipe_info(result, color_enabled(color, json));
             }
@@ -1743,9 +1613,8 @@ fn run_recipe(
             }
             if config.recipes.rollback_on_failure && config.recipes.snapshot_before_apply == "never"
             {
-                eprintln!(
-                    "[recipe] rollback-on-failure is enabled but snapshot-before-apply is never"
-                );
+                ui::stderr()
+                    .warning("rollback-on-failure is enabled but snapshot-before-apply is never");
             }
             let binary = std::env::current_exe().context("locate pbox executable")?;
             let planned_run = AnsibleRun {
@@ -1800,14 +1669,14 @@ fn run_recipe(
                 cleanup_error,
             )?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&run)?);
+                ui::json_text(&(serde_json::to_string_pretty(&run)?));
             } else {
-                println!(
+                ui::stdout().success(&format!(
                     "applied {} to {} @ {}",
                     safe_terminal_text(&run.recipe),
                     safe_terminal_text(&run.box_id),
                     safe_terminal_text(&run.revision)
-                );
+                ));
             }
         }
     }
@@ -1850,10 +1719,10 @@ fn create_recipe_snapshot(
         Err(error)
             if config.recipes.snapshot_before_apply == "auto" && snapshot_unavailable(&error) =>
         {
-            eprintln!(
-                "[recipe] snapshots are unavailable for {}; continuing without one",
+            ui::stderr().warning(&format!(
+                "snapshots are unavailable for {}; continuing without one",
                 safe_terminal_text(record.id.as_str())
-            );
+            ));
             return Ok(None);
         }
         Err(error) => {
@@ -2116,88 +1985,6 @@ fn load_recipe_catalog(store: &ConfigStore) -> Result<RecipeCatalog> {
     }
 }
 
-fn print_recipe_catalog(catalog: &RecipeCatalog, json: bool, color: ColorChoice) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(catalog)?);
-        return Ok(());
-    }
-    let colour = color_enabled(color, json);
-    let accent = if colour { "\x1b[36m" } else { "" };
-    let reset = if colour { "\x1b[0m" } else { "" };
-    println!(
-        "{accent}recipes{reset} {} @ {}",
-        safe_terminal_text(&catalog.repository),
-        safe_terminal_text(&catalog.revision),
-    );
-    println!("{:<28} {:<10} DESCRIPTION", "ID", "KIND");
-    for recipe in &catalog.recipes {
-        println!(
-            "{:<28} {:<10} {}",
-            safe_terminal_text(&recipe.id),
-            recipe.kind.as_str(),
-            safe_terminal_text(recipe.metadata.description.as_deref().unwrap_or("")),
-        );
-    }
-    Ok(())
-}
-
-fn print_recipe_info(recipe: &recipes::Recipe, colour: bool) {
-    let accent = if colour { "\x1b[36m" } else { "" };
-    let reset = if colour { "\x1b[0m" } else { "" };
-    println!("{accent}{}{reset}", safe_terminal_text(&recipe.id));
-    println!("kind: {}", recipe.kind.as_str());
-    println!("path: {}", safe_terminal_text(&recipe.path));
-    if let Some(description) = recipe.metadata.description.as_deref() {
-        println!("description: {}", safe_terminal_text(description));
-    }
-    if !recipe.metadata.requires.is_empty() {
-        println!(
-            "requires: {}",
-            safe_terminal_text(&recipe.metadata.requires.join(", ")),
-        );
-    }
-    if !recipe.metadata.supports.is_empty() {
-        println!(
-            "supports: {}",
-            safe_terminal_text(&recipe.metadata.supports.join(", ")),
-        );
-    }
-    if !recipe.metadata.capabilities.is_empty() {
-        println!(
-            "capabilities: {}",
-            safe_terminal_text(&recipe.metadata.capabilities.join(", ")),
-        );
-    }
-    let resources = &recipe.metadata.resources;
-    if resources.cores.is_some() || resources.memory.is_some() || resources.disk.is_some() {
-        println!(
-            "resources: cores={} memory={} disk={}",
-            resources
-                .cores
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "-".to_owned()),
-            resources
-                .memory
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "-".to_owned()),
-            safe_terminal_text(resources.disk.as_deref().unwrap_or("-"))
-        );
-    }
-}
-
-fn safe_terminal_text(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect()
-}
-
 fn run_forward(
     store: &ConfigStore,
     command: ForwardCommand,
@@ -2232,12 +2019,10 @@ fn run_forward(
             remote: format!("{}:{}", remote_host, remote_port),
         };
         if json {
-            println!("{}", serde_json::to_string_pretty(&output)?);
+            ui::json_text(&(serde_json::to_string_pretty(&output)?));
         } else {
-            println!(
-                "forwarding {} -> {} (press Ctrl-C to stop)",
-                output.local, output.remote
-            );
+            ui::stdout().success(&format!("forwarding {} -> {} (press Ctrl-C to stop)",
+                output.local, output.remote));
         }
         let connection_slots = Arc::new(Semaphore::new(MAX_FORWARD_CONNECTIONS));
         let shutdown = tokio::signal::ctrl_c();
@@ -2249,9 +2034,7 @@ fn run_forward(
                     let connection_permit = match connection_slots.clone().try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
-                            eprintln!(
-                                "[forward] rejecting {peer}: maximum of {MAX_FORWARD_CONNECTIONS} connections reached"
-                            );
+                            ui::stderr().warning(&format!("rejecting {peer}: maximum of {MAX_FORWARD_CONNECTIONS} connections reached"));
                             continue;
                         }
                     };
@@ -2284,7 +2067,7 @@ fn run_forward(
                         }
                         .await;
                         if let Err(error) = result {
-                            eprintln!("[forward] {peer}: {error:#}");
+                            ui::stderr().error(&format!("{peer}: {error:#}"));
                         }
                     });
                 }
@@ -2371,7 +2154,7 @@ fn run_exec(store: &ConfigStore, command: ExecCommand, json: bool) -> Result<Run
             exited: result.exited,
             exit_code: exec_exit_code(&result),
         };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ui::json_text(&(serde_json::to_string_pretty(&output)?));
     } else {
         write_exec_streams(&result)?;
     }
@@ -2423,7 +2206,10 @@ fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOu
         bail!("pbox-agent does not advertise PTY support; upgrade the guest agent");
     }
     if command.argv.is_empty() {
-        eprintln!("Connected to {}. Type exit to disconnect.", info.box_id);
+        ui::stderr().progress(&format!(
+            "Connected to {}. Type exit to disconnect.",
+            info.box_id
+        ));
     }
     let signals = runtime.block_on(install_terminal_signals())?;
     let terminal = TerminalModeGuard::enter()?;
@@ -2668,7 +2454,7 @@ fn pump_terminal_input(sender: tokio::sync::mpsc::Sender<ExecInput>) {
         let count = match stdin.read(&mut buffer) {
             Ok(count) => count,
             Err(error) => {
-                eprintln!("[ssh] read terminal input: {error}");
+                ui::stderr().error(&format!("read terminal input: {error}"));
                 break;
             }
         };
@@ -2707,7 +2493,7 @@ impl TerminalModeGuard {
     fn restore(&self) {
         let stdin = io::stdin();
         if let Err(error) = tcsetattr(&stdin, SetArg::TCSAFLUSH, &self.original) {
-            eprintln!("[ssh] restore terminal settings: {error}");
+            ui::stderr().error(&format!("restore terminal settings: {error}"));
         }
     }
 }
@@ -2773,7 +2559,7 @@ fn is_secret_config_key(key: &str) -> bool {
 }
 
 fn read_value_from_stdin() -> Result<String> {
-    eprint!("value: ");
+    ui::stderr().prompt("Value", None)?;
     io::stderr().flush().context("flush configuration prompt")?;
     let mut value = String::new();
     io::stdin()
@@ -2912,10 +2698,10 @@ impl Drop for TerminalEchoGuard {
 }
 
 fn read_secret_from_stdin() -> Result<String> {
-    read_secret_with_prompt(SetupStyle::from_enabled(false), "secret")
+    read_secret_with_prompt(ui::stderr(), "Secret")
 }
 
-fn read_secret_with_prompt(style: SetupStyle, prompt: &str) -> Result<String> {
+fn read_secret_with_prompt(style: CliStyle, prompt: &str) -> Result<String> {
     #[cfg(unix)]
     {
         let mut signal_handlers = SignalDispositionGuard::capture()?;
@@ -2950,7 +2736,7 @@ fn read_secret_with_prompt(style: SetupStyle, prompt: &str) -> Result<String> {
 }
 
 #[cfg(unix)]
-async fn read_secret_with_prompt_async(style: SetupStyle, prompt: &str) -> Result<String> {
+async fn read_secret_with_prompt_async(style: CliStyle, prompt: &str) -> Result<String> {
     let signals = install_secret_prompt_signals().await?;
     let stdin = io::stdin();
     let read_stdin = io::stdin();
@@ -2985,7 +2771,7 @@ async fn read_secret_with_prompt_async(style: SetupStyle, prompt: &str) -> Resul
         None => Ok(()),
     };
     if had_terminal {
-        eprintln!();
+        ui::blank_stderr();
     }
     restore_result?;
     let (read, value) = read_result??;
@@ -3006,10 +2792,10 @@ fn terminate_secret_prompt_on_signal(
         None => Ok(()),
     };
     if had_terminal {
-        eprintln!();
+        ui::blank_stderr();
     }
     if let Err(error) = restore_result {
-        eprintln!("warning: could not restore terminal echo: {error}");
+        ui::stderr().warning(&format!("could not restore terminal echo: {error}"));
     }
     std::process::exit(exit_code);
 }
@@ -3462,7 +3248,7 @@ fn prepare_new_template_with_progress(
     client: &impl PveApi,
     config: &Config,
     command: &NewCommand,
-    progress: Option<SetupStyle>,
+    progress: Option<CliStyle>,
 ) -> Result<(Option<String>, Option<String>)> {
     if command.ostemplate.is_some() {
         return Ok((None, None));
@@ -3515,7 +3301,7 @@ fn prepare_new_template_with_progress(
 }
 
 fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorChoice) -> Result<()> {
-    let progress = SetupStyle::for_stderr(color, json);
+    let progress = CliStyle::for_stderr(color, json);
     let config = load_config(store)?;
     if config.relay.url.is_some() {
         return relay::run_new(&config, command, json, color);
@@ -4059,24 +3845,7 @@ fn find_box_reference(client: &impl PveApi, requested_id: &str) -> Result<BoxRec
     }
 }
 
-fn confirm_delete(input: &mut impl BufRead, output: &mut impl Write) -> Result<bool> {
-    loop {
-        write!(output, "Delete permanently? [y/N] ")?;
-        output.flush()?;
-        let mut answer = String::new();
-        if input.read_line(&mut answer)? == 0 {
-            writeln!(output)?;
-            return Ok(false);
-        }
-        match answer.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" => return Ok(true),
-            "" | "n" | "no" => return Ok(false),
-            _ => writeln!(output, "Enter y or n.")?,
-        }
-    }
-}
-
-fn delete_box(client: &impl PveApi, record: &BoxRecord, style: SetupStyle) -> Result<()> {
+fn delete_box(client: &impl PveApi, record: &BoxRecord, style: CliStyle) -> Result<()> {
     let state = client
         .get_lxc_state(&record.node, record.vmid)
         .context("check box state before deletion")?;
@@ -4110,7 +3879,7 @@ fn run_delete(
 ) -> Result<()> {
     let client = client_from_store(store)?;
     let record = find_box_reference(&client, requested_id)?;
-    let style = SetupStyle::for_stderr(color, json);
+    let style = CliStyle::for_stderr(color, json);
     if !confirmed {
         if json || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
             bail!(
@@ -4119,15 +3888,13 @@ fn run_delete(
                 record.id
             );
         }
-        eprintln!(
-            "{} ({}, {})",
-            record.id,
-            safe_terminal_text(record.name.as_deref().unwrap_or("unnamed")),
-            safe_terminal_text(&record.state)
-        );
-        eprintln!("This permanently deletes the box and its data.");
+        style.section("Delete box");
+        style.metadata("id", &record.id.to_string());
+        style.metadata("name", record.name.as_deref().unwrap_or("unnamed"));
+        style.metadata("state", &record.state);
+        style.warning("This permanently deletes the box and its data.");
         if !confirm_delete(&mut io::stdin().lock(), &mut io::stderr().lock())? {
-            eprintln!("Cancelled. No changes made.");
+            style.hint("Cancelled. No changes made.");
             return Ok(());
         }
     }
@@ -4140,9 +3907,9 @@ fn run_delete(
         deleted: true,
     };
     if json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ui::json_text(&(serde_json::to_string_pretty(&output)?));
     } else {
-        let output_style = SetupStyle::for_stdout(color, json);
+        let output_style = CliStyle::for_stdout(color, json);
         output_style.stdout_status("ok", ANSI_GREEN, &format!("Deleted box {}.", output.id));
     }
     Ok(())
@@ -4185,7 +3952,7 @@ fn run_snapshot_list(
         .list_lxc_snapshots(&record.node, record.vmid)
         .with_context(|| format!("list snapshots for box {}", record.id))?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&snapshots)?);
+        ui::json_text(&(serde_json::to_string_pretty(&snapshots)?));
     } else {
         print_snapshot_list(&snapshots, color_enabled(color, json));
     }
@@ -4326,55 +4093,6 @@ fn delete_box_snapshot(client: &impl PveApi, record: &BoxRecord, name: &str) -> 
     Ok(())
 }
 
-fn print_snapshot_action(
-    output: &SnapshotActionOutput,
-    json: bool,
-    color: ColorChoice,
-) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(output)?);
-        return Ok(());
-    }
-    let colour = color_enabled(color, json);
-    let action = safe_terminal_text(&output.action);
-    let name = safe_terminal_text(&output.name);
-    let id = safe_terminal_text(&output.id.to_string());
-    if colour {
-        println!("\x1b[1;32m{action}\x1b[0m snapshot {name} on {id}");
-    } else {
-        println!("{action} snapshot {name} on {id}");
-    }
-    if output.started == Some(true) {
-        println!("started {}", id);
-    }
-    Ok(())
-}
-
-fn print_snapshot_list(snapshots: &[LxcSnapshot], colour: bool) {
-    println!(
-        "{:<24} {:<24} {:<20} DESCRIPTION",
-        "NAME", "CREATED", "PARENT"
-    );
-    for snapshot in snapshots {
-        let name = safe_terminal_text(&snapshot.name);
-        let name = format!("{name:<24}");
-        let name = if colour {
-            format!("\x1b[1;36m{name}\x1b[0m")
-        } else {
-            name
-        };
-        println!(
-            "{name} {:<24} {:<20} {}",
-            format_snapshot_time(snapshot.snaptime),
-            safe_terminal_text(snapshot.parent.as_deref().unwrap_or("-")),
-            safe_terminal_text(snapshot.description.as_deref().unwrap_or("-")),
-        );
-    }
-    if snapshots.is_empty() {
-        println!("No snapshots found.");
-    }
-}
-
 fn format_snapshot_time(timestamp: Option<u64>) -> String {
     let Some(timestamp) = timestamp else {
         return "-".to_owned();
@@ -4402,11 +4120,11 @@ const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 struct ProgressHeartbeat {
     stop: Arc<AtomicBool>,
     output_lock: Arc<Mutex<()>>,
-    style: SetupStyle,
+    style: CliStyle,
 }
 
 fn spawn_progress_heartbeat(
-    style: Option<SetupStyle>,
+    style: Option<CliStyle>,
     message: impl Into<String>,
 ) -> Option<ProgressHeartbeat> {
     let style = style?;
@@ -4468,7 +4186,7 @@ fn wait_for_oci_template_task_with_progress(
     reference: &str,
     volume: &str,
     task: PveTaskResponse,
-    progress: Option<SetupStyle>,
+    progress: Option<CliStyle>,
 ) -> Result<()> {
     let description = format!("OCI image {reference}");
     if let Err(task_error) = wait_for_task_with_progress(client, node, task, progress, &description)
@@ -4528,7 +4246,7 @@ fn wait_for_task_with_progress(
     client: &impl PveApi,
     node: &str,
     task: PveTaskResponse,
-    progress: Option<SetupStyle>,
+    progress: Option<CliStyle>,
     description: &str,
 ) -> Result<()> {
     let heartbeat = spawn_progress_heartbeat(
@@ -4581,7 +4299,7 @@ fn run_list(store: &ConfigStore, json: bool, color: ColorChoice) -> Result<()> {
     let client = client_from_store(store)?;
     let records = discover_boxes(&client)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&records)?);
+        ui::json_text(&(serde_json::to_string_pretty(&records)?));
     } else {
         let colour = color_enabled(color, json);
         print_box_records(&records, colour);
@@ -4635,9 +4353,7 @@ fn client_from_config(config: &Config) -> Result<PveClient> {
     let mut client_config = PveClientConfig::new(url, token_id, token_secret);
     client_config.tls_insecure = config.pve.tls_insecure;
     if config.pve.tls_insecure {
-        eprintln!(
-            "[security] pve.tls_insecure disables PVE certificate verification and exposes the API token to a MITM"
-        );
+        ui::stderr().warning("pve.tls_insecure disables PVE certificate verification and exposes the API token to a MITM");
     }
     PveClient::new(client_config).context("create PVE client")
 }
@@ -4741,7 +4457,7 @@ fn wait_for_lxc_ip_with_progress(
     client: &impl PveApi,
     node: &str,
     vmid: u64,
-    progress: Option<SetupStyle>,
+    progress: Option<CliStyle>,
 ) -> Result<Ipv4Addr> {
     let heartbeat = spawn_progress_heartbeat(
         progress,
@@ -4873,40 +4589,6 @@ fn find_box(client: &impl PveApi, requested_id: &str) -> Result<BoxRecord> {
         .ok_or_else(|| anyhow!("box '{id}' was not found"))
 }
 
-fn print_box_info(info: &BoxInfo, json: bool, color: ColorChoice) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(info)?);
-    } else {
-        let style = SetupStyle::for_stdout(color, json);
-        style.stdout_status("box", ANSI_CYAN, &info.id.to_string());
-        style.stdout_metadata("vmid", &info.vmid.to_string());
-        style.stdout_metadata("state", &info.state);
-        style.stdout_metadata("node", &info.node);
-        style.stdout_metadata("ipv4", info.ip.as_deref().unwrap_or("-"));
-        if let Some(ipv6) = &info.ipv6 {
-            style.stdout_metadata("ipv6", ipv6);
-        }
-        style.stdout_metadata("name", info.name.as_deref().unwrap_or("-"));
-        let recipes = info
-            .recipes
-            .iter()
-            .map(|recipe| safe_terminal_text(&recipe.id))
-            .collect::<Vec<_>>()
-            .join(", ");
-        style.stdout_metadata("recipes", if recipes.is_empty() { "-" } else { &recipes });
-        let capabilities = safe_terminal_text(&info.capabilities.join(", "));
-        style.stdout_metadata(
-            "capabilities",
-            if capabilities.is_empty() {
-                "-"
-            } else {
-                &capabilities
-            },
-        );
-    }
-    Ok(())
-}
-
 fn box_state_colour(state: &str) -> &'static str {
     match state {
         "running" => ANSI_GREEN,
@@ -4915,88 +4597,12 @@ fn box_state_colour(state: &str) -> &'static str {
     }
 }
 
-fn format_box_cell(style: SetupStyle, value: &str, width: usize, code: &str) -> String {
-    let value = style.text(value);
-    style.paint(code, &format!("{value:<width$}"))
-}
-
-fn print_box_records(records: &[BoxRecord], colour: bool) {
-    let style = SetupStyle::from_enabled(colour);
-    let has_ipv6 = records.iter().any(|record| record.ipv6.is_some());
-    let header = format!(
-        "{:<16} {:<10} {:<16} {:<16} {}NAME",
-        "ID",
-        "STATE",
-        "NODE",
-        "IPV4",
-        if has_ipv6 {
-            format!("{:<39} ", "IPV6")
-        } else {
-            String::new()
-        }
-    );
-    println!("{}", style.paint(ANSI_BOLD_CYAN, &header));
-    for record in records {
-        let id = format_box_cell(style, &record.id.to_string(), 16, ANSI_CYAN);
-        let state = format_box_cell(style, &record.state, 10, box_state_colour(&record.state));
-        let node = format_box_cell(style, &record.node, 16, ANSI_CYAN);
-        let ip = format_box_cell(style, record.ip.as_deref().unwrap_or("-"), 16, "");
-        let name = style.text(record.name.as_deref().unwrap_or("-"));
-        let ipv6 = if has_ipv6 {
-            format!(
-                "{} ",
-                format_box_cell(style, record.ipv6.as_deref().unwrap_or("-"), 39, "")
-            )
-        } else {
-            String::new()
-        };
-        println!("{id} {state} {node} {ip} {ipv6}{name}");
-    }
-    if records.is_empty() {
-        println!(
-            "{}",
-            style.paint(ANSI_DIM, "No pbox-managed containers found.")
-        );
-    }
-}
-
-fn print_value<T: Serialize>(value: &T, json: bool, color: ColorChoice) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(value)?);
-        return Ok(());
-    }
-    let value = serde_json::to_value(value)?;
-    if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
-        if color_enabled(color, false) {
-            println!("\x1b[1;36m{id}\x1b[0m");
-        } else {
-            println!("{id}");
-        }
-    } else {
-        println!("{value}");
-    }
-    Ok(())
-}
-
-fn color_enabled_for(color: ColorChoice, json: bool, is_terminal: bool) -> bool {
-    let mode = match color {
-        ColorChoice::Auto => pbox_core::ui::ColorMode::Auto,
-        ColorChoice::Always => pbox_core::ui::ColorMode::Always,
-        ColorChoice::Never => pbox_core::ui::ColorMode::Never,
-    };
-    mode.enabled(is_terminal, std::env::var_os("NO_COLOR").is_some(), json)
-}
-
-fn color_enabled(color: ColorChoice, json: bool) -> bool {
-    color_enabled_for(color, json, io::stdout().is_terminal())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        ANSI_CYAN, ANSI_RESET, AnsibleRun, BootstrapKey, BoxRecord, Cli, Command, ForwardCommand,
-        NewCommand, RecipeSnapshot, SetupAnswers, SetupChoice, SetupCommand, SetupOutput,
-        SetupStyle, SshCommand, agent_identity_changes, apply_setup_values, create_box_snapshot,
+        ANSI_CYAN, ANSI_RESET, AnsibleRun, BootstrapKey, BoxRecord, Cli, CliStyle, Command,
+        ForwardCommand, NewCommand, RecipeSnapshot, SetupAnswers, SetupChoice, SetupCommand,
+        SetupOutput, SshCommand, agent_identity_changes, apply_setup_values, create_box_snapshot,
         create_lxc_with_retry, create_recipe_snapshot, delete_box_snapshot, delete_recipe_snapshot,
         exec_exit_code, finish_recipe_failure, finish_recipe_success, format_snapshot_time,
         parse_env_entry, parse_recipe_sync_ttl, parse_remote_path, parse_setup_bool,
@@ -5377,7 +4983,7 @@ mod tests {
         super::delete_box(
             &fake,
             &record,
-            super::SetupStyle::for_stderr(super::ColorChoice::Never, true),
+            super::CliStyle::for_stderr(super::ColorChoice::Never, true),
         )
         .unwrap();
         assert_eq!(
@@ -5396,7 +5002,7 @@ mod tests {
             super::delete_box(
                 &fake,
                 &record,
-                super::SetupStyle::for_stderr(super::ColorChoice::Never, true)
+                super::CliStyle::for_stderr(super::ColorChoice::Never, true)
             )
             .is_err()
         );
@@ -5410,7 +5016,7 @@ mod tests {
         super::delete_box(
             &fake,
             &record,
-            super::SetupStyle::for_stderr(super::ColorChoice::Never, true),
+            super::CliStyle::for_stderr(super::ColorChoice::Never, true),
         )
         .unwrap();
         assert_eq!(*fake.events.borrow(), ["delete", "wait:delete"]);
@@ -5548,7 +5154,7 @@ mod tests {
 
     #[test]
     fn coloured_table_cells_pad_before_ansi_codes() {
-        let style = SetupStyle::from_enabled(true);
+        let style = CliStyle::from_enabled(true);
         let cell = super::format_box_cell(style, "pve", 16, ANSI_CYAN);
 
         assert_eq!(cell, format!("{ANSI_CYAN}{:<16}{ANSI_RESET}", "pve"));
@@ -6270,8 +5876,8 @@ mod tests {
 
     #[test]
     fn setup_style_sanitises_and_paints_text() {
-        let plain = SetupStyle::from_enabled(false);
-        let coloured = SetupStyle::from_enabled(true);
+        let plain = CliStyle::from_enabled(false);
+        let coloured = CliStyle::from_enabled(true);
 
         assert_eq!(plain.paint(ANSI_CYAN, "unsafe\ntext"), "unsafe text");
         assert_eq!(

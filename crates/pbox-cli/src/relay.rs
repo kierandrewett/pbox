@@ -46,7 +46,7 @@ pub async fn connect_agent(
 }
 
 use super::{
-    BootstrapKey, BootstrapOperation, BoxInfo, ColorChoice, NewCommand, PveApi, SetupStyle,
+    BootstrapKey, BootstrapOperation, BoxInfo, CliStyle, ColorChoice, NewCommand, PveApi,
     agent_materials, client_from_config, create_lxc_with_retry, discover_boxes, find_box,
     generate_unique_id, print_box_info, resolve_agent_binary, resolve_new_command_with_template,
     resolve_new_node, select_pve_storage, wait_for_task_with_progress,
@@ -137,7 +137,7 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
         command.ostemplate.is_none(),
         "relay bootstrap requires --image (an OCI image); existing PVE templates cannot be personalised through the PVE API"
     );
-    let progress = super::progress::verbose().then(|| SetupStyle::for_stderr(color, json));
+    let progress = super::progress::verbose().then(|| CliStyle::for_stderr(color, json));
     let creation = super::progress::CreationProgress::new(json);
     let client = client_from_config(config)?;
     let id = generate_unique_id(&discover_boxes(&client)?)?;
@@ -209,17 +209,19 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
         key.cleanup()?;
         drop(creation);
         if !json && !super::progress::verbose() {
+            let style = CliStyle::for_stdout(color, json);
             if resolved.stopped {
-                println!("Created {box_id} (stopped).\n\n  pbox start {box_id}");
+                style.success(&format!("Created {box_id} (stopped)"));
+                style.command(&format!("pbox start {box_id}"));
             } else {
-                println!("Ready: {box_id}");
+                style.success(&format!("Ready: {box_id}"));
                 if let Some(ip) = &record.ip {
-                    println!("  IPv4: {ip}");
+                    style.stdout_metadata("ipv4", ip);
                 }
                 if let Some(ip) = &record.ipv6 {
-                    println!("  IPv6: {ip}");
+                    style.stdout_metadata("ipv6", ip);
                 }
-                println!("\n  pbox ssh {box_id}");
+                style.command(&format!("pbox ssh {box_id}"));
             }
             return Ok(());
         }

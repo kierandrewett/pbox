@@ -1,5 +1,4 @@
 //! One terminal status line for normal creation; diagnostic output is opt-in.
-use std::io::{IsTerminal, Write};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
@@ -30,7 +29,7 @@ impl CreationProgress {
             worker: None,
             visible: !json,
         };
-        if !json && !verbose() && std::io::stderr().is_terminal() {
+        if !json && !verbose() && super::ui::stderr().can_animate() {
             let (sender, receiver) = mpsc::channel::<String>();
             progress.sender = Some(sender);
             progress.worker = Some(thread::spawn(move || {
@@ -44,18 +43,10 @@ impl CreationProgress {
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                     let marker = ["|", "/", "-", "\\"][frame % 4];
-                    let mut stderr = std::io::stderr().lock();
-                    let _ = write!(
-                        stderr,
-                        "\r\x1b[2K{marker} {phase} ({}s)",
-                        started.elapsed().as_secs()
-                    );
-                    let _ = stderr.flush();
+                    super::ui::stderr().spinner_frame(marker, &phase, started.elapsed().as_secs());
                     frame += 1;
                 }
-                let mut stderr = std::io::stderr().lock();
-                let _ = write!(stderr, "\r\x1b[2K");
-                let _ = stderr.flush();
+                super::ui::stderr().clear_progress_line();
             }));
         }
         progress.phase("Connecting to Proxmox");
@@ -66,7 +57,7 @@ impl CreationProgress {
         if let Some(sender) = &self.sender {
             let _ = sender.send(text.to_owned());
         } else if self.visible {
-            eprintln!("{text}...");
+            super::ui::stderr().progress(&format!("{text}..."));
         }
     }
 }

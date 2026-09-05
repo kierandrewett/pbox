@@ -509,7 +509,7 @@ fn run_local_process_inner(
     timeout: Duration,
 ) -> Result<Output> {
     if super::progress::verbose() {
-        eprintln!("[image] {action}");
+        super::ui::stderr().diagnostic(action);
     }
     let mut command = Command::new(program);
     command
@@ -573,19 +573,9 @@ fn read_and_report_command_stream(stream: impl Read) -> Result<Vec<u8>> {
             break;
         }
         output.extend_from_slice(line.as_bytes());
-        let cleaned = line
-            .trim_end_matches(['\r', '\n'])
-            .chars()
-            .map(|character| {
-                if character.is_control() {
-                    ' '
-                } else {
-                    character
-                }
-            })
-            .collect::<String>();
+        let cleaned = line.trim_end_matches(['\r', '\n']);
         if let Some(message) = cleaned.strip_prefix("[pbox-image] ") {
-            eprintln!("[image] {message}");
+            super::ui::stderr().diagnostic(message);
         }
     }
     Ok(output)
@@ -634,16 +624,16 @@ fn wait_for_local_process(
 
 fn report_local_progress(action: &str, elapsed: Duration) {
     if super::progress::verbose() {
-        eprintln!("[image] {action} ({}s elapsed)", elapsed.as_secs());
+        super::ui::stderr().diagnostic(&format!("{action} ({}s elapsed)", elapsed.as_secs()));
     }
 }
 
 fn finish_local_progress(action: &str, elapsed: Duration, outcome: &str) {
     if super::progress::verbose() {
-        eprintln!(
-            "[image] {action} {outcome} ({}s elapsed)",
+        super::ui::stderr().diagnostic(&format!(
+            "{action} {outcome} ({}s elapsed)",
             elapsed.as_secs()
-        );
+        ));
     }
 }
 
