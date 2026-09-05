@@ -1,6 +1,7 @@
 mod ansible;
 mod bootstrap;
 mod images;
+mod progress;
 mod recipes;
 mod relay;
 use ansible::{AnsibleRun, apply_recipe};
@@ -23,7 +24,7 @@ use pbox_core::{
     Config, ConfigStore, LxcConfigUpdateRequest, LxcCreateRequest, LxcSnapshot, LxcSnapshotRequest,
     PboxId, PboxMetadata, PboxRecipeProvenance, PveApi, PveClient, PveClientConfig, PveError,
     PveNetworkInterface, PveStorage, PveStorageContent, PveTaskResponse, encode_metadata,
-    parse_duration, parse_metadata, preserve_metadata, select_lxc_ipv4,
+    parse_duration, parse_metadata, preserve_metadata, select_lxc_ipv4, select_lxc_ipv6,
 };
 use pbox_crypto::{
     CertificateMaterial, CertificatePurpose, client_subject, derive_context_seed,
@@ -59,6 +60,9 @@ const SSH_POST_EXIT_TIMEOUT: Duration = Duration::from_secs(1);
     arg_required_else_help = true
 )]
 struct Cli {
+    /// Show image preparation and provisioning details.
+    #[arg(short, long, global = true)]
+    verbose: bool,
     #[arg(long, global = true, value_enum, default_value_t = ColorChoice::Auto)]
     color: ColorChoice,
 
@@ -392,6 +396,7 @@ struct BoxRecord {
     state: String,
     node: String,
     ip: Option<String>,
+    ipv6: Option<String>,
     name: Option<String>,
     recipes: Vec<PboxRecipeProvenance>,
     capabilities: Vec<String>,
@@ -404,6 +409,7 @@ struct BoxInfo {
     state: String,
     node: String,
     ip: Option<String>,
+    ipv6: Option<String>,
     name: Option<String>,
     recipes: Vec<PboxRecipeProvenance>,
     capabilities: Vec<String>,
@@ -463,6 +469,7 @@ fn main() {
 
 fn run() -> Result<RunOutcome> {
     let cli = Cli::parse();
+    progress::set_verbose(cli.verbose);
     let store = ConfigStore::new(
         cli.config
             .unwrap_or_else(pbox_core::config::default_config_path),
@@ -2415,6 +2422,9 @@ fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOu
     {
         bail!("pbox-agent does not advertise PTY support; upgrade the guest agent");
     }
+    if command.argv.is_empty() {
+        eprintln!("Connected to {}. Type exit to disconnect.", info.box_id);
+    }
     let signals = runtime.block_on(install_terminal_signals())?;
     let terminal = TerminalModeGuard::enter()?;
     let result = runtime.block_on(run_ssh_session_with_signals(
@@ -2477,7 +2487,8 @@ fn validate_exec_arguments(command: &ExecCommand) -> Result<()> {
 }
 fn ssh_command_argv(argv: &[String]) -> Vec<String> {
     if argv.is_empty() {
-        vec!["/bin/sh".to_owned(), "-il".to_owned()]
+        vec!["/bin/sh".to_owned(), "-c".to_owned(),
+            r#"shell=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f7); exec "${shell:-/bin/sh}" -il"#.to_owned()]
     } else {
         argv.to_owned()
     }
@@ -3505,11 +3516,11 @@ fn prepare_new_template_with_progress(
 
 fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorChoice) -> Result<()> {
     let progress = SetupStyle::for_stderr(color, json);
-    progress.progress("Starting box creation...");
     let config = load_config(store)?;
     if config.relay.url.is_some() {
         return relay::run_new(&config, command, json, color);
     }
+    progress.progress("Starting box creation...");
     let agent_binary = resolve_agent_binary(&config)?;
     if !agent_binary.is_file() {
         return Err(anyhow!(
@@ -3675,7 +3686,12 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         id,
         vmid,
         state,
-        node: resolved.node,
+        node: resolved.node.clone(),
+        ipv6: if resolved.stopped {
+            None
+        } else {
+            discover_lxc_addresses(&client, &resolved.node, vmid)?.1
+        },
         ip: output_ip,
         name: Some(hostname),
         recipes: Vec::new(),
@@ -3814,6 +3830,7 @@ fn run_repair(
         state: record.state,
         node: record.node,
         ip: Some(ip.to_string()),
+        ipv6: record.ipv6,
         name: record.name,
         recipes: record.recipes,
         capabilities: record.capabilities,
@@ -3852,6 +3869,7 @@ fn run_start(
                 node: record.node,
                 state: "running".to_owned(),
                 ip: current.ip.map(|ip| ip.to_string()),
+                ipv6: current.ipv6,
                 name: record.name,
                 recipes: record.recipes,
                 capabilities: record.capabilities,
@@ -3879,6 +3897,7 @@ fn run_start(
         state: "running".to_owned(),
         node: record.node,
         ip: Some(ip.to_string()),
+        ipv6: record.ipv6,
         name: record.name,
         recipes: record.recipes,
         capabilities: record.capabilities,
@@ -3949,6 +3968,11 @@ where
         state: state.to_owned(),
         node: record.node,
         ip,
+        ipv6: if state == "running" {
+            record.ipv6
+        } else {
+            None
+        },
         name: record.name,
         recipes: record.recipes,
         capabilities: record.capabilities,
@@ -4542,6 +4566,7 @@ fn run_info(store: &ConfigStore, requested_id: &str, json: bool, color: ColorCho
         state: record.state,
         node: record.node,
         ip: record.ip,
+        ipv6: record.ipv6,
         name: record.name,
         recipes: record.recipes,
         capabilities: record.capabilities,
@@ -4725,6 +4750,20 @@ fn discover_lxc_ip(client: &impl PveApi, node: &str, vmid: u64) -> Result<Option
     Ok(select_lxc_ipv4(&interfaces).map(|address| address.to_string()))
 }
 
+fn discover_lxc_addresses(
+    client: &impl PveApi,
+    node: &str,
+    vmid: u64,
+) -> Result<(Option<String>, Option<String>)> {
+    let interfaces = client
+        .list_lxc_interfaces(node, vmid)
+        .context("read runtime LXC interfaces")?;
+    Ok((
+        select_lxc_ipv4(&interfaces).map(|ip| ip.to_string()),
+        select_lxc_ipv6(&interfaces).map(|ip| ip.to_string()),
+    ))
+}
+
 fn discover_boxes(client: &impl PveApi) -> Result<Vec<BoxRecord>> {
     let resources = client
         .list_cluster_resources()
@@ -4756,15 +4795,15 @@ fn discover_boxes(client: &impl PveApi) -> Result<Vec<BoxRecord>> {
             continue;
         }
         let state = resource.status.unwrap_or_else(|| "unknown".to_owned());
-        let ip = if state == "running" {
-            discover_lxc_ip(client, node, vmid).with_context(|| {
+        let (ip, ipv6) = if state == "running" {
+            discover_lxc_addresses(client, node, vmid).with_context(|| {
                 format!(
-                    "discover IPv4 address for box {metadata_id}",
+                    "discover addresses for box {metadata_id}",
                     metadata_id = metadata.id
                 )
             })?
         } else {
-            None
+            (None, None)
         };
         let name = config.hostname.or(resource.name);
         records.push(BoxRecord {
@@ -4773,6 +4812,7 @@ fn discover_boxes(client: &impl PveApi) -> Result<Vec<BoxRecord>> {
             state,
             node: node.to_owned(),
             ip,
+            ipv6,
             name,
             recipes: metadata.recipes,
             capabilities: metadata.capabilities,
@@ -4811,7 +4851,10 @@ fn print_box_info(info: &BoxInfo, json: bool, color: ColorChoice) -> Result<()> 
         style.stdout_metadata("vmid", &info.vmid.to_string());
         style.stdout_metadata("state", &info.state);
         style.stdout_metadata("node", &info.node);
-        style.stdout_metadata("ip", info.ip.as_deref().unwrap_or("-"));
+        style.stdout_metadata("ipv4", info.ip.as_deref().unwrap_or("-"));
+        if let Some(ipv6) = &info.ipv6 {
+            style.stdout_metadata("ipv6", ipv6);
+        }
         style.stdout_metadata("name", info.name.as_deref().unwrap_or("-"));
         let recipes = info
             .recipes
@@ -4848,9 +4891,18 @@ fn format_box_cell(style: SetupStyle, value: &str, width: usize, code: &str) -> 
 
 fn print_box_records(records: &[BoxRecord], colour: bool) {
     let style = SetupStyle::from_enabled(colour);
+    let has_ipv6 = records.iter().any(|record| record.ipv6.is_some());
     let header = format!(
-        "{:<16} {:<10} {:<16} {:<16} NAME",
-        "ID", "STATE", "NODE", "IP"
+        "{:<16} {:<10} {:<16} {:<16} {}NAME",
+        "ID",
+        "STATE",
+        "NODE",
+        "IPV4",
+        if has_ipv6 {
+            format!("{:<39} ", "IPV6")
+        } else {
+            String::new()
+        }
     );
     println!("{}", style.paint(ANSI_BOLD_CYAN, &header));
     for record in records {
@@ -4859,7 +4911,15 @@ fn print_box_records(records: &[BoxRecord], colour: bool) {
         let node = format_box_cell(style, &record.node, 16, ANSI_CYAN);
         let ip = format_box_cell(style, record.ip.as_deref().unwrap_or("-"), 16, "");
         let name = style.text(record.name.as_deref().unwrap_or("-"));
-        println!("{id} {state} {node} {ip} {name}");
+        let ipv6 = if has_ipv6 {
+            format!(
+                "{} ",
+                format_box_cell(style, record.ipv6.as_deref().unwrap_or("-"), 39, "")
+            )
+        } else {
+            String::new()
+        };
+        println!("{id} {state} {node} {ip} {ipv6}{name}");
     }
     if records.is_empty() {
         println!(
@@ -5263,6 +5323,7 @@ mod tests {
             state: "running".to_owned(),
             node: "pve01".to_owned(),
             ip: None,
+            ipv6: None,
             name: Some("test-box".to_owned()),
             recipes: Vec::new(),
             capabilities: Vec::new(),
@@ -6255,7 +6316,8 @@ mod tests {
     fn ssh_defaults_to_a_login_shell() {
         assert_eq!(
             ssh_command_argv(&[]),
-            vec!["/bin/sh".to_owned(), "-il".to_owned()]
+            vec!["/bin/sh".to_owned(), "-c".to_owned(),
+            r#"shell=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f7); exec "${shell:-/bin/sh}" -il"#.to_owned()]
         );
     }
 

@@ -137,7 +137,8 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
         command.ostemplate.is_none(),
         "relay bootstrap requires --image (an OCI image); existing PVE templates cannot be personalised through the PVE API"
     );
-    let progress = SetupStyle::for_stderr(color, json);
+    let progress = super::progress::verbose().then(|| SetupStyle::for_stderr(color, json));
+    let creation = super::progress::CreationProgress::new(json);
     let client = client_from_config(config)?;
     let id = generate_unique_id(&discover_boxes(&client)?)?;
     let box_id = id.to_string();
@@ -166,10 +167,9 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
         let image = super::images::oci_reference_for_image(
             command.image.as_deref().unwrap_or(&config.images.default),
         );
-        progress.progress(&format!(
-            "Preparing image and outbound agent for {box_id}..."
-        ));
+        creation.phase("Preparing your image");
         let archive = super::images::build_local_oci_archive(&image, &filename, Some(&payload))?;
+        creation.phase("Creating your box");
         let upload = client.upload_storage_template(
             &node,
             storage,
@@ -184,13 +184,7 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
         let upload = upload?;
         operation.relay_task = Some(upload.upid.clone());
         key.save_operation(&operation)?;
-        wait_for_task_with_progress(
-            &client,
-            &node,
-            upload,
-            Some(progress),
-            "private template upload",
-        )?;
+        wait_for_task_with_progress(&client, &node, upload, progress, "private template upload")?;
         let hostname = resolved
             .name
             .clone()
@@ -201,18 +195,34 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
         operation.vmid = Some(vmid);
         operation.relay_task = Some(task.upid.clone());
         key.save_operation(&operation)?;
-        wait_for_task_with_progress(&client, &node, task, Some(progress), "container creation")?;
+        wait_for_task_with_progress(&client, &node, task, progress, "container creation")?;
         operation.phase = "relay-waiting".to_owned();
         key.save_operation(&operation)?;
         cleanup_template(&client, &key, &mut operation)?;
-        progress.progress("Waiting for the agent to connect through the relay...");
+        creation.phase("Connecting to your box");
         wait_ready(config, &box_id)?;
         if resolved.stopped {
             let task = client.shutdown_lxc(&node, vmid)?;
-            wait_for_task_with_progress(&client, &node, task, Some(progress), "box shutdown")?;
+            wait_for_task_with_progress(&client, &node, task, progress, "box shutdown")?;
         }
         let record = find_box(&client, &box_id)?;
         key.cleanup()?;
+        drop(creation);
+        if !json && !super::progress::verbose() {
+            if resolved.stopped {
+                println!("Created {box_id} (stopped).\n\n  pbox start {box_id}");
+            } else {
+                println!("Ready: {box_id}");
+                if let Some(ip) = &record.ip {
+                    println!("  IPv4: {ip}");
+                }
+                if let Some(ip) = &record.ipv6 {
+                    println!("  IPv6: {ip}");
+                }
+                println!("\n  pbox ssh {box_id}");
+            }
+            return Ok(());
+        }
         print_box_info(
             &BoxInfo {
                 id,
@@ -220,6 +230,7 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
                 node,
                 state: record.state,
                 ip: record.ip.map(|ip| ip.to_string()),
+                ipv6: record.ipv6,
                 name: Some(hostname),
                 recipes: Vec::new(),
                 capabilities: Vec::new(),
@@ -296,6 +307,7 @@ pub fn repair(
                 node: record.node,
                 state: record.state,
                 ip: record.ip.map(|ip| ip.to_string()),
+                ipv6: record.ipv6,
                 name: record.name,
                 recipes: Vec::new(),
                 capabilities: Vec::new(),

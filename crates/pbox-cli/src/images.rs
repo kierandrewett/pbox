@@ -7,7 +7,7 @@ use pbox_core::{PveApi, PveError, PveTaskResponse};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, BufRead, Read};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -508,7 +508,9 @@ fn run_local_process_inner(
     report_stdout: bool,
     timeout: Duration,
 ) -> Result<Output> {
-    eprintln!("[image] {action}");
+    if super::progress::verbose() {
+        eprintln!("[image] {action}");
+    }
     let mut command = Command::new(program);
     command
         .args(args)
@@ -535,7 +537,7 @@ fn run_local_process_inner(
         }
     };
     let stdout_reader = thread::spawn(move || {
-        if report_stdout {
+        if report_stdout && super::progress::verbose() {
             read_and_report_command_stream(stdout)
         } else {
             read_command_stream(stdout)
@@ -631,24 +633,13 @@ fn wait_for_local_process(
 }
 
 fn report_local_progress(action: &str, elapsed: Duration) {
-    if io::stderr().is_terminal() {
-        eprint!("\r\x1b[2K[image] {action} ({}s elapsed)", elapsed.as_secs());
-        let _ = io::stderr().flush();
-    } else {
-        eprintln!(
-            "[image] {action} still running ({}s elapsed)",
-            elapsed.as_secs()
-        );
+    if super::progress::verbose() {
+        eprintln!("[image] {action} ({}s elapsed)", elapsed.as_secs());
     }
 }
 
 fn finish_local_progress(action: &str, elapsed: Duration, outcome: &str) {
-    if io::stderr().is_terminal() {
-        eprintln!(
-            "\r\x1b[2K[image] {action} {outcome} ({}s elapsed)",
-            elapsed.as_secs()
-        );
-    } else {
+    if super::progress::verbose() {
         eprintln!(
             "[image] {action} {outcome} ({}s elapsed)",
             elapsed.as_secs()

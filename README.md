@@ -11,6 +11,15 @@ pbox new --image debian:13
 pbox ssh BOX_ID
 ```
 
+With a relay configured, creation shows a single updating status line, then the
+available IPv4/IPv6 addresses and the exact command to connect. Use
+`pbox new --verbose` for image preparation details. Preparing an OCI image still
+installs the prerequisites needed to boot it as an LXC guest.
+
+`pbox info` and `pbox list` show both address families when assigned; loopback and
+link-local IPv6 addresses are omitted. JSON retains `ip` for IPv4 and adds `ipv6`.
+`pbox ssh` opens the guest user's configured login shell.
+
 Direct access needs a route from the workstation to the guest. For private guest
 subnets, deploy the optional relay in Docker or a Proxmox LXC and configure its
 hostname or reachable private IP. See [relay setup](docs/relay.md).
