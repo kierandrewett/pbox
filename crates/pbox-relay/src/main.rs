@@ -24,5 +24,13 @@ async fn main() -> Result<()> {
         .await
         .context("bind relay listener")?;
     eprintln!("[relay] listening on {}", listener.local_addr()?);
-    axum::serve(listener, app).await.context("serve relay")
+    // PID 1 does not get the usual default SIGTERM behaviour in a container.
+    // Closing the process drops tunnels; agents reconnect to the replacement relay.
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("install SIGTERM handler")?;
+    tokio::select! {
+        result = axum::serve(listener, app) => result.context("serve relay"),
+        _ = terminate.recv() => Ok(()),
+        result = tokio::signal::ctrl_c() => result.context("wait for shutdown signal"),
+    }
 }
