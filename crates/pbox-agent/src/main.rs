@@ -1492,7 +1492,11 @@ async fn main() -> Result<()> {
         pbox_relay::websocket_url(&access.url, "agent", &args.box_id)?;
         let mut local = listener.local_addr()?;
         if local.ip().is_unspecified() {
-            local.set_ip(if local.is_ipv4() { std::net::Ipv4Addr::LOCALHOST.into() } else { std::net::Ipv6Addr::LOCALHOST.into() });
+            local.set_ip(if local.is_ipv4() {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            } else {
+                std::net::Ipv6Addr::LOCALHOST.into()
+            });
         }
         tokio::spawn(pbox_relay::run_agent(access, args.box_id.clone(), local));
     }
@@ -1565,28 +1569,77 @@ mod tests {
     async fn relay_preserves_mutual_tls_and_guest_identity() {
         let box_id = "pbx_t3yzd9y3";
         let ca = generate_context_ca(&derive_context_seed("relay-test", "secret")).unwrap();
-        let server = issue_certificate(&ca, &server_subject(box_id).unwrap(), CertificatePurpose::Server).unwrap();
-        let identity = issue_certificate(&ca, "pbox.cwd.dev/context/test", CertificatePurpose::Client).unwrap();
+        let server = issue_certificate(
+            &ca,
+            &server_subject(box_id).unwrap(),
+            CertificatePurpose::Server,
+        )
+        .unwrap();
+        let identity =
+            issue_certificate(&ca, "pbox.cwd.dev/context/test", CertificatePurpose::Client)
+                .unwrap();
         let (endpoint, task) = spawn_test_agent(box_id, server, &ca).await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let key = "relay-test-key-at-least-thirty-two-characters";
         let relay = tokio::spawn(pbox_relay::server::serve(listener, key.to_owned(), 8));
-        let guest = pbox_relay::RelayAccess { url: url.clone(), token: pbox_relay::scoped_token(key, "agent", box_id) };
-        let outbound = tokio::spawn(pbox_relay::run_agent(guest, box_id.to_owned(), endpoint.trim_start_matches("https://").parse().unwrap()));
-        let access = pbox_relay::RelayAccess { url, token: pbox_relay::scoped_token(key, "client", box_id) };
+        let guest = pbox_relay::RelayAccess {
+            url: url.clone(),
+            token: pbox_relay::scoped_token(key, "agent", box_id),
+        };
+        let outbound = tokio::spawn(pbox_relay::run_agent(
+            guest,
+            box_id.to_owned(),
+            endpoint.trim_start_matches("https://").parse().unwrap(),
+        ));
+        let access = pbox_relay::RelayAccess {
+            url,
+            token: pbox_relay::scoped_token(key, "client", box_id),
+        };
         let mut client = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let Ok(client) = AgentClient::connect_with_relay("https://unreachable.invalid:443", box_id, &ca.certificate_pem, &identity, Some(&access)).await { break client; }
+                if let Ok(client) = AgentClient::connect_with_relay(
+                    "https://unreachable.invalid:443",
+                    box_id,
+                    &ca.certificate_pem,
+                    &identity,
+                    Some(&access),
+                )
+                .await
+                {
+                    break client;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert_eq!(client.info().await.unwrap().box_id, box_id);
-        let result = client.exec(vec!["/bin/echo".into(), "relay-ok".into()], "/", Vec::<(String, String)>::new(), "root").await.unwrap();
+        let result = client
+            .exec(
+                vec!["/bin/echo".into(), "relay-ok".into()],
+                "/",
+                Vec::<(String, String)>::new(),
+                "root",
+            )
+            .await
+            .unwrap();
         assert_eq!(result.stdout, b"relay-ok\n");
         let other_ca = generate_context_ca(&derive_context_seed("other", "secret")).unwrap();
-        assert!(AgentClient::connect_with_relay("https://unreachable.invalid:443", box_id, &other_ca.certificate_pem, &identity, Some(&access)).await.is_err());
-        outbound.abort(); relay.abort(); stop_test_agent(task).await;
+        assert!(
+            AgentClient::connect_with_relay(
+                "https://unreachable.invalid:443",
+                box_id,
+                &other_ca.certificate_pem,
+                &identity,
+                Some(&access)
+            )
+            .await
+            .is_err()
+        );
+        outbound.abort();
+        relay.abort();
+        stop_test_agent(task).await;
     }
 
     #[tokio::test]

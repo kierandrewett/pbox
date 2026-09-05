@@ -152,7 +152,11 @@ impl Service<Uri> for AgentTlsConnector {
                 .as_str()
                 .to_owned();
             let stream: Box<dyn Transport> = match relay {
-                Some((access, box_id)) => Box::new(pbox_relay::connect(&access, &box_id).await.map_err(io::Error::other)?),
+                Some((access, box_id)) => Box::new(
+                    pbox_relay::connect(&access, &box_id)
+                        .await
+                        .map_err(io::Error::other)?,
+                ),
                 None => Box::new(TcpStream::connect(authority).await?),
             };
             let server_name = ServerName::try_from(domain)
