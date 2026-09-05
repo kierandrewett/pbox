@@ -1,0 +1,19 @@
+services:
+  pbox-relay:
+    build:
+      context: ../..
+      dockerfile: deploy/relay/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    secrets:
+      - relay-key
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+secrets:
+  relay-key:
+    file: ./relay.key

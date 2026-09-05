@@ -1,3 +1,6 @@
+> Superseded: the implemented design uses an unprivileged connection relay.
+> See [relay setup](relay.md). The management service below was an earlier proposal.
+
 # pbox management service
 
 ## Agreed constraints
