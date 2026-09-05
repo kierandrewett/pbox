@@ -155,11 +155,20 @@ impl Default for ImageConfig {
     }
 }
 
+/// Relay settings are optional. Credentials are read from a separate owner-readable file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RelayConfig {
+    pub url: Option<String>,
+    pub key_file: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Config {
     pub pve: PveConfig,
     pub agent: AgentConfig,
+    pub relay: RelayConfig,
     pub images: ImageConfig,
     pub recipes: RecipeConfig,
     pub vmid_pattern: VmidPattern,
@@ -170,6 +179,7 @@ impl Default for Config {
         Self {
             pve: PveConfig::default(),
             agent: AgentConfig::default(),
+            relay: RelayConfig::default(),
             images: ImageConfig::default(),
             recipes: RecipeConfig::default(),
             vmid_pattern: VmidPattern::parse("9xxx").expect("default VMID pattern is valid"),
@@ -226,9 +236,32 @@ pub struct RedactedRecipeConfig {
 pub struct RedactedConfig {
     pub pve: RedactedPveConfig,
     pub agent: RedactedAgentConfig,
+    pub relay: RelayConfig,
     pub images: RedactedImageConfig,
     pub recipes: RedactedRecipeConfig,
     pub vmid_pattern: VmidPattern,
+}
+
+fn validate_relay_url(key: &str, value: &str) -> Result<(), ConfigError> {
+    let url = Url::parse(value).map_err(|_| ConfigError::InvalidValue {
+        key: key.to_owned(),
+        reason: "expected a relay HTTP(S) or WS(S) origin".to_owned(),
+    })?;
+    if !matches!(url.scheme(), "http" | "https" | "ws" | "wss")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_owned(),
+            reason: "expected a relay origin without credentials, path, query, or fragment"
+                .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 pub fn parse_duration(value: &str) -> Result<Duration, String> {
@@ -255,6 +288,16 @@ pub fn parse_duration(value: &str) -> Result<Duration, String> {
 
 impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(url) = &self.relay.url {
+            validate_relay_url("relay.url", url)?;
+        }
+        if let Some(path) = &self.relay.key_file {
+            validate_non_empty(
+                "relay.key-file",
+                &path.to_string_lossy(),
+                "relay key file path cannot be empty",
+            )?;
+        }
         if let Some(url) = &self.pve.url {
             validate_non_empty("pve.url", url, "URL cannot be empty")?;
             validate_pve_url("pve.url", url)?;
@@ -349,6 +392,7 @@ impl Config {
                     onboot: self.pve.defaults.onboot,
                 },
             },
+            relay: self.relay.clone(),
             agent: RedactedAgentConfig {
                 binary: self.agent.binary.clone(),
                 port: self.agent.port,
@@ -433,6 +477,18 @@ impl Config {
                 .unwrap_or_else(|| "<unset>".to_owned()),
         );
         values.insert("agent.port".to_owned(), self.agent.port.to_string());
+        values.insert(
+            "relay.url".to_owned(),
+            self.relay.url.clone().unwrap_or_default(),
+        );
+        values.insert(
+            "relay.key-file".to_owned(),
+            self.relay
+                .key_file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        );
         values.insert(
             "recipes.repository".to_owned(),
             self.recipes.repository.clone(),
@@ -530,6 +586,11 @@ impl Config {
                 }
                 self.agent.binary = Some(PathBuf::from(value));
             }
+            "relay.url" => {
+                validate_relay_url(key, value)?;
+                self.relay.url = Some(value.to_owned());
+            }
+            "relay.key-file" => self.relay.key_file = Some(PathBuf::from(value)),
             "agent.port" => {
                 self.agent.port = parse_port(key, value)?;
             }
@@ -594,6 +655,8 @@ impl Config {
             "pve.defaults.onboot" => self.pve.defaults.onboot = PveDefaults::default().onboot,
             "images.default" => self.images.default = ImageConfig::default().default,
             "agent.binary" => self.agent.binary = None,
+            "relay.url" => self.relay.url = None,
+            "relay.key-file" => self.relay.key_file = None,
             "agent.port" => self.agent.port = AgentConfig::default().port,
             "recipes.repository" => self.recipes.repository = RecipeConfig::default().repository,
             "recipes.ref" => self.recipes.reference = RecipeConfig::default().reference,
@@ -1011,6 +1074,28 @@ fn apply_environment(config: &mut Config) -> Result<(), ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relay_config_rejects_url_credentials_and_round_trips_private_ip() {
+        let mut config = super::Config::default();
+        assert!(
+            config
+                .set_value("relay.url", "https://user:secret@example.com")
+                .is_err()
+        );
+        config
+            .set_value("relay.url", "http://100.64.1.2:8080")
+            .unwrap();
+        config
+            .set_value("relay.key-file", "/tmp/relay.key")
+            .unwrap();
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: super::Config = toml::from_str(&encoded).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded, config);
+        config.unset_value("relay.url").unwrap();
+        assert!(config.relay.url.is_none());
+    }
+
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -66,6 +66,18 @@ pub trait PveApi {
             "this PVE client does not support storage template uploads".to_owned(),
         ))
     }
+    /// Delete only a temporary per-box bootstrap template owned by pbox.
+    fn delete_bootstrap_template(
+        &self,
+        node: &str,
+        storage: &str,
+        filename: &str,
+    ) -> Result<PveTaskResponse, PveError> {
+        let _ = (node, storage, filename);
+        Err(PveError::Unsupported(
+            "bootstrap template deletion is unavailable".to_owned(),
+        ))
+    }
     fn get_lxc_config(&self, node: &str, vmid: u64) -> Result<LxcConfig, PveError>;
     fn list_lxc_interfaces(&self, node: &str, vmid: u64) -> Result<Vec<LxcInterface>, PveError>;
     fn list_lxc_snapshots(&self, node: &str, vmid: u64) -> Result<Vec<LxcSnapshot>, PveError>;
@@ -365,6 +377,26 @@ impl PveApi for PveClient {
             .send()
             .map_err(PveError::Request)?;
         decode_task_response(response)
+    }
+
+    fn delete_bootstrap_template(
+        &self,
+        node: &str,
+        storage: &str,
+        filename: &str,
+    ) -> Result<PveTaskResponse, PveError> {
+        validate_path_segment(node, "node")?;
+        validate_path_segment(storage, "storage")?;
+        validate_path_segment(filename, "filename")?;
+        if !filename.starts_with("pbox-bootstrap-pbx_") || !filename.ends_with(".tar.zst") {
+            return Err(PveError::Unsupported(
+                "refusing to delete a non-bootstrap template".to_owned(),
+            ));
+        }
+        self.task_without_form(
+            Method::DELETE,
+            &format!("/nodes/{node}/storage/{storage}/content/{storage}:vztmpl%2F{filename}"),
+        )
     }
 
     fn create_lxc(
