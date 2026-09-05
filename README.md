@@ -40,3 +40,10 @@ shared rendering components and Clippy checks. `just check` runs strict Clippy;
 
 Run `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings`
 to check the workspace. See `GOAL.md`, `PLAN.md`, and `TODO.md` for scope and remaining work.
+
+Accounts created by pbox have passwordless sudo inside the guest; password login
+remains locked. If your image already defines `pbox`, its sudo policy is preserved.
+Creation, start, and interactive SSH warn when passwordless root access is unavailable
+and show `pbox ssh BOX_ID --user root` to install tools or adjust the policy.
+Image authors can grant access with a root-owned, mode `0440` file in
+`/etc/sudoers.d/90-pbox` containing `pbox ALL=(ALL:ALL) NOPASSWD: ALL`.

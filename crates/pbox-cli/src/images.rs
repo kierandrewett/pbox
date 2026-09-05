@@ -343,7 +343,10 @@ pub fn build_local_oci_archive(
             .ok_or_else(|| anyhow::anyhow!("local OCI workspace has no valid container name"))?
             .to_owned();
         let preparation = if payload.is_some() {
-            format!("set -eu\n(\n{OCI_GUEST_PREPARATION}\n)\n{RELAY_GUEST_PREPARATION}")
+            format!(
+                "set -eu\n(\n{OCI_GUEST_PREPARATION}\n)\n{}\n{RELAY_GUEST_PREPARATION}",
+                super::guest::USER_SETUP
+            )
         } else {
             OCI_GUEST_PREPARATION.to_owned()
         };
@@ -788,7 +791,6 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 const RELAY_GUEST_PREPARATION: &str = r#"
-if ! id -u pbox >/dev/null 2>&1; then useradd --create-home --shell /bin/bash pbox; fi
 install -d -o pbox -g pbox -m 0755 /home/pbox
 chmod 0755 /usr/local/bin/pbox-agent
 chmod 0700 /etc/pbox

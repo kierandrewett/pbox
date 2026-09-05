@@ -327,7 +327,7 @@ if ! command -v sudo >/dev/null 2>&1; then\n\
   apt-get install -y --no-install-recommends sudo\n\
 fi\n\
 if ! command -v systemctl >/dev/null 2>&1; then echo 'systemd is required for pbox-agent' >&2; exit 1; fi\n\
-if ! id -u pbox >/dev/null 2>&1; then useradd --create-home --shell /bin/bash pbox; fi\n\
+{user_setup}\n\
 install -d -o pbox -g pbox -m 0755 /home/pbox\n\
 install -d -m 0750 /etc/pbox\n\
 install -m 0755 {stage}/pbox-agent /usr/local/bin/pbox-agent\n\
@@ -340,6 +340,7 @@ systemctl daemon-reload\n\
 systemctl enable pbox-agent.service\n\
 systemctl restart pbox-agent.service\n",
         stage = shell_quote(stage),
+        user_setup = super::guest::USER_SETUP,
     );
     ssh.run(&install_script)
         .context("install and start pbox-agent in guest")?;

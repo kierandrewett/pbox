@@ -1,6 +1,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 mod ansible;
 mod bootstrap;
+mod guest;
 mod images;
 mod progress;
 mod ui;
@@ -2206,6 +2207,8 @@ fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOu
         bail!("pbox-agent does not advertise PTY support; upgrade the guest agent");
     }
     if command.argv.is_empty() {
+        let access = runtime.block_on(guest::check_client(&mut client, &command.user));
+        ui::user_access(&info.box_id, &command.user, access);
         ui::stderr().progress(&format!(
             "Connected to {}. Type exit to disconnect.",
             info.box_id
@@ -3450,6 +3453,10 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         )
     })?;
 
+    if !json {
+        let endpoint = format!("https://{ip}:{}", config.agent.port);
+        ui::user_access(&id_text, "pbox", guest::check(&config, &id_text, &endpoint));
+    }
     progress.progress("Box bootstrap complete.");
     let (state, output_ip) = if resolved.stopped {
         progress.progress(&format!("Stopping box {id}..."));
@@ -3647,6 +3654,13 @@ fn run_start(
     ensure_box_started(&client, &record)?;
     if config.relay.url.is_some() {
         relay::wait_ready(&config, &record.id.to_string())?;
+        if !json {
+            ui::user_access(
+                record.id.as_str(),
+                "pbox",
+                guest::check(&config, record.id.as_str(), relay::ENDPOINT),
+            );
+        }
         let current = find_box(&client, &record.id.to_string())?;
         return print_box_info(
             &BoxInfo {
@@ -3677,6 +3691,10 @@ fn run_start(
     };
     wait_for_agent(&probe)
         .with_context(|| format!("wait for authenticated pbox-agent in box {}", record.id))?;
+    if !json {
+        let endpoint = format!("https://{ip}:{}", config.agent.port);
+        ui::user_access(&box_id, "pbox", guest::check(&config, &box_id, &endpoint));
+    }
     let info = BoxInfo {
         id: record.id,
         vmid: record.vmid,

@@ -202,6 +202,11 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
         cleanup_template(&client, &key, &mut operation)?;
         creation.phase("Connecting to your box");
         wait_ready(config, &box_id)?;
+        let access = if !json {
+            Some(super::guest::check(config, &box_id, ENDPOINT))
+        } else {
+            None
+        };
         if resolved.stopped {
             creation.phase("Stopping your box");
             let task = client.shutdown_lxc(&node, vmid)?;
@@ -210,6 +215,9 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
         let record = find_box(&client, &box_id)?;
         key.cleanup()?;
         creation.finish();
+        if let Some(access) = access {
+            super::ui::user_access(&box_id, "pbox", access);
+        }
         if !json && !super::progress::verbose() {
             let style = CliStyle::for_stdout(color, json);
             if resolved.stopped {

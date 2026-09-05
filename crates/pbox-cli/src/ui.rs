@@ -537,6 +537,23 @@ pub(crate) fn parse_cli() -> Cli {
     Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
 }
 
+/// Explain an image's access restrictions without changing its existing policy.
+pub(crate) fn user_access(box_id: &str, user: &str, access: super::guest::UserAccess) {
+    use super::guest::UserAccess;
+    let style = stderr();
+    match access {
+        UserAccess::Passwordless => return,
+        UserAccess::Restricted => {
+            style.warning(&format!("User {user} cannot use passwordless sudo."))
+        }
+        UserAccess::Unknown => {
+            style.warning(&format!("Could not check sudo access for user {user}."))
+        }
+    }
+    style.hint("Use a root shell to install tools or change the sudo policy:");
+    style.hint(&format!("pbox ssh {box_id} --user root"));
+}
+
 #[cfg(test)]
 mod design_tests {
     use super::*;
