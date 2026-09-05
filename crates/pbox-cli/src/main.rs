@@ -143,6 +143,9 @@ enum Command {
         /// Skip the interactive deletion confirmation.
         #[arg(long)]
         yes: bool,
+        /// Gracefully shut down and wait for deletion instead of queuing an immediate stop/delete.
+        #[arg(long)]
+        wait: bool,
     },
 }
 
@@ -528,8 +531,8 @@ fn run() -> Result<RunOutcome> {
         Command::Stop { id, force } => {
             run_stop(&store, &id, force, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
-        Command::Delete { id, yes } => {
-            run_delete(&store, &id, yes, cli.json, cli.color).map(|_| RunOutcome::Success)
+        Command::Delete { id, yes, wait } => {
+            run_delete(&store, &id, yes, wait, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
     }
 }
@@ -3925,16 +3928,27 @@ fn delete_box(client: &impl PveApi, record: &BoxRecord, style: CliStyle) -> Resu
         .with_context(|| format!("PVE did not finish deleting box {}", record.id))
 }
 
+fn queue_delete(client: &impl PveApi, record: &BoxRecord) -> Result<PveTaskResponse> {
+    client
+        .force_delete_lxc(&record.node, record.vmid)
+        .with_context(|| format!("queue deletion of box {}", record.id))
+}
+
 fn run_delete(
     store: &ConfigStore,
     requested_id: &str,
     confirmed: bool,
+    wait: bool,
     json: bool,
     color: ColorChoice,
 ) -> Result<()> {
     let client = client_from_store(store)?;
     let record = find_box_reference(&client, requested_id)?;
     let style = CliStyle::for_stderr(color, json);
+    // Failed bootstrap operations still own private templates and recovery files.
+    // Finish synchronously in that case so cleanup only follows successful deletion.
+    let recovery = BootstrapKey::find_pending(&record.id.to_string())?.is_some();
+    let wait = wait || recovery;
     if !confirmed {
         if json || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
             bail!(
@@ -3948,10 +3962,33 @@ fn run_delete(
         style.metadata("name", record.name.as_deref().unwrap_or("unnamed"));
         style.metadata("state", &record.state);
         style.warning("This permanently deletes the box and its data.");
+        if !wait {
+            style.hint("Running boxes will be stopped immediately. Deletion continues in Proxmox.");
+        }
         if !confirm_delete(&mut io::stdin().lock(), &mut io::stderr().lock())? {
             style.hint("Cancelled. No changes made.");
             return Ok(());
         }
+    }
+    if !wait {
+        let task = queue_delete(&client, &record)?;
+        if json {
+            ui::json_text(&serde_json::to_string_pretty(&serde_json::json!({
+                "id": record.id, "vmid": record.vmid, "node": record.node,
+                "deleted": false, "queued": true, "upid": task.upid
+            }))?);
+        } else {
+            let output = CliStyle::for_stdout(color, json);
+            output.success(&format!("Deletion queued: {}", record.id));
+            output.hint(&format!("Proxmox is stopping and deleting the box. Check node {} task history for the result.", record.node));
+            if progress::verbose() {
+                output.stdout_metadata("task", &task.upid);
+            }
+        }
+        return Ok(());
+    }
+    if recovery && !json {
+        style.hint("Waiting for deletion to finish so private bootstrap files can be cleaned up.");
     }
     delete_box(&client, &record, style)?;
     cleanup_pending_bootstrap(&client, &record.id.to_string())?;
@@ -4966,6 +5003,11 @@ mod tests {
             Ok(Self::task("delete"))
         }
 
+        fn force_delete_lxc(&self, _node: &str, _vmid: u64) -> Result<PveTaskResponse, PveError> {
+            self.events.borrow_mut().push("force-delete".to_owned());
+            Ok(Self::task("force-delete"))
+        }
+
         fn create_lxc_snapshot(
             &self,
             _node: &str,
@@ -5044,6 +5086,24 @@ mod tests {
             );
             assert!(String::from_utf8(output).unwrap().contains("[y/N]"));
         }
+    }
+
+    #[test]
+    fn background_delete_returns_task_without_local_stop_or_wait() {
+        let record = test_record();
+        let fake = FakePve::new(&test_metadata(&record), "test");
+        let task = super::queue_delete(&fake, &record).unwrap();
+        assert!(!task.upid.is_empty());
+        assert_eq!(*fake.events.borrow(), ["force-delete"]);
+        let cli = Cli::try_parse_from(["pbox", "rm", "current", "--wait", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Delete {
+                wait: true,
+                yes: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -5200,7 +5260,7 @@ mod tests {
     #[test]
     fn delete_command_accepts_rm_alias_and_current() {
         let cli = Cli::try_parse_from(["pbox", "rm", "current", "--yes"]).unwrap();
-        let Command::Delete { id, yes } = cli.command else {
+        let Command::Delete { id, yes, .. } = cli.command else {
             panic!("expected delete command");
         };
 

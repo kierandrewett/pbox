@@ -24,9 +24,13 @@ link-local IPv6 addresses are omitted. JSON retains `ip` for IPv4 and adds `ipv6
 titles are prefixed with `box-name · ` as the shell or apps update them. The previous
 host title is restored on disconnect in terminals that support the title stack.
 
-`pbox rm BOX_ID` asks for confirmation, shuts down a running box, then deletes it.
-Press Enter to cancel, or use `--yes` to skip the prompt in scripts. If shutdown
-fails, deletion stops; forced shutdown remains an explicit `pbox stop BOX_ID --force`.
+`pbox rm BOX_ID` asks for confirmation, then queues an immediate stop-and-delete
+in Proxmox and returns. Check the node's task history for completion or failures;
+`--json` returns the task UPID with `queued: true` and `deleted: false`.
+Use `--wait` for graceful shutdown and confirmed deletion; shutdown failures stop
+that operation. Press Enter to cancel, or use `--yes` to skip the prompt in scripts.
+Boxes with unfinished bootstrap recovery state still wait so private templates
+and recovery credentials can be cleaned up after successful deletion.
 `current` selects the box only when exactly one pbox-managed container exists.
 
 Direct access needs a route from the workstation to the guest. For private guest

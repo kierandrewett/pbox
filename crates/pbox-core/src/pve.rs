@@ -118,6 +118,13 @@ pub trait PveApi {
     fn shutdown_lxc(&self, node: &str, vmid: u64) -> Result<PveTaskResponse, PveError>;
     fn stop_lxc(&self, node: &str, vmid: u64) -> Result<PveTaskResponse, PveError>;
     fn delete_lxc(&self, node: &str, vmid: u64) -> Result<PveTaskResponse, PveError>;
+    fn force_delete_lxc(&self, node: &str, vmid: u64) -> Result<PveTaskResponse, PveError> {
+        let _ = (node, vmid);
+        Err(PveError::Unsupported(
+            "this PVE client does not support background deletion".to_owned(),
+        ))
+    }
+
     fn create_lxc_snapshot(
         &self,
         node: &str,
@@ -456,6 +463,11 @@ impl PveApi for PveClient {
     fn delete_lxc(&self, node: &str, vmid: u64) -> Result<PveTaskResponse, PveError> {
         validate_path_segment(node, "node")?;
         self.task_without_form(Method::DELETE, &format!("/nodes/{node}/lxc/{vmid}"))
+    }
+
+    fn force_delete_lxc(&self, node: &str, vmid: u64) -> Result<PveTaskResponse, PveError> {
+        validate_path_segment(node, "node")?;
+        self.task_without_form(Method::DELETE, &format!("/nodes/{node}/lxc/{vmid}?force=1"))
     }
 
     fn create_lxc_snapshot(

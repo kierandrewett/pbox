@@ -29,7 +29,9 @@ before human display. Calculate table padding before applying colour.
 - `--color auto` enables colour only for the relevant terminal stream.
 - `--color always` forces colour. `--color never` disables it.
 - `NO_COLOR` and `--json` disable colour, including command help and usage errors.
-- JSON result schemas stay unchanged. Never insert a heading or success message
+- Keep existing JSON result schemas stable. Background deletion has an explicit
+  queued receipt (`deleted: false`, `queued: true`, `upid`); `--wait` retains the
+  completed-deletion result. Never insert a heading or success message
   into JSON stdout. `json_text` accepts already-serialised machine output only.
 - Interactive SSH saves the host terminal title, sets the box name, and
   restores the title on disconnect using the terminal title stack. Guest OSC 0/1/2 title
@@ -48,7 +50,9 @@ before human display. Calculate table padding before applying colour.
 - Normal output describes the user's operation. Put implementation details in
   verbose diagnostics or explicit resource details.
 - Confirmation uses the shared prompt component with a safe default. Deletion
-  uses `[y/N]`; cancellation is a hint, not a runtime error.
+  uses `[y/N]`; cancellation is a hint, not a runtime error. Background deletion
+  says `Deletion queued`, never `Deleted`, and identifies where to check its result.
+  The confirmation explains the immediate stop; `--wait` uses graceful shutdown.
 - Clap owns help layout and usage errors, with palette tokens supplied by `ui.rs`.
 
 ## Command coverage
