@@ -312,12 +312,12 @@ if command -v apt-get >/dev/null 2>&1; then
     printf '%s\n' '[pbox-image] Updating package metadata'
     run_timed 120 apt-get -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=1 update
     printf '%s\n' '[pbox-image] Installing guest packages: systemd, OpenSSH, sudo, Python, CA certificates, iproute2, ifupdown, DHCP client'
-    run_timed 180 apt-get install -y --no-install-recommends systemd-sysv openssh-server sudo python3 ca-certificates iproute2 ifupdown isc-dhcp-client
+    run_timed 180 apt-get install -y --no-install-recommends systemd-sysv openssh-server sudo python3 ncurses-base ca-certificates iproute2 ifupdown isc-dhcp-client
     printf '%s\n' '[pbox-image] Cleaning package metadata'
     rm -rf /var/lib/apt/lists/* /usr/sbin/policy-rc.d
 elif command -v dnf >/dev/null 2>&1; then
     printf '%s\n' '[pbox-image] Installing guest packages: systemd, OpenSSH, sudo, Python, CA certificates, iproute, DHCP client'
-    run_timed 180 dnf install -y systemd openssh-server sudo python3 ca-certificates iproute dhcp-client
+    run_timed 180 dnf install -y systemd openssh-server sudo python3 ncurses-base ca-certificates iproute dhcp-client
     printf '%s\n' '[pbox-image] Cleaning package metadata'
     dnf clean all
 else

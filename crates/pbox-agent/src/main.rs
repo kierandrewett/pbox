@@ -788,6 +788,12 @@ async fn run_pty_command(
 }
 
 fn command_for_request(request: &ExecRequest) -> Command {
+    let mut environment = request.env.clone();
+    if request.allocate_pty {
+        environment
+            .entry("TERM".to_owned())
+            .or_insert_with(|| "xterm-256color".to_owned());
+    }
     let requested_user = if request.user.is_empty() {
         "pbox"
     } else {
@@ -796,7 +802,7 @@ fn command_for_request(request: &ExecRequest) -> Command {
     let mut command = if requested_user == "root" {
         let mut command = Command::new(&request.argv[0]);
         command.args(&request.argv[1..]);
-        command.envs(&request.env);
+        command.envs(&environment);
         command
     } else {
         // Keep values out of sudo's argv. The validator rejects loader hooks before
@@ -804,8 +810,8 @@ fn command_for_request(request: &ExecRequest) -> Command {
         // sudo changes to the requested user.
         let mut command = Command::new("/usr/bin/sudo");
         command.arg("-n").arg("-u").arg(requested_user);
-        let mut environment_names = request.env.keys().cloned().collect::<Vec<_>>();
-        if !request.env.contains_key("PATH") {
+        let mut environment_names = environment.keys().cloned().collect::<Vec<_>>();
+        if !environment.contains_key("PATH") {
             command.env(
                 "PATH",
                 "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -817,7 +823,7 @@ fn command_for_request(request: &ExecRequest) -> Command {
             command.arg(format!("--preserve-env={}", environment_names.join(",")));
         }
         command.arg("--").args(&request.argv);
-        command.envs(&request.env);
+        command.envs(&environment);
         command
     };
     if !request.cwd.is_empty() {
@@ -1699,6 +1705,43 @@ mod tests {
         stop_test_agent(task).await;
     }
 
+    #[test]
+    fn pty_terminal_defaults_survive_user_switching_and_allow_overrides() {
+        for user in ["root", "pbox"] {
+            let mut request = ExecRequest {
+                argv: vec!["/bin/sh".to_owned()],
+                user: user.to_owned(),
+                allocate_pty: true,
+                ..Default::default()
+            };
+            let command = super::command_for_request(&request);
+            assert!(command.as_std().get_envs().any(|(key, value)| key == "TERM"
+                && value == Some(std::ffi::OsStr::new("xterm-256color"))));
+            if user == "pbox" {
+                assert!(
+                    command
+                        .as_std()
+                        .get_args()
+                        .any(|arg| arg.to_string_lossy().starts_with("--preserve-env=")
+                            && arg.to_string_lossy().contains("TERM"))
+                );
+            }
+            request.env.insert("TERM".to_owned(), "vt100".to_owned());
+            let command = super::command_for_request(&request);
+            assert!(
+                command
+                    .as_std()
+                    .get_envs()
+                    .any(|(key, value)| key == "TERM"
+                        && value == Some(std::ffi::OsStr::new("vt100")))
+            );
+            request.allocate_pty = false;
+            request.env.clear();
+            let command = super::command_for_request(&request);
+            assert!(!command.as_std().get_envs().any(|(key, _)| key == "TERM"));
+        }
+    }
+
     #[tokio::test]
     async fn local_agent_supports_streamed_pty_input_and_output() {
         let box_id = "pbx_t3yzd9y3";
@@ -1726,7 +1769,8 @@ mod tests {
                 vec![
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    "read value; printf 'received:%s' \"$value\"".to_owned(),
+                    r#"printf 'term:%s\n' "$TERM"; read value; printf 'received:%s' "$value""#
+                        .to_owned(),
                 ],
                 "/tmp",
                 [],
@@ -1756,6 +1800,7 @@ mod tests {
             }
         }
         assert!(exited);
+        assert!(String::from_utf8_lossy(&output).contains("term:xterm-256color"));
         assert!(
             output
                 .windows(b"received:streamed-input".len())

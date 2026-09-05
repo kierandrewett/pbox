@@ -2176,11 +2176,7 @@ fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOu
     let (box_id, endpoint) =
         resolve_agent_endpoint(&config, &command.id, command.endpoint.as_deref())?;
     let materials = agent_materials(&config, &box_id)?;
-    let env = command
-        .env
-        .iter()
-        .map(|entry| parse_env_entry(entry))
-        .collect::<Result<Vec<_>>>()?;
+    let env = ssh_environment(&command.env, std::env::var("COLORTERM").ok())?;
     let argv = ssh_command_argv(&command.argv);
     let ca_pem = materials.ca.certificate_pem.clone();
     let client_identity = materials.client;
@@ -2274,6 +2270,26 @@ fn validate_exec_arguments(command: &ExecCommand) -> Result<()> {
     }
     Ok(())
 }
+fn ssh_environment(
+    entries: &[String],
+    color_term: Option<String>,
+) -> Result<Vec<(String, String)>> {
+    let mut env = entries
+        .iter()
+        .map(|entry| parse_env_entry(entry))
+        .collect::<Result<Vec<_>>>()?;
+    if !env.iter().any(|(key, _)| key == "TERM") {
+        env.push(("TERM".to_owned(), "xterm-256color".to_owned()));
+    }
+    if let Some(color_term) =
+        color_term.filter(|value| matches!(value.as_str(), "truecolor" | "24bit"))
+        && !env.iter().any(|(key, _)| key == "COLORTERM")
+    {
+        env.push(("COLORTERM".to_owned(), color_term));
+    }
+    Ok(env)
+}
+
 fn ssh_command_argv(argv: &[String]) -> Vec<String> {
     if argv.is_empty() {
         vec!["/bin/sh".to_owned(), "-c".to_owned(),
@@ -6036,6 +6052,27 @@ mod tests {
         fs::remove_file(&link).unwrap();
         fs::remove_file(&target).unwrap();
     }
+    #[test]
+    fn ssh_advertises_a_portable_terminal_and_preserves_overrides() {
+        let env = super::ssh_environment(&[], Some("truecolor".to_owned())).unwrap();
+        assert!(env.contains(&("TERM".to_owned(), "xterm-256color".to_owned())));
+        assert!(env.contains(&("COLORTERM".to_owned(), "truecolor".to_owned())));
+        let env = super::ssh_environment(
+            &["TERM=vt100".to_owned(), "COLORTERM=custom".to_owned()],
+            Some("truecolor".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(
+            env,
+            [
+                ("TERM".to_owned(), "vt100".to_owned()),
+                ("COLORTERM".to_owned(), "custom".to_owned())
+            ]
+        );
+        let env = super::ssh_environment(&[], Some("unknown".to_owned())).unwrap();
+        assert!(!env.iter().any(|(key, _)| key == "COLORTERM"));
+    }
+
     #[test]
     fn ssh_defaults_to_a_login_shell() {
         assert_eq!(

@@ -47,3 +47,8 @@ Creation, start, and interactive SSH warn when passwordless root access is unava
 and show `pbox ssh BOX_ID --user root` to install tools or adjust the policy.
 Image authors can grant access with a root-owned, mode `0440` file in
 `/etc/sudoers.d/90-pbox` containing `pbox ALL=(ALL:ALL) NOPASSWD: ALL`.
+
+Interactive sessions default to `TERM=xterm-256color`; image preparation installs
+its base terminfo entries. Use `pbox ssh BOX_ID --env TERM=...` to override it.
+The CLI forwards `COLORTERM=truecolor` or `24bit` when advertised by the local
+terminal. These defaults apply to PTYs, not ordinary `pbox exec` commands.
