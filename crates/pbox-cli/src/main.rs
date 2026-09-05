@@ -2,6 +2,7 @@ mod ansible;
 mod bootstrap;
 mod images;
 mod recipes;
+mod relay;
 use ansible::{AnsibleRun, apply_recipe};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -1510,9 +1511,15 @@ fn run_scp(store: &ConfigStore, command: ScpCommand, json: bool, color: ColorCho
         .build()
         .context("create async runtime for pbox-agent file transfer")?;
     let size = runtime.block_on(async move {
-        let mut client = AgentClient::connect(&endpoint, &client_box_id, &ca_pem, &client_identity)
-            .await
-            .context("connect to pbox-agent")?;
+        let mut client = relay::connect_agent(
+            &config,
+            &endpoint,
+            &client_box_id,
+            &ca_pem,
+            &client_identity,
+        )
+        .await
+        .context("connect to pbox-agent")?;
         client
             .info()
             .await
@@ -2246,10 +2253,12 @@ fn run_forward(
                     let ca_pem = ca_pem.clone();
                     let client_identity = client_identity.clone();
                     let remote_host = remote_host.clone();
+                    let config = config.clone();
                     tokio::spawn(async move {
                         let _connection_permit = connection_permit;
                         let result = async {
-                            let mut client = AgentClient::connect(
+                            let mut client = relay::connect_agent(
+                                &config,
                                 &endpoint,
                                 &box_id,
                                 &ca_pem,
@@ -2332,9 +2341,10 @@ fn run_exec(store: &ConfigStore, command: ExecCommand, json: bool) -> Result<Run
         .build()
         .context("create async runtime for pbox-agent")?;
     let result = runtime.block_on(async move {
-        let mut client = AgentClient::connect(&endpoint, &box_id, &ca_pem, &client_identity)
-            .await
-            .context("connect to pbox-agent")?;
+        let mut client =
+            relay::connect_agent(&config, &endpoint, &box_id, &ca_pem, &client_identity)
+                .await
+                .context("connect to pbox-agent")?;
         client
             .info()
             .await
@@ -2388,9 +2398,10 @@ fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOu
         .build()
         .context("create async runtime for pbox-agent shell")?;
     let (mut client, info) = runtime.block_on(async move {
-        let mut client = AgentClient::connect(&endpoint, &box_id, &ca_pem, &client_identity)
-            .await
-            .context("connect to pbox-agent")?;
+        let mut client =
+            relay::connect_agent(&config, &endpoint, &box_id, &ca_pem, &client_identity)
+                .await
+                .context("connect to pbox-agent")?;
         let info = client
             .info()
             .await
@@ -3400,7 +3411,11 @@ fn create_lxc_with_retry(
             unprivileged: Some(resolved.unprivileged),
             onboot: Some(resolved.onboot),
             description: Some(description),
-            ssh_public_keys: Some(key.public_key().to_owned()),
+            ssh_public_keys: config
+                .relay
+                .url
+                .is_none()
+                .then(|| key.public_key().to_owned()),
             start: Some(true),
         };
         match client.create_lxc(&resolved.node, vmid, &request) {
@@ -3492,6 +3507,9 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
     let progress = SetupStyle::for_stderr(color, json);
     progress.progress("Starting box creation...");
     let config = load_config(store)?;
+    if config.relay.url.is_some() {
+        return relay::run_new(&config, command, json, color);
+    }
     let agent_binary = resolve_agent_binary(&config)?;
     if !agent_binary.is_file() {
         return Err(anyhow!(
@@ -3676,6 +3694,9 @@ fn run_repair(
     let config = load_config(store)?;
     let (key, mut operation) = BootstrapKey::find_pending(&id_text)?
         .ok_or_else(|| anyhow!("no interrupted bootstrap operation found for {id_text}"))?;
+    if operation.relay {
+        return relay::repair(&config, key, operation, json, color);
+    }
     let client = client_from_config(&config)?;
     let record = if operation.vmid.is_some() {
         find_box(&client, &id_text)?
@@ -3948,8 +3969,9 @@ fn cleanup_uncreated_bootstrap(
     }
 }
 
-fn cleanup_pending_bootstrap(box_id: &str) -> Result<()> {
-    if let Some((key, _)) = BootstrapKey::find_pending(box_id)? {
+fn cleanup_pending_bootstrap(client: &impl PveApi, box_id: &str) -> Result<()> {
+    if let Some((key, mut operation)) = BootstrapKey::find_pending(box_id)? {
+        relay::cleanup_template(client, &key, &mut operation)?;
         key.cleanup()
             .with_context(|| format!("remove bootstrap recovery state for deleted box {box_id}"))?;
     }
@@ -4030,7 +4052,7 @@ fn run_delete(
         .with_context(|| format!("delete box {}", record.id))?;
     wait_for_task(&client, &record.node, task)
         .with_context(|| format!("PVE did not finish deleting box {}", record.id))?;
-    cleanup_pending_bootstrap(&record.id.to_string())?;
+    cleanup_pending_bootstrap(&client, &record.id.to_string())?;
     let output = DeleteOutput {
         id: record.id,
         vmid: record.vmid,
@@ -4593,6 +4615,10 @@ fn resolve_agent_endpoint(
     let record = find_box(&client, &id.to_string())?;
     if record.state != "running" {
         return Err(anyhow!("box {} is not running", record.id));
+    }
+    if config.relay.url.is_some() {
+        relay::access(config, &id.to_string(), "client")?;
+        return Ok((id.to_string(), relay::ENDPOINT.to_owned()));
     }
     let ip = record
         .ip

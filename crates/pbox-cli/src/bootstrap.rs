@@ -26,6 +26,12 @@ pub struct BootstrapOperation {
     pub port: u16,
     pub stage: String,
     pub phase: String,
+    #[serde(default)]
+    pub relay: bool,
+    #[serde(default)]
+    pub relay_template: Option<String>,
+    #[serde(default)]
+    pub relay_task: Option<String>,
 }
 
 impl BootstrapOperation {
@@ -39,6 +45,9 @@ impl BootstrapOperation {
             port,
             stage: stage.to_owned(),
             phase: "created".to_owned(),
+            relay: false,
+            relay_template: None,
+            relay_task: None,
         }
     }
 }

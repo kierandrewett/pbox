@@ -254,7 +254,7 @@ fn prepare_local_oci_template(
     reference: &str,
     filename: &str,
 ) -> Result<OciTemplate> {
-    let archive = build_local_oci_archive(reference, filename)?;
+    let archive = build_local_oci_archive(reference, filename, None)?;
     let result = upload_local_oci_template(client, node, storage, reference, filename, &archive);
     if let Some(workspace) = archive.parent() {
         let _ = fs::remove_dir_all(workspace);
@@ -327,7 +327,11 @@ fi
 printf '%s\n' '[pbox-image] Guest preparation complete'
 "#;
 
-fn build_local_oci_archive(reference: &str, filename: &str) -> Result<PathBuf> {
+pub fn build_local_oci_archive(
+    reference: &str,
+    filename: &str,
+    payload: Option<&Path>,
+) -> Result<PathBuf> {
     let workspace = create_local_oci_workspace(filename)?;
     let result = (|| {
         let image = ImageReference::parse(reference)?.canonical();
@@ -338,25 +342,46 @@ fn build_local_oci_archive(reference: &str, filename: &str) -> Result<PathBuf> {
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow::anyhow!("local OCI workspace has no valid container name"))?
             .to_owned();
+        let preparation = if payload.is_some() {
+            format!("set -eu\n(\n{OCI_GUEST_PREPARATION}\n)\n{RELAY_GUEST_PREPARATION}")
+        } else {
+            OCI_GUEST_PREPARATION.to_owned()
+        };
         run_local_command(
             "podman",
             &[
                 "create",
+                "--user",
+                "0",
+                "--workdir",
+                "/",
+                "--entrypoint",
+                "/bin/sh",
                 "--quiet",
                 "--name",
                 container.as_str(),
                 "--network",
                 "host",
                 image.as_str(),
-                "/bin/sh",
                 "-c",
-                OCI_GUEST_PREPARATION,
+                &preparation,
             ],
             "Creating temporary OCI container",
         )?;
         let tar = workspace.join(format!("{filename}.tar"));
         let compressed = workspace.join(format!("{filename}.tar.zst"));
         let operation_result = (|| {
+            if let Some(payload) = payload {
+                run_local_command(
+                    "podman",
+                    &[
+                        "cp",
+                        &format!("{}/.", path_text(payload)?),
+                        &format!("{container}:/"),
+                    ],
+                    "Installing per-box agent credentials",
+                )?;
+            }
             let tar_text = path_text(&tar)?;
             let compressed_text = path_text(&compressed)?;
             run_local_command_streaming(
@@ -407,7 +432,14 @@ fn create_local_oci_workspace(filename: &str) -> Result<PathBuf> {
     for attempt in 0..100 {
         let workspace = root.join(format!("pbox-oci-{filename}-{pid}-{attempt}"));
         match fs::create_dir(&workspace) {
-            Ok(()) => return Ok(workspace),
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700))?;
+                }
+                return Ok(workspace);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -773,6 +805,16 @@ fn hex_lower(bytes: &[u8]) -> String {
     }
     value
 }
+
+const RELAY_GUEST_PREPARATION: &str = r#"
+if ! id -u pbox >/dev/null 2>&1; then useradd --create-home --shell /bin/bash pbox; fi
+install -d -o pbox -g pbox -m 0755 /home/pbox
+chmod 0755 /usr/local/bin/pbox-agent
+chmod 0700 /etc/pbox
+chmod 0600 /etc/pbox/server-key.pem /etc/pbox/relay.json
+mkdir -p /etc/systemd/system/multi-user.target.wants
+ln -sf /etc/systemd/system/pbox-agent.service /etc/systemd/system/multi-user.target.wants/pbox-agent.service
+"#;
 
 #[cfg(test)]
 mod tests {
