@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+pbox-relay = { path = "../pbox-relay" }
 thiserror.workspace = true
 pbox-crypto = { path = "../pbox-crypto" }
 pbox-proto = { path = "../pbox-proto" }

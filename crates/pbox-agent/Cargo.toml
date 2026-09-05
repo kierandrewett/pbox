@@ -10,6 +10,8 @@ name = "pbox-agent"
 path = "src/main.rs"
 
 [dependencies]
+serde_json.workspace = true
+pbox-relay = { path = "../pbox-relay" }
 clap.workspace = true
 anyhow.workspace = true
 ipnet.workspace = true

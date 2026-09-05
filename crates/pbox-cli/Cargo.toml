@@ -10,6 +10,7 @@ name = "pbox"
 path = "src/main.rs"
 
 [dependencies]
+pbox-relay = { path = "../pbox-relay" }
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true

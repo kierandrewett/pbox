@@ -138,3 +138,9 @@ async fn forward(
     tokio::time::timeout(DEAD_PEER, target.send(message)).await??;
     Ok(keep_open)
 }
+
+/// Serve on an existing listener, also used by end-to-end transport tests.
+pub async fn serve(listener: tokio::net::TcpListener, key: String, max_connections: usize) -> anyhow::Result<()> {
+    axum::serve(listener, router(key, max_connections)?).await?;
+    Ok(())
+}

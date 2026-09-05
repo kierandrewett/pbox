@@ -75,6 +75,7 @@ pub struct ExecPtySession {
 
 #[derive(Clone)]
 struct AgentTlsConnector {
+    relay: Option<(pbox_relay::RelayAccess, String)>,
     tls: TlsConnector,
     domain: String,
 }
@@ -116,14 +117,18 @@ impl AgentTlsConnector {
             .map_err(|error| AgentClientError::Tls(error.to_string()))?;
         config.alpn_protocols = vec![b"h2".to_vec()];
         Ok(Self {
+            relay: None,
             tls: TlsConnector::from(Arc::new(config)),
             domain,
         })
     }
 }
 
+trait Transport: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Transport for T {}
+
 impl Service<Uri> for AgentTlsConnector {
-    type Response = TokioIo<tokio_rustls::client::TlsStream<TcpStream>>;
+    type Response = TokioIo<tokio_rustls::client::TlsStream<Box<dyn Transport>>>;
     type Error = io::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -134,6 +139,7 @@ impl Service<Uri> for AgentTlsConnector {
     fn call(&mut self, uri: Uri) -> Self::Future {
         let tls = self.tls.clone();
         let domain = self.domain.clone();
+        let relay = self.relay.clone();
         Box::pin(async move {
             let authority = uri
                 .authority()
@@ -145,7 +151,10 @@ impl Service<Uri> for AgentTlsConnector {
                 })?
                 .as_str()
                 .to_owned();
-            let stream = TcpStream::connect(authority).await?;
+            let stream: Box<dyn Transport> = match relay {
+                Some((access, box_id)) => Box::new(pbox_relay::connect(&access, &box_id).await.map_err(io::Error::other)?),
+                None => Box::new(TcpStream::connect(authority).await?),
+            };
             let server_name = ServerName::try_from(domain)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
             tls.connect(server_name, stream)
@@ -168,6 +177,17 @@ impl AgentClient {
         ca_pem: &str,
         client_identity: &CertificateMaterial,
     ) -> Result<Self, AgentClientError> {
+        Self::connect_with_relay(endpoint, box_id, ca_pem, client_identity, None).await
+    }
+
+    /// Connect directly or carry the same mutual TLS connection through a relay.
+    pub async fn connect_with_relay(
+        endpoint: &str,
+        box_id: &str,
+        ca_pem: &str,
+        client_identity: &CertificateMaterial,
+        relay: Option<&pbox_relay::RelayAccess>,
+    ) -> Result<Self, AgentClientError> {
         let domain = server_dns_name(box_id)
             .map_err(|error| AgentClientError::Identity(error.to_string()))?;
         let endpoint = Endpoint::from_shared(endpoint.to_owned())
@@ -184,7 +204,8 @@ impl AgentClient {
         .connect_timeout(AGENT_CONNECT_TIMEOUT)
         .timeout(AGENT_RPC_TIMEOUT);
         validate_https_endpoint(&endpoint)?;
-        let connector = AgentTlsConnector::new(domain, ca_pem, client_identity)?;
+        let mut connector = AgentTlsConnector::new(domain, ca_pem, client_identity)?;
+        connector.relay = relay.cloned().map(|access| (access, box_id.to_owned()));
         let channel = connector_endpoint.connect_with_connector(connector).await?;
         let inner = GeneratedAgentClient::new(channel);
         Ok(Self {
