@@ -1,5 +1,3 @@
-mod transport;
-
 use hyper_util::rt::TokioIo;
 use pbox_crypto::{CertificateMaterial, server_dns_name};
 use pbox_proto::PROTOCOL_VERSION;
@@ -26,7 +24,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::codegen::{Service, http::Uri};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Status, Streaming};
-use transport::AgentStream;
 const AGENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_RPC_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_COLLECTED_BYTES: usize = 64 * 1024 * 1024;
@@ -80,7 +77,6 @@ pub struct ExecPtySession {
 struct AgentTlsConnector {
     tls: TlsConnector,
     domain: String,
-    ssh_host: Option<String>,
 }
 
 impl AgentTlsConnector {
@@ -122,13 +118,12 @@ impl AgentTlsConnector {
         Ok(Self {
             tls: TlsConnector::from(Arc::new(config)),
             domain,
-            ssh_host: None,
         })
     }
 }
 
 impl Service<Uri> for AgentTlsConnector {
-    type Response = TokioIo<tokio_rustls::client::TlsStream<AgentStream>>;
+    type Response = TokioIo<tokio_rustls::client::TlsStream<TcpStream>>;
     type Error = io::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -139,7 +134,6 @@ impl Service<Uri> for AgentTlsConnector {
     fn call(&mut self, uri: Uri) -> Self::Future {
         let tls = self.tls.clone();
         let domain = self.domain.clone();
-        let ssh_host = self.ssh_host.clone();
         Box::pin(async move {
             let authority = uri
                 .authority()
@@ -151,7 +145,7 @@ impl Service<Uri> for AgentTlsConnector {
                 })?
                 .as_str()
                 .to_owned();
-            let stream = AgentStream::connect(&authority, ssh_host.as_deref()).await?;
+            let stream = TcpStream::connect(authority).await?;
             let server_name = ServerName::try_from(domain)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
             tls.connect(server_name, stream)
@@ -174,17 +168,6 @@ impl AgentClient {
         ca_pem: &str,
         client_identity: &CertificateMaterial,
     ) -> Result<Self, AgentClientError> {
-        Self::connect_via_ssh(endpoint, box_id, ca_pem, client_identity, None).await
-    }
-
-    /// Connect through an optional SSH host while retaining guest TLS identity checks.
-    pub async fn connect_via_ssh(
-        endpoint: &str,
-        box_id: &str,
-        ca_pem: &str,
-        client_identity: &CertificateMaterial,
-        ssh_host: Option<&str>,
-    ) -> Result<Self, AgentClientError> {
         let domain = server_dns_name(box_id)
             .map_err(|error| AgentClientError::Identity(error.to_string()))?;
         let endpoint = Endpoint::from_shared(endpoint.to_owned())
@@ -201,8 +184,7 @@ impl AgentClient {
         .connect_timeout(AGENT_CONNECT_TIMEOUT)
         .timeout(AGENT_RPC_TIMEOUT);
         validate_https_endpoint(&endpoint)?;
-        let mut connector = AgentTlsConnector::new(domain, ca_pem, client_identity)?;
-        connector.ssh_host = ssh_host.map(str::to_owned);
+        let connector = AgentTlsConnector::new(domain, ca_pem, client_identity)?;
         let channel = connector_endpoint.connect_with_connector(connector).await?;
         let inner = GeneratedAgentClient::new(channel);
         Ok(Self {
