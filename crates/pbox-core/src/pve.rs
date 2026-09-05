@@ -4,7 +4,7 @@ use reqwest::{Method, StatusCode};
 use serde::de::{DeserializeOwned, Deserializer, Error as DeError};
 use serde::{Deserialize, Serialize, Serializer};
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
@@ -854,6 +854,8 @@ pub struct LxcInterface {
     pub hwaddr: Option<String>,
     pub inet: Option<String>,
     pub inet6: Option<String>,
+    #[serde(default, rename = "ip-addresses")]
+    pub ip_addresses: Vec<LxcIpAddress>,
     pub address: Option<String>,
     pub netmask: Option<String>,
     pub gateway: Option<String>,
@@ -865,6 +867,13 @@ pub struct LxcInterface {
     pub active: Option<u64>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One address from the runtime interface's complete address list.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct LxcIpAddress {
+    #[serde(rename = "ip-address")]
+    pub address: String,
 }
 
 /// Select a reachable-looking IPv4 address from runtime LXC interfaces.
@@ -888,6 +897,30 @@ pub fn select_lxc_ipv4(interfaces: &[LxcInterface]) -> Option<Ipv4Addr> {
         })
         .min_by_key(|(not_eth0, octets, _)| (*not_eth0, *octets))
         .map(|(_, _, address)| address)
+}
+
+/// Select an assigned IPv6 address, excluding loopback and interface-local addresses.
+pub fn select_lxc_ipv6(interfaces: &[LxcInterface]) -> Option<Ipv6Addr> {
+    interfaces
+        .iter()
+        .filter(|interface| interface.active != Some(0) && interface.exists != Some(0))
+        .flat_map(|interface| {
+            interface
+                .ip_addresses
+                .iter()
+                .map(|entry| entry.address.as_str())
+                .chain(interface.inet6.as_deref())
+                .filter_map(|value| value.split('/').next()?.parse::<Ipv6Addr>().ok())
+                .filter(|address| {
+                    !address.is_unspecified()
+                        && !address.is_loopback()
+                        && !address.is_unicast_link_local()
+                        && !address.is_multicast()
+                })
+                .map(move |address| (interface.name.as_deref() != Some("eth0"), address))
+        })
+        .min()
+        .map(|(_, address)| address)
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1263,6 +1296,35 @@ mod tests {
             serde_json::from_str(r#"[{"name":"eth0","inet":"10.0.20.43/24","active":0}]"#).unwrap();
         assert_eq!(select_lxc_ipv4(&interfaces), None);
     }
+    #[test]
+    fn ipv6_selection_handles_dual_stack_ula_and_unusable_addresses() {
+        let interfaces: Vec<LxcInterface> = serde_json::from_str(
+            r#"[
+            {"name":"lo","inet6":"::1/128"},
+            {"name":"eth1","inet6":"fd12::5/64"},
+            {"name":"eth0","inet":"10.0.0.2/24","inet6":"fe80::2/64","ip-addresses":[{"ip-address":"10.0.0.2"},{"ip-address":"2001:db8::2"},{"ip-address":"fe80::2"}]},
+            {"name":"eth2","inet6":"2001:db8::1/64","active":0}
+        ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            select_lxc_ipv6(&interfaces),
+            Some("2001:db8::2".parse().unwrap())
+        );
+        assert_eq!(
+            select_lxc_ipv4(&interfaces),
+            Some("10.0.0.2".parse().unwrap())
+        );
+        assert_eq!(
+            select_lxc_ipv6(&interfaces[1..2]),
+            Some("fd12::5".parse().unwrap())
+        );
+        let local: Vec<LxcInterface> =
+            serde_json::from_str(r#"[{"inet6":"fe80::2/64"},{"inet6":"::"},{"inet6":"ff02::1"}]"#)
+                .unwrap();
+        assert_eq!(select_lxc_ipv6(&local), None);
+    }
+
     #[test]
     fn oci_pull_form_uses_reference_and_filename() {
         let form = OciRegistryPullForm {
