@@ -3821,6 +3821,17 @@ fn run_repair(
     print_box_info(&info, json, color)
 }
 
+fn ensure_box_started(client: &impl PveApi, record: &BoxRecord) -> Result<()> {
+    if client.get_lxc_state(&record.node, record.vmid)? != "running" {
+        let task = client
+            .start_lxc(&record.node, record.vmid)
+            .with_context(|| format!("start box {}", record.id))?;
+        wait_for_task(client, &record.node, task)
+            .with_context(|| format!("PVE did not finish starting box {}", record.id))?;
+    }
+    Ok(())
+}
+
 fn run_start(
     store: &ConfigStore,
     requested_id: &str,
@@ -3830,12 +3841,24 @@ fn run_start(
     let config = load_config(store)?;
     let client = client_from_config(&config)?;
     let record = find_box(&client, requested_id)?;
-    if record.state != "running" {
-        let task = client
-            .start_lxc(&record.node, record.vmid)
-            .with_context(|| format!("start box {}", record.id))?;
-        wait_for_task(&client, &record.node, task)
-            .with_context(|| format!("PVE did not finish starting box {}", record.id))?;
+    ensure_box_started(&client, &record)?;
+    if config.relay.url.is_some() {
+        relay::wait_ready(&config, &record.id.to_string())?;
+        let current = find_box(&client, &record.id.to_string())?;
+        return print_box_info(
+            &BoxInfo {
+                id: record.id,
+                vmid: record.vmid,
+                node: record.node,
+                state: "running".to_owned(),
+                ip: current.ip.map(|ip| ip.to_string()),
+                name: record.name,
+                recipes: record.recipes,
+                capabilities: record.capabilities,
+            },
+            json,
+            color,
+        );
     }
     let ip = wait_for_lxc_ip(&client, &record.node, record.vmid)
         .with_context(|| format!("discover IPv4 address for box {}", record.id))?;
@@ -4613,7 +4636,7 @@ fn resolve_agent_endpoint(
     }
     let client = client_from_config(config)?;
     let record = find_box(&client, &id.to_string())?;
-    if record.state != "running" {
+    if client.get_lxc_state(&record.node, record.vmid)? != "running" {
         return Err(anyhow!("box {} is not running", record.id));
     }
     if config.relay.url.is_some() {
@@ -4907,6 +4930,7 @@ mod tests {
     use std::time::Duration;
 
     struct FakePve {
+        current_state: RefCell<String>,
         config: RefCell<LxcConfig>,
         snapshots: RefCell<Vec<LxcSnapshot>>,
         nodes: RefCell<Vec<PveNode>>,
@@ -4925,6 +4949,7 @@ mod tests {
     impl FakePve {
         fn new(metadata: &PboxMetadata, note: &str) -> Self {
             Self {
+                current_state: RefCell::new("stopped".to_owned()),
                 config: RefCell::new(LxcConfig {
                     digest: Some("digest-1".to_owned()),
                     description: Some(format!("{note}\n\n{}", encode_metadata(metadata).unwrap())),
@@ -5063,6 +5088,10 @@ mod tests {
             Ok(Self::task("oci-upload"))
         }
 
+        fn get_lxc_state(&self, _node: &str, _vmid: u64) -> Result<String, PveError> {
+            Ok(self.current_state.borrow().clone())
+        }
+
         fn get_lxc_config(&self, _node: &str, _vmid: u64) -> Result<LxcConfig, PveError> {
             Ok(self.config.borrow().clone())
         }
@@ -5149,7 +5178,9 @@ mod tests {
         }
 
         fn start_lxc(&self, _node: &str, _vmid: u64) -> Result<PveTaskResponse, PveError> {
-            Err(Self::unsupported())
+            self.events.borrow_mut().push("start".to_owned());
+            *self.current_state.borrow_mut() = "running".to_owned();
+            Ok(Self::task("start"))
         }
 
         fn shutdown_lxc(&self, _node: &str, _vmid: u64) -> Result<PveTaskResponse, PveError> {
@@ -5211,6 +5242,18 @@ mod tests {
                 .retain(|snapshot| snapshot.name != snapname);
             Ok(Self::task("snapshot-delete"))
         }
+    }
+
+    #[test]
+    fn immediate_restart_uses_node_state_even_when_cluster_cache_says_running() {
+        let record = test_record();
+        let fake = FakePve::new(&test_metadata(&record), "test");
+        assert_eq!(record.state, "running");
+        super::ensure_box_started(&fake, &record).unwrap();
+        assert!(fake.events.borrow().iter().any(|event| event == "start"));
+        fake.events.borrow_mut().clear();
+        super::ensure_box_started(&fake, &record).unwrap();
+        assert!(fake.events.borrow().is_empty());
     }
 
     fn test_record() -> BoxRecord {

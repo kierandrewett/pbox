@@ -231,7 +231,7 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
     result.with_context(|| format!("relay bootstrap for {box_id}; use `pbox repair {box_id}` or `pbox delete {box_id} --yes` to recover; operation {}", key.operation_directory().display()))
 }
 
-fn wait_ready(config: &Config, box_id: &str) -> Result<()> {
+pub fn wait_ready(config: &Config, box_id: &str) -> Result<()> {
     let materials = agent_materials(config, box_id)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -281,7 +281,7 @@ pub fn repair(
         .find(|r| r.id.to_string() == operation.box_id);
     if let Some(record) = record {
         anyhow::ensure!(
-            record.state == "running",
+            client.get_lxc_state(&record.node, record.vmid)? == "running",
             "start {} before repairing its relay connection",
             record.id
         );

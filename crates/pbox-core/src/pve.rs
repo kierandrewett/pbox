@@ -78,6 +78,13 @@ pub trait PveApi {
             "bootstrap template deletion is unavailable".to_owned(),
         ))
     }
+    /// Read the node's current state instead of the delayed cluster resource cache.
+    fn get_lxc_state(&self, node: &str, vmid: u64) -> Result<String, PveError> {
+        let _ = (node, vmid);
+        Err(PveError::Unsupported(
+            "current LXC state is unavailable".to_owned(),
+        ))
+    }
     fn get_lxc_config(&self, node: &str, vmid: u64) -> Result<LxcConfig, PveError>;
     fn list_lxc_interfaces(&self, node: &str, vmid: u64) -> Result<Vec<LxcInterface>, PveError>;
     fn list_lxc_snapshots(&self, node: &str, vmid: u64) -> Result<Vec<LxcSnapshot>, PveError>;
@@ -397,6 +404,16 @@ impl PveApi for PveClient {
             Method::DELETE,
             &format!("/nodes/{node}/storage/{storage}/content/{storage}:vztmpl%2F{filename}"),
         )
+    }
+
+    fn get_lxc_state(&self, node: &str, vmid: u64) -> Result<String, PveError> {
+        validate_path_segment(node, "node")?;
+        #[derive(Deserialize)]
+        struct Current {
+            status: String,
+        }
+        let current: Current = self.get(&format!("/nodes/{node}/lxc/{vmid}/status/current"))?;
+        Ok(current.status)
     }
 
     fn create_lxc(
