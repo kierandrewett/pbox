@@ -11,8 +11,9 @@ pbox new --image debian:13
 pbox ssh BOX_ID
 ```
 
-With a relay configured, creation shows a single updating status line, then the
-available IPv4/IPv6 addresses and the exact command to connect. Use
+With a relay configured, creation keeps completed steps above the active spinner
+and names the resolved image. The result shows that image, available IPv4/IPv6
+addresses, and the exact command to connect. Use
 `pbox new --verbose` for image preparation details. Preparing an OCI image still
 installs the prerequisites needed to boot it as an LXC guest.
 

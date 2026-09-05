@@ -33,8 +33,12 @@ before human display. Calculate table padding before applying colour.
   into JSON stdout. `json_text` accepts already-serialised machine output only.
 - Guest output from `exec` and `ssh`, transferred files, and Ansible process output
   are data streams. Preserve their bytes; do not style or sanitise them.
-- Creation uses one updating status line on a capable terminal. Redirected output
+- Creation keeps each completed step with a green `ok` and its elapsed time, then
+  shows a new spinner for the active step on a capable terminal. Failed steps are
+  never marked complete. Redirected output
   and `TERM=dumb` use separate phase lines. Detailed preparation logs need `--verbose`.
+- Image preparation names the resolved OCI reference, including its registry and tag
+  or digest. The creation result repeats it in an `image` metadata row.
 - Normal output describes the user's operation. Put implementation details in
   verbose diagnostics or explicit resource details.
 - Confirmation uses the shared prompt component with a safe default. Deletion

@@ -193,6 +193,13 @@ impl CliStyle {
     pub(crate) fn diagnostic(self, message: &str) {
         self.hint(message);
     }
+    pub(crate) fn completed_step(self, phase: &str, elapsed: u64) {
+        eprintln!(
+            "{} {}",
+            self.status("ok", ANSI_GREEN, phase),
+            self.paint(ANSI_DIM, &format!("({elapsed}s)"))
+        );
+    }
     pub(crate) fn spinner_frame(self, marker: &str, phase: &str, elapsed: u64) {
         eprint!(
             "\r\x1b[2K{} {}",

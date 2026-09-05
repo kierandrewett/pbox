@@ -1,4 +1,4 @@
-//! One terminal status line for normal creation; diagnostic output is opt-in.
+//! Keep completed creation steps above the active spinner; diagnostics are opt-in.
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
@@ -16,8 +16,13 @@ pub fn verbose() -> bool {
     VERBOSE.load(Ordering::Relaxed)
 }
 
+enum ProgressEvent {
+    Phase(String),
+    Finish,
+}
+
 pub struct CreationProgress {
-    sender: Option<mpsc::Sender<String>>,
+    sender: Option<mpsc::Sender<ProgressEvent>>,
     worker: Option<thread::JoinHandle<()>>,
     visible: bool,
 }
@@ -30,32 +35,60 @@ impl CreationProgress {
             visible: !json,
         };
         if !json && !verbose() && super::ui::stderr().can_animate() {
-            let (sender, receiver) = mpsc::channel::<String>();
+            let (sender, receiver) = mpsc::channel::<ProgressEvent>();
             progress.sender = Some(sender);
             progress.worker = Some(thread::spawn(move || {
-                let started = Instant::now();
-                let mut phase = "Connecting to Proxmox".to_owned();
+                let mut started = Instant::now();
+                let mut phase: Option<String> = None;
                 let mut frame = 0;
+                let style = super::ui::stderr();
                 loop {
                     match receiver.recv_timeout(Duration::from_millis(120)) {
-                        Ok(next) => phase = next,
+                        Ok(ProgressEvent::Phase(next)) => {
+                            if let Some(previous) = &phase {
+                                style.clear_progress_line();
+                                style.completed_step(previous, started.elapsed().as_secs());
+                            }
+                            phase = Some(next);
+                            started = Instant::now();
+                            frame = 0;
+                        }
+                        Ok(ProgressEvent::Finish) => {
+                            style.clear_progress_line();
+                            if let Some(phase) = &phase {
+                                style.completed_step(phase, started.elapsed().as_secs());
+                            }
+                            break;
+                        }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            // Dropping during failure must not mark the current step complete.
+                            style.clear_progress_line();
+                            break;
+                        }
                     }
-                    let marker = ["|", "/", "-", "\\"][frame % 4];
-                    super::ui::stderr().spinner_frame(marker, &phase, started.elapsed().as_secs());
-                    frame += 1;
+                    if let Some(phase) = &phase {
+                        let marker = ["|", "/", "-", "\\"][frame % 4];
+                        style.spinner_frame(marker, phase, started.elapsed().as_secs());
+                        frame += 1;
+                    }
                 }
-                super::ui::stderr().clear_progress_line();
             }));
         }
         progress.phase("Connecting to Proxmox");
         progress
     }
 
+    pub fn finish(self) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(ProgressEvent::Finish);
+        }
+        // Drop joins the renderer before the command prints its final result.
+    }
+
     pub fn phase(&self, text: &str) {
         if let Some(sender) = &self.sender {
-            let _ = sender.send(text.to_owned());
+            let _ = sender.send(ProgressEvent::Phase(text.to_owned()));
         } else if self.visible {
             super::ui::stderr().progress(&format!("{text}..."));
         }

@@ -161,13 +161,14 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
     operation.relay = true;
     operation.relay_template = Some(volume);
     key.save_operation(&operation)?;
-    let result = (|| {
+    let result: Result<()> = (|| {
         let payload = key.operation_directory().join("payload");
         write_payload(&payload, config, &box_id)?;
         let image = super::images::oci_reference_for_image(
             command.image.as_deref().unwrap_or(&config.images.default),
         );
-        creation.phase("Preparing your image");
+        let image = super::images::ImageReference::parse(&image)?.canonical();
+        creation.phase(&format!("Preparing {image}"));
         let archive = super::images::build_local_oci_archive(&image, &filename, Some(&payload))?;
         creation.phase("Creating your box");
         let upload = client.upload_storage_template(
@@ -202,19 +203,22 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
         creation.phase("Connecting to your box");
         wait_ready(config, &box_id)?;
         if resolved.stopped {
+            creation.phase("Stopping your box");
             let task = client.shutdown_lxc(&node, vmid)?;
             wait_for_task_with_progress(&client, &node, task, progress, "box shutdown")?;
         }
         let record = find_box(&client, &box_id)?;
         key.cleanup()?;
-        drop(creation);
+        creation.finish();
         if !json && !super::progress::verbose() {
             let style = CliStyle::for_stdout(color, json);
             if resolved.stopped {
                 style.success(&format!("Created {box_id} (stopped)"));
+                style.stdout_metadata("image", &image);
                 style.command(&format!("pbox start {box_id}"));
             } else {
                 style.success(&format!("Ready: {box_id}"));
+                style.stdout_metadata("image", &image);
                 if let Some(ip) = &record.ip {
                     style.stdout_metadata("ipv4", ip);
                 }
@@ -239,7 +243,11 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
             },
             json,
             color,
-        )
+        )?;
+        if !json {
+            CliStyle::for_stdout(color, json).stdout_metadata("image", &image);
+        }
+        Ok(())
     })();
     result.with_context(|| format!("relay bootstrap for {box_id}; use `pbox repair {box_id}` or `pbox delete {box_id} --yes` to recover; operation {}", key.operation_directory().display()))
 }
