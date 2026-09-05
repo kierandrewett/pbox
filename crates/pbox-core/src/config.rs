@@ -81,6 +81,10 @@ pub struct PveConfig {
     pub storage: String,
     pub template_storage: String,
     pub bridge: String,
+    /// SSH host that can run pct and reach the guest network.
+    pub ssh_host: Option<String>,
+    /// Docker container that runs PVE, when PVE is nested in Docker.
+    pub ssh_container: Option<String>,
     pub defaults: PveDefaults,
 }
 
@@ -95,6 +99,8 @@ impl Default for PveConfig {
             storage: "auto".to_owned(),
             template_storage: "local".to_owned(),
             bridge: "vmbr0".to_owned(),
+            ssh_host: None,
+            ssh_container: None,
             defaults: PveDefaults::default(),
         }
     }
@@ -197,6 +203,10 @@ pub struct RedactedPveConfig {
     pub storage: String,
     pub template_storage: String,
     pub bridge: String,
+    /// SSH host that can run pct and reach the guest network.
+    pub ssh_host: Option<String>,
+    /// Docker container that runs PVE, when PVE is nested in Docker.
+    pub ssh_container: Option<String>,
     pub defaults: RedactedPveDefaults,
 }
 
@@ -278,6 +288,20 @@ impl Config {
                 reason: "agent binary path cannot be empty".to_owned(),
             });
         }
+        for (key, value) in [
+            ("pve.ssh-host", &self.pve.ssh_host),
+            ("pve.ssh-container", &self.pve.ssh_container),
+        ] {
+            if let Some(value) = value {
+                validate_ssh_target(key, value)?;
+            }
+        }
+        if self.pve.ssh_container.is_some() && self.pve.ssh_host.is_none() {
+            return Err(ConfigError::InvalidValue {
+                key: "pve.ssh-container".to_owned(),
+                reason: "requires pve.ssh-host".to_owned(),
+            });
+        }
         if self.agent.port == 0 {
             return Err(ConfigError::InvalidValue {
                 key: "agent.port".to_owned(),
@@ -340,6 +364,8 @@ impl Config {
                 storage: self.pve.storage.clone(),
                 template_storage: self.pve.template_storage.clone(),
                 bridge: self.pve.bridge.clone(),
+                ssh_host: self.pve.ssh_host.clone(),
+                ssh_container: self.pve.ssh_container.clone(),
                 defaults: RedactedPveDefaults {
                     cores: self.pve.defaults.cores,
                     memory: self.pve.defaults.memory,
@@ -399,6 +425,14 @@ impl Config {
             self.pve.template_storage.clone(),
         );
         values.insert("pve.bridge".to_owned(), self.pve.bridge.clone());
+        values.insert(
+            "pve.ssh-host".to_owned(),
+            optional_value(&self.pve.ssh_host),
+        );
+        values.insert(
+            "pve.ssh-container".to_owned(),
+            optional_value(&self.pve.ssh_container),
+        );
         values.insert(
             "pve.defaults.cores".to_owned(),
             self.pve.defaults.cores.to_string(),
@@ -481,6 +515,14 @@ impl Config {
             }
             "pve.tls_insecure" => {
                 self.pve.tls_insecure = parse_bool(key, value)?;
+            }
+            "pve.ssh-host" => {
+                validate_ssh_target(key, value)?;
+                self.pve.ssh_host = Some(value.to_owned());
+            }
+            "pve.ssh-container" => {
+                validate_ssh_target(key, value)?;
+                self.pve.ssh_container = Some(value.to_owned());
             }
             "pve.node" => {
                 validate_non_empty(key, value, "PVE node cannot be empty")?;
@@ -578,6 +620,8 @@ impl Config {
             "pve.token_id" => self.pve.token_id = None,
             "pve.token_secret" => self.pve.token_secret = None,
             "pve.tls_insecure" => self.pve.tls_insecure = false,
+            "pve.ssh-host" => self.pve.ssh_host = None,
+            "pve.ssh-container" => self.pve.ssh_container = None,
             "pve.node" => self.pve.node = PveConfig::default().node,
             "pve.storage" => self.pve.storage = PveConfig::default().storage,
             "pve.template-storage" => {
@@ -676,6 +720,22 @@ fn redact_url(value: &Option<String>) -> Option<String> {
         parsed.set_fragment(None);
     }
     Some(parsed.to_string())
+}
+
+fn validate_ssh_target(key: &str, value: &str) -> Result<(), ConfigError> {
+    if value.is_empty()
+        || value.starts_with('-')
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-@:".contains(&b))
+    {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_owned(),
+            reason: "use an SSH host alias or a container name, without whitespace or shell syntax"
+                .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_non_empty(key: &str, value: &str, reason: &str) -> Result<(), ConfigError> {
@@ -1020,6 +1080,35 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("pbox-config-test-{suffix}.toml"))
+    }
+
+    #[test]
+    fn host_transport_config_roundtrips_and_rejects_shell_syntax() {
+        let mut config = Config::default();
+        config.set_value("pve.ssh-host", "user@pve-host").unwrap();
+        config.set_value("pve.ssh-container", "pve").unwrap();
+        config.validate().unwrap();
+        let text = toml::to_string(&config).unwrap();
+        let loaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(loaded, config);
+        assert_eq!(
+            loaded.get_redacted("pve.ssh-host").as_deref(),
+            Some("user@pve-host")
+        );
+        for value in [
+            "",
+            "-oProxyCommand=evil",
+            "host;true",
+            "host name",
+            "$(id)",
+            "host\n",
+        ] {
+            assert!(config.set_value("pve.ssh-host", value).is_err());
+        }
+        config.unset_value("pve.ssh-host").unwrap();
+        assert!(config.validate().is_err());
+        config.unset_value("pve.ssh-container").unwrap();
+        config.validate().unwrap();
     }
 
     #[test]
