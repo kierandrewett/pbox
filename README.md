@@ -20,6 +20,11 @@ installs the prerequisites needed to boot it as an LXC guest.
 link-local IPv6 addresses are omitted. JSON retains `ip` for IPv4 and adds `ipv6`.
 `pbox ssh` opens the guest user's configured login shell.
 
+`pbox rm BOX_ID` asks for confirmation, shuts down a running box, then deletes it.
+Press Enter to cancel, or use `--yes` to skip the prompt in scripts. If shutdown
+fails, deletion stops; forced shutdown remains an explicit `pbox stop BOX_ID --force`.
+`current` selects the box only when exactly one pbox-managed container exists.
+
 Direct access needs a route from the workstation to the guest. For private guest
 subnets, deploy the optional relay in Docker or a Proxmox LXC and configure its
 hostname or reachable private IP. See [relay setup](docs/relay.md).

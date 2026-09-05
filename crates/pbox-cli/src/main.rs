@@ -135,7 +135,7 @@ enum Command {
         /// Public pbox identifier, or `current` when exactly one box exists.
         #[arg(value_name = "ID|current")]
         id: String,
-        /// Confirm the destructive operation.
+        /// Skip the interactive deletion confirmation.
         #[arg(long)]
         yes: bool,
     },
@@ -4059,15 +4059,46 @@ fn find_box_reference(client: &impl PveApi, requested_id: &str) -> Result<BoxRec
     }
 }
 
-fn print_delete_target(style: SetupStyle, requested_id: &str, record: &BoxRecord) {
-    style.section("Delete target");
-    style.metadata("reference", requested_id);
-    style.metadata("id", &record.id.to_string());
-    style.metadata("name", record.name.as_deref().unwrap_or("-"));
-    style.metadata("state", &record.state);
-    style.metadata("node", &record.node);
-    style.metadata("vmid", &record.vmid.to_string());
-    style.hint("This operation is permanent. Repeat with --yes to continue.");
+fn confirm_delete(input: &mut impl BufRead, output: &mut impl Write) -> Result<bool> {
+    loop {
+        write!(output, "Delete permanently? [y/N] ")?;
+        output.flush()?;
+        let mut answer = String::new();
+        if input.read_line(&mut answer)? == 0 {
+            writeln!(output)?;
+            return Ok(false);
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "" | "n" | "no" => return Ok(false),
+            _ => writeln!(output, "Enter y or n.")?,
+        }
+    }
+}
+
+fn delete_box(client: &impl PveApi, record: &BoxRecord, style: SetupStyle) -> Result<()> {
+    let state = client
+        .get_lxc_state(&record.node, record.vmid)
+        .context("check box state before deletion")?;
+    if state != "stopped" {
+        style.progress(&format!("Stopping {}...", record.id));
+        let task = client
+            .shutdown_lxc(&record.node, record.vmid)
+            .with_context(|| format!("request shutdown of {}; box was not deleted", record.id))?;
+        wait_for_task(client, &record.node, task)
+            .with_context(|| format!("shutdown failed; box was not deleted. Use `pbox stop {} --force` if needed, then retry deletion", record.id))?;
+        anyhow::ensure!(
+            client.get_lxc_state(&record.node, record.vmid)? == "stopped",
+            "box {} is still running; it was not deleted",
+            record.id
+        );
+    }
+    style.progress(&format!("Deleting {}...", record.id));
+    let task = client
+        .delete_lxc(&record.node, record.vmid)
+        .with_context(|| format!("delete box {}", record.id))?;
+    wait_for_task(client, &record.node, task)
+        .with_context(|| format!("PVE did not finish deleting box {}", record.id))
 }
 
 fn run_delete(
@@ -4081,24 +4112,26 @@ fn run_delete(
     let record = find_box_reference(&client, requested_id)?;
     let style = SetupStyle::for_stderr(color, json);
     if !confirmed {
-        print_delete_target(style, requested_id, &record);
-        return Err(anyhow!(
-            "deletion not confirmed for box {}; repeat the command with --yes",
-            record.id
-        ));
+        if json || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+            bail!(
+                "to permanently delete {}, run `pbox rm {} --yes`",
+                record.id,
+                record.id
+            );
+        }
+        eprintln!(
+            "{} ({}, {})",
+            record.id,
+            safe_terminal_text(record.name.as_deref().unwrap_or("unnamed")),
+            safe_terminal_text(&record.state)
+        );
+        eprintln!("This permanently deletes the box and its data.");
+        if !confirm_delete(&mut io::stdin().lock(), &mut io::stderr().lock())? {
+            eprintln!("Cancelled. No changes made.");
+            return Ok(());
+        }
     }
-    style.progress(&format!(
-        "Deleting box {} ({} on node {}, VMID {})...",
-        record.id,
-        record.name.as_deref().unwrap_or("unnamed"),
-        record.node,
-        record.vmid
-    ));
-    let task = client
-        .delete_lxc(&record.node, record.vmid)
-        .with_context(|| format!("delete box {}", record.id))?;
-    wait_for_task(&client, &record.node, task)
-        .with_context(|| format!("PVE did not finish deleting box {}", record.id))?;
+    delete_box(&client, &record, style)?;
     cleanup_pending_bootstrap(&client, &record.id.to_string())?;
     let output = DeleteOutput {
         id: record.id,
@@ -4111,8 +4144,6 @@ fn run_delete(
     } else {
         let output_style = SetupStyle::for_stdout(color, json);
         output_style.stdout_status("ok", ANSI_GREEN, &format!("Deleted box {}.", output.id));
-        output_style.stdout_metadata("vmid", &output.vmid.to_string());
-        output_style.stdout_metadata("node", &output.node);
     }
     Ok(())
 }
@@ -5244,7 +5275,9 @@ mod tests {
         }
 
         fn shutdown_lxc(&self, _node: &str, _vmid: u64) -> Result<PveTaskResponse, PveError> {
-            Err(Self::unsupported())
+            self.events.borrow_mut().push("shutdown".to_owned());
+            *self.current_state.borrow_mut() = "stopped".to_owned();
+            Ok(Self::task("shutdown"))
         }
 
         fn stop_lxc(&self, _node: &str, _vmid: u64) -> Result<PveTaskResponse, PveError> {
@@ -5252,7 +5285,8 @@ mod tests {
         }
 
         fn delete_lxc(&self, _node: &str, _vmid: u64) -> Result<PveTaskResponse, PveError> {
-            Err(Self::unsupported())
+            self.events.borrow_mut().push("delete".to_owned());
+            Ok(Self::task("delete"))
         }
 
         fn create_lxc_snapshot(
@@ -5314,6 +5348,72 @@ mod tests {
         fake.events.borrow_mut().clear();
         super::ensure_box_started(&fake, &record).unwrap();
         assert!(fake.events.borrow().is_empty());
+    }
+
+    #[test]
+    fn delete_confirmation_defaults_to_cancel_and_accepts_only_yes() {
+        for (input, expected) in [
+            ("", false),
+            ("\n", false),
+            ("n\n", false),
+            ("yes\n", true),
+            (" Y \n", true),
+            ("maybe\nno\n", false),
+        ] {
+            let mut output = Vec::new();
+            assert_eq!(
+                super::confirm_delete(&mut input.as_bytes(), &mut output).unwrap(),
+                expected
+            );
+            assert!(String::from_utf8(output).unwrap().contains("[y/N]"));
+        }
+    }
+
+    #[test]
+    fn delete_stops_running_guest_and_waits_before_destroying() {
+        let record = test_record();
+        let fake = FakePve::new(&test_metadata(&record), "test");
+        *fake.current_state.borrow_mut() = "running".to_owned();
+        super::delete_box(
+            &fake,
+            &record,
+            super::SetupStyle::for_stderr(super::ColorChoice::Never, true),
+        )
+        .unwrap();
+        assert_eq!(
+            *fake.events.borrow(),
+            ["shutdown", "wait:shutdown", "delete", "wait:delete"]
+        );
+    }
+
+    #[test]
+    fn delete_does_not_destroy_guest_after_failed_shutdown() {
+        let record = test_record();
+        let fake = FakePve::new(&test_metadata(&record), "test");
+        *fake.current_state.borrow_mut() = "running".to_owned();
+        *fake.fail_next_task.borrow_mut() = true;
+        assert!(
+            super::delete_box(
+                &fake,
+                &record,
+                super::SetupStyle::for_stderr(super::ColorChoice::Never, true)
+            )
+            .is_err()
+        );
+        assert_eq!(*fake.events.borrow(), ["shutdown", "wait:shutdown"]);
+    }
+
+    #[test]
+    fn delete_stopped_guest_skips_shutdown() {
+        let record = test_record();
+        let fake = FakePve::new(&test_metadata(&record), "test");
+        super::delete_box(
+            &fake,
+            &record,
+            super::SetupStyle::for_stderr(super::ColorChoice::Never, true),
+        )
+        .unwrap();
+        assert_eq!(*fake.events.borrow(), ["delete", "wait:delete"]);
     }
 
     fn test_record() -> BoxRecord {
