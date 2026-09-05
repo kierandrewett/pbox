@@ -60,7 +60,7 @@ before human display. Calculate table padding before applying colour.
 | Commands | Shared presentation |
 | --- | --- |
 | `setup`, `config` | Headings, metadata, prompts, hints, success, errors |
-| `image search/pull` | Headings, metadata, success, verbose diagnostics |
+| `image search/tags/pull` | Headings, metadata, success, verbose diagnostics |
 | `new`, `repair`, `start`, `stop` | Progress, box details, success, next command |
 | `rm` / `delete` | Section, metadata, warning, prompt, progress, success |
 | `list`, `info`, `id` | Tables, metadata, resource titles |
@@ -80,3 +80,8 @@ For presentation changes, inspect a real terminal and redirected output. Verify
 coloured, plain, and JSON modes. Add new components to `ui.rs` and this document
 before using them. Keep command-specific layouts in the renderer. Do not add
 another style helper to a command module.
+
+Image search displays image names and descriptions with next-command hints; tag
+listing is a separate command. Missing interactive search terms use the shared
+prompt, while redirected input gets a concrete usage hint. Snapshot listing needs
+no ID and groups results under box names and identifiers; an ID is an optional filter.

@@ -18,6 +18,17 @@ addresses, and the exact command to connect. Use
 live image/PVE logs expand beneath it; they collapse into its completed row. Preparing an OCI image still
 installs the prerequisites needed to boot it as an LXC guest.
 
+Find images with `pbox image search debian` (Docker Hub by default), or use
+`--registry REGISTRY` / a qualified query to search another registry. Bare
+`pbox image search` prompts for a name; `pbox image search docker.io` prompts
+within that registry. Search uses local Podman and does not require PVE setup.
+Registries must support search; for a known image, list versions with
+`pbox image tags docker.io/library/debian`.
+
+`pbox snapshot list` lists snapshots grouped by box. An optional ID or `current`
+filters to one box. Unfiltered JSON groups each box's snapshots with its ID, name,
+and node; filtered JSON retains the existing snapshot array.
+
 `pbox info` and `pbox list` show both address families when assigned; loopback and
 link-local IPv6 addresses are omitted. JSON retains `ip` for IPv4 and adds `ipv6`.
 `pbox ssh` opens the guest user's configured login shell. Interactive terminal

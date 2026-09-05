@@ -28,6 +28,63 @@ pub struct OciSearchResult {
     pub repository: String,
     pub tags: Vec<String>,
 }
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all(deserialize = "PascalCase", serialize = "snake_case"))]
+pub struct ImageSearchEntry {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub stars: u64,
+    #[serde(default)]
+    pub official: String,
+}
+
+pub fn is_registry_search(value: &str) -> bool {
+    let value = value.trim_end_matches('/');
+    !value.contains('/') && is_registry_host(value)
+}
+
+fn image_search_term(query: &str, registry: &str) -> Result<String> {
+    let query = query.trim();
+    if query.is_empty()
+        || query.starts_with('-')
+        || query.contains("://")
+        || query.chars().any(char::is_whitespace)
+        || query.chars().any(char::is_control)
+    {
+        bail!("use an image name or keyword, for example `pbox image search debian`");
+    }
+    let first = query.split('/').next().unwrap_or_default();
+    if query.contains('/') && is_registry_host(first) {
+        return Ok(query.to_owned());
+    }
+    let registry = registry.trim_end_matches('/');
+    if registry.is_empty()
+        || registry.starts_with('-')
+        || registry.contains('/')
+        || registry.chars().any(char::is_whitespace)
+        || registry.chars().any(char::is_control)
+    {
+        bail!("--registry must be a registry hostname, for example docker.io");
+    }
+    Ok(format!("{registry}/{query}"))
+}
+
+pub fn search_images(query: &str, registry: &str, limit: usize) -> Result<Vec<ImageSearchEntry>> {
+    if !(1..=100).contains(&limit) {
+        bail!("--limit must be between 1 and 100");
+    }
+    let term = image_search_term(query, registry)?;
+    let output = run_local_command_output("podman",
+        &["search", "--format", "json", "--limit", &limit.to_string(), &term],
+        &format!("search images matching {term}"))
+        .context("image search failed; the registry must support search and may require `podman login`. For a known image, use `pbox image tags REPOSITORY`")?;
+    let entries: Option<Vec<ImageSearchEntry>> =
+        serde_json::from_str(&output).context("parse registry image search results")?;
+    Ok(entries.unwrap_or_default())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OciTemplate {
     pub reference: String,
@@ -179,6 +236,11 @@ pub fn search_oci_repository(
     input: &str,
     limit: usize,
 ) -> Result<OciSearchResult> {
+    if is_registry_search(input) {
+        bail!(
+            "a registry is not an image repository; use `pbox image search {input}` to find images, or `pbox image tags {input}/library/debian`"
+        );
+    }
     let reference = ImageReference::parse(input)?;
     let repository = reference.repository();
     let mut tags = match client.list_oci_repo_tags(node, &repository) {
@@ -793,6 +855,35 @@ ln -sf /etc/systemd/system/pbox-agent.service /etc/systemd/system/multi-user.tar
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_search_preserves_namespaces_and_selects_registries() {
+        assert_eq!(
+            image_search_term("debian", "docker.io").unwrap(),
+            "docker.io/debian"
+        );
+        assert_eq!(
+            image_search_term("nvidia/cuda", "docker.io").unwrap(),
+            "docker.io/nvidia/cuda"
+        );
+        assert_eq!(
+            image_search_term("quay.io/org/image", "docker.io").unwrap(),
+            "quay.io/org/image"
+        );
+        assert!(is_registry_search("docker.io"));
+        assert!(is_registry_search("localhost:5000/"));
+        assert!(!is_registry_search("docker.io/debian"));
+        assert!(image_search_term("--help", "docker.io").is_err());
+        assert!(image_search_term("debian", "https://docker.io").is_err());
+    }
+
+    #[test]
+    fn image_search_reads_podman_fields_and_emits_stable_json() {
+        let entry: ImageSearchEntry = serde_json::from_str(r#"{"Name":"docker.io/library/debian","Description":"Debian","Stars":42,"Official":"[OK]"}"#).unwrap();
+        let output = serde_json::to_value(entry).unwrap();
+        assert_eq!(output["name"], "docker.io/library/debian");
+        assert_eq!(output["stars"], 42);
+    }
 
     #[test]
     fn parses_docker_hub_equivalents_and_rejects_trailing_paths() {

@@ -103,7 +103,7 @@ enum Command {
     Setup(SetupCommand),
     /// Manage local pbox configuration.
     Config(ConfigCommand),
-    /// Manage OCI images through the PVE registry integration.
+    /// Search OCI images, list tags, and prepare PVE templates.
     Image(ImageCommand),
     /// Create a pbox-managed LXC container.
     New(NewCommand),
@@ -190,14 +190,28 @@ struct ImageCommand {
 
 #[derive(Debug, Subcommand)]
 enum ImageSubcommand {
-    /// List tags from an OCI repository through PVE.
+    /// Search registries for images by name or keyword.
     Search(ImageSearchCommand),
+    /// List available tags for a specific OCI repository.
+    Tags(ImageTagsCommand),
     /// Pull a tagged OCI image into PVE template storage.
     Pull(ImagePullCommand),
 }
 
 #[derive(Debug, Args)]
 struct ImageSearchCommand {
+    /// Search term (e.g. debian or docker.io/debian). Prompts when omitted.
+    query: Option<String>,
+    /// Registry for an unqualified search term.
+    #[arg(long, default_value = "docker.io")]
+    registry: String,
+    /// Maximum number of images to show.
+    #[arg(long, default_value_t = 25)]
+    limit: usize,
+}
+
+#[derive(Debug, Args)]
+struct ImageTagsCommand {
     /// OCI repository or image reference, for example ghcr.io/example/base.
     repository: String,
     /// PVE node used for the registry request.
@@ -332,8 +346,11 @@ struct SnapshotCommand {
 
 #[derive(Debug, Subcommand)]
 enum SnapshotSubcommand {
-    /// List snapshots, including PVE's synthetic current entry.
-    List { id: String },
+    /// List snapshots across boxes, or filter by box ID/current.
+    List {
+        /// Optional box filter. Omit to list snapshots across all boxes.
+        id: Option<String>,
+    },
     /// Create a snapshot of a pbox.
     Create {
         /// Public pbox identifier.
@@ -616,10 +633,36 @@ fn run_image(
     json: bool,
     color: ColorChoice,
 ) -> Result<()> {
+    if let ImageSubcommand::Search(command) = command {
+        let mut query = command.query.unwrap_or_default();
+        let mut registry = command.registry;
+        if images::is_registry_search(&query) {
+            registry = query.trim_end_matches('/').to_owned();
+            query.clear();
+        }
+        if query.trim().is_empty() {
+            if json || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+                bail!(
+                    "enter an image name: `pbox image search debian` (or `pbox image search --registry {registry} debian`)"
+                );
+            }
+            ui::stderr().section("Search images");
+            ui::stderr().metadata("registry", &registry);
+            query = prompt_setup_text(ui::stderr(), "Search", None)?;
+        }
+        let result = images::search_images(&query, &registry, command.limit)?;
+        if json {
+            print_value(&result, true, color)?;
+        } else {
+            ui::image_search_results(&result);
+        }
+        return Ok(());
+    }
     let config = load_config(store)?;
     let client = client_from_config(&config)?;
     match command {
-        ImageSubcommand::Search(command) => {
+        ImageSubcommand::Search(_) => unreachable!("image search handled above"),
+        ImageSubcommand::Tags(command) => {
             if command.limit == 0 {
                 bail!("--limit must be greater than zero");
             }
@@ -1320,11 +1363,9 @@ fn parse_setup_bool(value: &str) -> Result<bool> {
 fn prompt_setup_text(style: CliStyle, label: &str, default: Option<&str>) -> Result<String> {
     style.prompt(label, default)?;
     let mut value = String::new();
-    let read = io::stdin()
-        .read_line(&mut value)
-        .context("read setup value")?;
+    let read = io::stdin().read_line(&mut value).context("read input")?;
     if read == 0 {
-        bail!("input ended during pbox setup");
+        bail!("input ended before a value was entered");
     }
     let value = value.trim_end_matches(['\r', '\n']);
     if value.is_empty() {
@@ -4014,7 +4055,7 @@ fn run_snapshot(
     color: ColorChoice,
 ) -> Result<()> {
     match command {
-        SnapshotSubcommand::List { id } => run_snapshot_list(store, &id, json, color),
+        SnapshotSubcommand::List { id } => run_snapshot_list(store, id.as_deref(), json, color),
         SnapshotSubcommand::Create {
             id,
             name,
@@ -4034,19 +4075,40 @@ fn run_snapshot(
 
 fn run_snapshot_list(
     store: &ConfigStore,
-    requested_id: &str,
+    requested_id: Option<&str>,
     json: bool,
     color: ColorChoice,
 ) -> Result<()> {
     let client = client_from_store(store)?;
-    let record = find_box(&client, requested_id)?;
-    let snapshots = client
-        .list_lxc_snapshots(&record.node, record.vmid)
-        .with_context(|| format!("list snapshots for box {}", record.id))?;
-    if json {
-        ui::json_text(&(serde_json::to_string_pretty(&snapshots)?));
+    let records = if let Some(id) = requested_id {
+        vec![find_box_reference(&client, id)?]
     } else {
-        print_snapshot_list(&snapshots, color_enabled(color, json));
+        discover_boxes(&client)?
+    };
+    let mut groups = Vec::new();
+    for record in records {
+        let snapshots = client
+            .list_lxc_snapshots(&record.node, record.vmid)
+            .with_context(|| format!("list snapshots for box {}", record.id))?;
+        groups.push((record, snapshots));
+    }
+    if json {
+        if requested_id.is_some() {
+            ui::json_text(&serde_json::to_string_pretty(&groups[0].1)?);
+        } else {
+            let output: Vec<_> = groups
+                .iter()
+                .map(|(record, snapshots)| {
+                    serde_json::json!({
+                        "id": record.id, "name": record.name, "node": record.node,
+                        "snapshots": snapshots
+                    })
+                })
+                .collect();
+            ui::json_text(&serde_json::to_string_pretty(&output)?);
+        }
+    } else {
+        ui::snapshot_groups(&groups, color_enabled(color, json));
     }
     Ok(())
 }
@@ -6360,6 +6422,26 @@ mod tests {
         assert!(!message.contains("secret"));
     }
     #[test]
+    fn discovery_commands_accept_missing_filters() {
+        let cli = Cli::try_parse_from(["pbox", "snapshot", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(super::SnapshotCommand {
+                command: super::SnapshotSubcommand::List { id: None }
+            })
+        ));
+        let cli = Cli::try_parse_from(["pbox", "snapshot", "list", "current"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(super::SnapshotCommand {
+                command: super::SnapshotSubcommand::List { id: Some(_) }
+            })
+        ));
+        assert!(Cli::try_parse_from(["pbox", "image", "search"]).is_ok());
+        assert!(Cli::try_parse_from(["pbox", "image", "tags", "debian"]).is_ok());
+    }
+
+    #[test]
     fn image_commands_parse_with_expected_defaults() {
         let cli = Cli::try_parse_from([
             "pbox",
@@ -6376,9 +6458,9 @@ mod tests {
         let super::ImageSubcommand::Search(command) = command.command else {
             panic!("expected image search command");
         };
-        assert_eq!(command.repository, "ghcr.io/example/base");
+        assert_eq!(command.query.as_deref(), Some("ghcr.io/example/base"));
         assert_eq!(command.limit, 10);
-        assert!(command.node.is_none());
+        assert_eq!(command.registry, "docker.io");
 
         let cli = Cli::try_parse_from(["pbox", "image", "pull", "ghcr.io/example/base"]).unwrap();
         let Command::Image(command) = cli.command else {

@@ -38,6 +38,7 @@ fn help_for_every_command_uses_the_shared_palette() {
         "config set",
         "config unset",
         "image search",
+        "image tags",
         "image pull",
         "recipe sync",
         "recipe list",
@@ -94,4 +95,30 @@ fn json_is_unstyled_even_when_colour_is_forced() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(value["id"].as_str().unwrap().starts_with("pbx_"));
     assert!(!output.stdout.contains(&27));
+}
+
+#[test]
+fn image_discovery_does_not_require_pve_configuration() {
+    let output = pbox(
+        &[
+            "--config",
+            "/nonexistent/pbox-test.toml",
+            "image",
+            "search",
+            "debian",
+            "--limit",
+            "0",
+        ],
+        true,
+    );
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(!output.status.success());
+    assert!(
+        error.contains("--limit must be between 1 and 100"),
+        "{error}"
+    );
+    let output = pbox(&["image", "search", "docker.io"], true);
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("pbox image search debian"), "{error}");
+    assert!(!error.contains("skopeo"));
 }

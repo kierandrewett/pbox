@@ -811,6 +811,44 @@ impl TitlePrefix {
     }
 }
 
+pub(crate) fn snapshot_groups(groups: &[(BoxRecord, Vec<LxcSnapshot>)], colour: bool) {
+    let style = CliStyle::from_enabled(colour);
+    if groups.is_empty() {
+        style.stdout_hint("No boxes found.");
+    }
+    for (record, snapshots) in groups {
+        style.stdout_heading(&format!(
+            "{} ({})",
+            record.name.as_deref().unwrap_or("unnamed"),
+            record.id
+        ));
+        print_snapshot_list(snapshots, colour);
+    }
+}
+
+pub(crate) fn image_search_results(entries: &[super::images::ImageSearchEntry]) {
+    let style = stdout();
+    style.stdout_heading("Images");
+    if entries.is_empty() {
+        style.stdout_hint("No images found. Try a broader name or another --registry.");
+        return;
+    }
+    for entry in entries {
+        style.stdout_metadata("image", &entry.name);
+        if !entry.description.is_empty() {
+            style.stdout_hint(&clip_terminal_text(
+                &entry.description,
+                terminal_columns().saturating_sub(4),
+            ));
+        }
+        if !entry.official.is_empty() {
+            style.stdout_hint("Official image");
+        }
+    }
+    style.stdout_hint("List versions: pbox image tags IMAGE");
+    style.stdout_hint("Create a box:  pbox new --image IMAGE:TAG");
+}
+
 #[cfg(test)]
 mod design_tests {
     use super::*;
