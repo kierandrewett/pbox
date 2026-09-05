@@ -1,3 +1,4 @@
+use crate::host::HostGuest;
 use anyhow::{Context, Result, anyhow, bail};
 use pbox_agent_client::AgentClient;
 use pbox_crypto::{CertificateMaterial, CertificatePurpose, issue_certificate};
@@ -269,6 +270,7 @@ impl BootstrapKey {
 }
 
 pub struct BootstrapRequest<'a> {
+    pub host_guest: Option<HostGuest<'a>>,
     pub box_id: &'a str,
     pub ip: Ipv4Addr,
     pub port: u16,
@@ -293,7 +295,10 @@ pub fn bootstrap_box(request: &BootstrapRequest<'_>) -> Result<()> {
 
     let stage = request.key.remote_stage();
     let local_files = write_local_material(request)?;
-    let ssh = SshSession::new(request.ip, request.key);
+    let ssh = GuestSession::new(request);
+    if let Some(host) = request.host_guest.as_ref() {
+        host.verify()?;
+    }
 
     ssh.run(&format!("install -d -m 0700 {}", shell_quote(stage)))
         .context("create guest bootstrap staging directory")?;
@@ -335,6 +340,7 @@ systemctl restart pbox-agent.service\n",
     ssh.run(&install_script)
         .context("install and start pbox-agent in guest")?;
     let probe = AgentProbeRequest {
+        ssh_host: request.host_guest.as_ref().map(|host| host.host),
         box_id: request.box_id,
         ip: request.ip,
         port: request.port,
@@ -416,6 +422,7 @@ fn write_restricted(path: &Path, contents: &str, mode: u32) -> Result<()> {
 }
 
 pub struct AgentProbeRequest<'a> {
+    pub ssh_host: Option<&'a str>,
     pub box_id: &'a str,
     pub ip: Ipv4Addr,
     pub port: u16,
@@ -442,8 +449,14 @@ pub fn wait_for_agent(request: &AgentProbeRequest<'_>) -> Result<()> {
     while started.elapsed() < AGENT_READY_TIMEOUT {
         let result = runtime.block_on(async {
             tokio::time::timeout(AGENT_CONNECT_TIMEOUT, async {
-                let mut client =
-                    AgentClient::connect(&endpoint, &box_id, &ca_pem, &identity).await?;
+                let mut client = AgentClient::connect_via_ssh(
+                    &endpoint,
+                    &box_id,
+                    &ca_pem,
+                    &identity,
+                    request.ssh_host,
+                )
+                .await?;
                 client.info().await
             })
             .await
@@ -481,9 +494,10 @@ pub fn cleanup_bootstrap_authenticated(
         .build()
         .context("create async runtime for authenticated bootstrap cleanup")?;
     let result = runtime.block_on(async {
-        let mut client = AgentClient::connect(&endpoint, &box_id, &ca_pem, &identity)
-            .await
-            .context("connect to pbox-agent for bootstrap cleanup")?;
+        let mut client =
+            AgentClient::connect_via_ssh(&endpoint, &box_id, &ca_pem, &identity, request.ssh_host)
+                .await
+                .context("connect to pbox-agent for bootstrap cleanup")?;
         client
             .exec(command, "/", std::iter::empty::<(String, String)>(), "root")
             .await
@@ -502,11 +516,42 @@ pub fn cleanup_bootstrap_with_fallback(
     request: &AgentProbeRequest<'_>,
     key: &BootstrapKey,
 ) -> Result<()> {
+    if request.ssh_host.is_some() {
+        return cleanup_bootstrap_authenticated(request, key);
+    }
     if let Err(ssh_error) = cleanup_bootstrap(request.ip, key) {
         cleanup_bootstrap_authenticated(request, key)
             .with_context(|| format!("SSH bootstrap cleanup failed: {ssh_error}"))?;
     }
     Ok(())
+}
+
+enum GuestSession<'a> {
+    Direct(SshSession<'a>),
+    Host(&'a HostGuest<'a>),
+}
+
+impl<'a> GuestSession<'a> {
+    fn new(request: &'a BootstrapRequest<'a>) -> Self {
+        match request.host_guest.as_ref() {
+            Some(host) => Self::Host(host),
+            None => Self::Direct(SshSession::new(request.ip, request.key)),
+        }
+    }
+
+    fn run(&self, script: &str) -> Result<Output> {
+        match self {
+            Self::Direct(ssh) => ssh.run(script),
+            Self::Host(host) => host.run(script),
+        }
+    }
+
+    fn copy(&self, local: &Path, remote: &str) -> Result<()> {
+        match self {
+            Self::Direct(ssh) => ssh.copy(local, remote),
+            Self::Host(host) => host.copy(local, remote),
+        }
+    }
 }
 
 struct SshSession<'a> {

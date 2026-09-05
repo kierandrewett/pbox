@@ -1,5 +1,6 @@
 mod ansible;
 mod bootstrap;
+mod host;
 mod images;
 mod recipes;
 use ansible::{AnsibleRun, apply_recipe};
@@ -1293,6 +1294,39 @@ fn run_setup(
         Some(&agent_port_default),
     )?;
 
+    style.section("Guest access");
+    style.hint("Direct access requires a route from this machine to the guest network.");
+    style.hint("Host access uses SSH to run pct and carry guest-agent traffic.");
+    let use_host = prompt_setup_bool(style, "Use a PVE SSH host", config.pve.ssh_host.is_some())?;
+    let (ssh_host, ssh_container) = if use_host {
+        let host = prompt_setup_config_value(
+            style,
+            &config,
+            "pve.ssh-host",
+            "SSH host (from ~/.ssh/config)",
+            config.pve.ssh_host.as_deref(),
+        )?;
+        let nested = prompt_setup_bool(
+            style,
+            "PVE runs inside Docker",
+            config.pve.ssh_container.is_some(),
+        )?;
+        let container = if nested {
+            Some(prompt_setup_config_value(
+                style,
+                &config,
+                "pve.ssh-container",
+                "PVE Docker container",
+                config.pve.ssh_container.as_deref(),
+            )?)
+        } else {
+            None
+        };
+        (Some(host), container)
+    } else {
+        (None, None)
+    };
+
     style.section("Recipes");
     let recipes_repository = prompt_setup_config_value(
         style,
@@ -1332,6 +1366,8 @@ fn run_setup(
         }
     }
     apply_setup_values(&mut config, &answers)?;
+    config.pve.ssh_host = ssh_host;
+    config.pve.ssh_container = ssh_container;
 
     let verified = if command.skip_verify {
         false
@@ -1510,9 +1546,15 @@ fn run_scp(store: &ConfigStore, command: ScpCommand, json: bool, color: ColorCho
         .build()
         .context("create async runtime for pbox-agent file transfer")?;
     let size = runtime.block_on(async move {
-        let mut client = AgentClient::connect(&endpoint, &client_box_id, &ca_pem, &client_identity)
-            .await
-            .context("connect to pbox-agent")?;
+        let mut client = AgentClient::connect_via_ssh(
+            &endpoint,
+            &client_box_id,
+            &ca_pem,
+            &client_identity,
+            config.pve.ssh_host.as_deref(),
+        )
+        .await
+        .context("connect to pbox-agent")?;
         client
             .info()
             .await
@@ -2246,14 +2288,16 @@ fn run_forward(
                     let ca_pem = ca_pem.clone();
                     let client_identity = client_identity.clone();
                     let remote_host = remote_host.clone();
+                    let ssh_host = config.pve.ssh_host.clone();
                     tokio::spawn(async move {
                         let _connection_permit = connection_permit;
                         let result = async {
-                            let mut client = AgentClient::connect(
+                            let mut client = AgentClient::connect_via_ssh(
                                 &endpoint,
                                 &box_id,
                                 &ca_pem,
                                 &client_identity,
+                                ssh_host.as_deref(),
                             )
                             .await
                             .context("connect to pbox-agent")?;
@@ -2332,9 +2376,15 @@ fn run_exec(store: &ConfigStore, command: ExecCommand, json: bool) -> Result<Run
         .build()
         .context("create async runtime for pbox-agent")?;
     let result = runtime.block_on(async move {
-        let mut client = AgentClient::connect(&endpoint, &box_id, &ca_pem, &client_identity)
-            .await
-            .context("connect to pbox-agent")?;
+        let mut client = AgentClient::connect_via_ssh(
+            &endpoint,
+            &box_id,
+            &ca_pem,
+            &client_identity,
+            config.pve.ssh_host.as_deref(),
+        )
+        .await
+        .context("connect to pbox-agent")?;
         client
             .info()
             .await
@@ -2388,9 +2438,15 @@ fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOu
         .build()
         .context("create async runtime for pbox-agent shell")?;
     let (mut client, info) = runtime.block_on(async move {
-        let mut client = AgentClient::connect(&endpoint, &box_id, &ca_pem, &client_identity)
-            .await
-            .context("connect to pbox-agent")?;
+        let mut client = AgentClient::connect_via_ssh(
+            &endpoint,
+            &box_id,
+            &ca_pem,
+            &client_identity,
+            config.pve.ssh_host.as_deref(),
+        )
+        .await
+        .context("connect to pbox-agent")?;
         let info = client
             .info()
             .await
@@ -3400,7 +3456,11 @@ fn create_lxc_with_retry(
             unprivileged: Some(resolved.unprivileged),
             onboot: Some(resolved.onboot),
             description: Some(description),
-            ssh_public_keys: Some(key.public_key().to_owned()),
+            ssh_public_keys: config
+                .pve
+                .ssh_host
+                .is_none()
+                .then(|| key.public_key().to_owned()),
             start: Some(true),
         };
         match client.create_lxc(&resolved.node, vmid, &request) {
@@ -3594,8 +3654,21 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
     )?;
     operation.phase = "bootstrapping".to_owned();
     save_bootstrap_operation(&key, &operation, "record guest bootstrap start", &id_text)?;
-    progress.progress(&format!("Bootstrapping pbox-agent over SSH at {ip}..."));
+    if let Some(host) = config.pve.ssh_host.as_deref() {
+        progress.progress(&format!(
+            "Bootstrapping pbox-agent through PVE host {host}..."
+        ));
+    } else {
+        progress.progress(&format!("Bootstrapping pbox-agent over SSH at {ip}..."));
+    }
     let bootstrap_request = BootstrapRequest {
+        host_guest: config.pve.ssh_host.as_deref().map(|host| host::HostGuest {
+            host,
+            container: config.pve.ssh_container.as_deref(),
+            node: &resolved.node,
+            vmid,
+            box_id: &id_text,
+        }),
         box_id: &id_text,
         ip,
         port: config.agent.port,
@@ -3617,6 +3690,7 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         &id_text,
     )?;
     let probe = AgentProbeRequest {
+        ssh_host: config.pve.ssh_host.as_deref(),
         box_id: &id_text,
         ip,
         port: config.agent.port,
@@ -3716,6 +3790,7 @@ fn run_repair(
         .with_context(|| format!("discover IPv4 address for box {id_text}"))?;
     let materials = agent_materials(&config, &id_text)?;
     let probe = AgentProbeRequest {
+        ssh_host: config.pve.ssh_host.as_deref(),
         box_id: &id_text,
         ip,
         port: config.agent.port,
@@ -3754,6 +3829,13 @@ fn run_repair(
             save_bootstrap_operation(&key, &operation, "record bootstrap repair state", &id_text)?;
 
             let bootstrap_request = BootstrapRequest {
+                host_guest: config.pve.ssh_host.as_deref().map(|host| host::HostGuest {
+                    host,
+                    container: config.pve.ssh_container.as_deref(),
+                    node: &record.node,
+                    vmid: record.vmid,
+                    box_id: &id_text,
+                }),
                 box_id: &id_text,
                 ip,
                 port: config.agent.port,
@@ -3821,6 +3903,7 @@ fn run_start(
     let box_id = record.id.to_string();
     let materials = agent_materials(&config, &box_id)?;
     let probe = AgentProbeRequest {
+        ssh_host: config.pve.ssh_host.as_deref(),
         box_id: &box_id,
         ip,
         port: config.agent.port,
