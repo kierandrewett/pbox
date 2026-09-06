@@ -1,3 +1,4 @@
+mod pty;
 mod sessions;
 mod workspace;
 use anyhow::{Context, Result};
@@ -273,6 +274,7 @@ impl Agent for AgentService {
                 "exec".to_owned(),
                 "pty".to_owned(),
                 "terminal-sessions".to_owned(),
+                "session-control".to_owned(),
                 "files".to_owned(),
                 "forward".to_owned(),
             ]
@@ -354,6 +356,38 @@ impl Agent for AgentService {
         Ok(Response::new(pbox_proto::agent::ListSessionsResponse {
             sessions: self.sessions.list(),
         }))
+    }
+
+    async fn start_session(
+        &self,
+        request: Request<ExecRequest>,
+    ) -> Result<Response<pbox_proto::agent::TerminalSession>, Status> {
+        let first = workspace::resolve_request(request.into_inner())?;
+        validate_exec_request(&first)?;
+        Ok(Response::new(
+            self.sessions.start(first, &self.exec_slots).await?,
+        ))
+    }
+
+    async fn read_session(
+        &self,
+        request: Request<pbox_proto::agent::SessionRequest>,
+    ) -> Result<Response<pbox_proto::agent::ReadSessionResponse>, Status> {
+        let request = request.into_inner();
+        sessions::check_protocol(request.protocol_version)?;
+        Ok(Response::new(self.sessions.read(&request.name)?))
+    }
+
+    async fn send_session(
+        &self,
+        request: Request<pbox_proto::agent::SendSessionRequest>,
+    ) -> Result<Response<pbox_proto::agent::SendSessionResponse>, Status> {
+        let request = request.into_inner();
+        sessions::check_protocol(request.protocol_version)?;
+        self.sessions
+            .send(&request.name, &request.text, &request.keys)
+            .await?;
+        Ok(Response::new(pbox_proto::agent::SendSessionResponse {}))
     }
 
     async fn close_session(
@@ -686,7 +720,7 @@ async fn run_command(
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     if request.allocate_pty {
-        run_pty_command(request, requests, sender).await;
+        run_pty_command(request, requests, sender, None).await;
     } else {
         run_piped_command(request, requests, sender).await;
     }
@@ -769,10 +803,22 @@ async fn run_piped_command(
     }
 }
 
+async fn pty_start_failure(
+    sender: mpsc::Sender<Result<ExecEvent, Status>>,
+    started: Option<tokio::sync::oneshot::Sender<Result<(), Status>>>,
+    error: Status,
+) {
+    if let Some(started) = started {
+        let _ = started.send(Err(error.clone()));
+    }
+    let _ = sender.send(Err(error)).await;
+}
+
 async fn run_pty_command(
     request: ExecRequest,
     requests: impl Stream<Item = Result<ExecRequest, Status>> + Unpin + Send + 'static,
     sender: mpsc::Sender<Result<ExecEvent, Status>>,
+    mut started: Option<tokio::sync::oneshot::Sender<Result<(), Status>>>,
 ) {
     let deadline = request
         .session_name
@@ -791,9 +837,12 @@ async fn run_pty_command(
     let pty = match nix::pty::openpty(winsize.as_ref(), None) {
         Ok(pty) => pty,
         Err(error) => {
-            let _ = sender
-                .send(Err(Status::internal(format!("create PTY: {error}"))))
-                .await;
+            pty_start_failure(
+                sender,
+                started.take(),
+                Status::internal(format!("create PTY: {error}")),
+            )
+            .await;
             return;
         }
     };
@@ -802,23 +851,26 @@ async fn run_pty_command(
     let slave_stdout = match slave.try_clone() {
         Ok(file) => file,
         Err(error) => {
-            let _ = sender.send(Err(internal_io(error))).await;
+            pty_start_failure(sender, started.take(), internal_io(error)).await;
             return;
         }
     };
     let slave_stderr = match slave.try_clone() {
         Ok(file) => file,
         Err(error) => {
-            let _ = sender.send(Err(internal_io(error))).await;
+            pty_start_failure(sender, started.take(), internal_io(error)).await;
             return;
         }
     };
     let mut command = match prepare_command(&request) {
         Ok(command) => command,
         Err(error) => {
-            let _ = sender
-                .send(Err(Status::invalid_argument(error.to_string())))
-                .await;
+            pty_start_failure(
+                sender,
+                started.take(),
+                Status::invalid_argument(error.to_string()),
+            )
+            .await;
             return;
         }
     };
@@ -839,23 +891,36 @@ async fn run_pty_command(
     }
     let master = std::fs::File::from(pty.master);
     let master_fd = master.as_raw_fd();
-    let master_reader = match master.try_clone() {
-        Ok(file) => tokio::fs::File::from_std(file),
+    let master_reader = match master.try_clone().and_then(pty::PtyIo::new) {
+        Ok(file) => file,
         Err(error) => {
-            let _ = sender.send(Err(internal_io(error))).await;
+            pty_start_failure(sender, started.take(), internal_io(error)).await;
             return;
         }
     };
-    let master_writer = tokio::fs::File::from_std(master);
+    let master_writer = match pty::PtyIo::new(master) {
+        Ok(file) => file,
+        Err(error) => {
+            pty_start_failure(sender, started.take(), internal_io(error)).await;
+            return;
+        }
+    };
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let _ = sender
-                .send(Err(Status::internal(format!("spawn PTY command: {error}"))))
-                .await;
+            pty_start_failure(
+                sender,
+                started.take(),
+                Status::internal(format!("spawn PTY command: {error}")),
+            )
+            .await;
             return;
         }
     };
+    drop(command);
+    if let Some(started) = started.take() {
+        let _ = started.send(Ok(()));
+    }
     let mut input_task = tokio::spawn(forward_stdin(
         requests,
         Some(master_writer),
@@ -2125,6 +2190,116 @@ mod tests {
         })
         .await
         .unwrap();
+        stop_test_agent(task).await;
+    }
+
+    #[tokio::test]
+    async fn headless_sessions_accept_control_without_taking_over_an_attachment() {
+        let box_id = "pbx_t3yzd9y3";
+        let ca = generate_context_ca(&derive_context_seed("headless-sessions", "secret")).unwrap();
+        let server = issue_certificate(
+            &ca,
+            &server_subject(box_id).unwrap(),
+            CertificatePurpose::Server,
+        )
+        .unwrap();
+        let identity = issue_certificate(
+            &ca,
+            "pbox.cwd.dev/context/client",
+            CertificatePurpose::Client,
+        )
+        .unwrap();
+        let (endpoint, task) = spawn_test_agent(box_id, server, &ca).await;
+        let mut client = AgentClient::connect(&endpoint, box_id, &ca.certificate_pem, &identity)
+            .await
+            .unwrap();
+        let request = ExecRequest {
+            session_name: "control".into(), user: "root".into(), cwd: "/tmp".into(),
+            argv: vec!["/bin/sh".into(), "-c".into(), "stty -echo; printf '__ready__\\n'; while IFS= read -r line; do eval \"$line\"; done".into()],
+            ..Default::default()
+        };
+        async fn screen(
+            client: &mut AgentClient,
+            marker: &str,
+        ) -> pbox_proto::agent::ReadSessionResponse {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let screen = client.read_session("control").await.unwrap();
+                    if screen.text.contains(marker) {
+                        return screen;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("screen did not update")
+        }
+        client.start_session(request.clone()).await.unwrap();
+        assert!(
+            !screen(&mut client, "__ready__")
+                .await
+                .session
+                .unwrap()
+                .attached
+        );
+        assert!(client.start_session(request.clone()).await.is_err());
+        client
+            .send_session(
+                "control",
+                "printf '__sent__\\n'".into(),
+                vec!["Enter".into()],
+            )
+            .await
+            .unwrap();
+        assert!(
+            !screen(&mut client, "__sent__")
+                .await
+                .session
+                .unwrap()
+                .attached
+        );
+        let attached = client.terminal_session(request).await.unwrap();
+        client
+            .send_session(
+                "control",
+                "printf '__attached__\\n'".into(),
+                vec!["Enter".into()],
+            )
+            .await
+            .unwrap();
+        assert!(
+            screen(&mut client, "__attached__")
+                .await
+                .session
+                .unwrap()
+                .attached
+        );
+        assert!(
+            client
+                .send_session("control", "hello".into(), vec!["unknown".into()])
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .send_session("control", "x".repeat(65537), Vec::new())
+                .await
+                .is_err()
+        );
+        drop(attached);
+        client.close_session("control").await.unwrap();
+        assert!(client.read_session("control").await.is_err());
+        assert!(
+            client
+                .start_session(ExecRequest {
+                    session_name: "missing-command".into(),
+                    user: "root".into(),
+                    argv: vec!["/no/such/pbox-test-command".into()],
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
         stop_test_agent(task).await;
     }
 

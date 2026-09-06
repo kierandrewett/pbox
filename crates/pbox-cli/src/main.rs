@@ -2680,7 +2680,10 @@ fn ssh_environment(
     if !env.iter().any(|(key, _)| key == "TERM") {
         env.push((
             "TERM".to_owned(),
-            term.unwrap_or_else(|| "xterm-256color".to_owned()),
+            // Harnesses often inherit TERM=dumb even when SSH allocates a PTY.
+            // Keep real terminal types and explicit --env overrides intact.
+            term.filter(|value| !value.trim().is_empty() && value != "dumb")
+                .unwrap_or_else(|| "xterm-256color".to_owned()),
         ));
     }
     if let Some(color_term) =
@@ -5136,21 +5139,22 @@ fn resolve_agent_endpoint(
     }
     let client = client_from_config(config)?;
     let record = find_box(&client, requested_id)?;
-    let id = &record.id;
     if client.get_lxc_state(&record.node, record.vmid)? != "running" {
         return Err(anyhow!("box {} is not running", record.id));
     }
+    Ok((record.id.to_string(), agent_endpoint(config, &record)?))
+}
+
+fn agent_endpoint(config: &Config, record: &BoxRecord) -> Result<String> {
     if config.relay.url.is_some() {
-        relay::access(config, &id.to_string(), "client")?;
-        return Ok((id.to_string(), relay::ENDPOINT.to_owned()));
+        relay::access(config, &record.id.to_string(), "client")?;
+        return Ok(relay::ENDPOINT.to_owned());
     }
     let ip = record
         .ip
+        .as_deref()
         .ok_or_else(|| anyhow!("box {} has no discovered IPv4 address", record.id))?;
-    Ok((
-        record.id.to_string(),
-        format!("https://{ip}:{}", config.agent.port),
-    ))
+    Ok(format!("https://{ip}:{}", config.agent.port))
 }
 
 fn resolve_agent_binary(config: &Config) -> Result<PathBuf> {
@@ -6974,6 +6978,18 @@ mod tests {
         )
         .unwrap();
         assert!(!env.iter().any(|(key, _)| key == "COLORTERM"));
+    }
+
+    #[test]
+    fn ssh_gives_harness_ptys_a_usable_terminal() {
+        for inherited in [None, Some(""), Some(" "), Some("dumb")] {
+            let env = super::ssh_environment(&[], inherited.map(str::to_owned), None).unwrap();
+            assert_eq!(env, [("TERM".to_owned(), "xterm-256color".to_owned())]);
+        }
+        // An explicit request still wins over the automatic fallback.
+        let env = super::ssh_environment(&["TERM=dumb".to_owned()], Some("dumb".to_owned()), None)
+            .unwrap();
+        assert_eq!(env, [("TERM".to_owned(), "dumb".to_owned())]);
     }
 
     #[test]

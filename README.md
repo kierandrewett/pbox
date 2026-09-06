@@ -202,7 +202,8 @@ and carry on where you left off. **Ctrl-]** detaches; `exit` ends the shell.
 | Task | Command |
 | --- | --- |
 | Open a separate terminal | `pbox ssh BOX --session build` |
-| List terminals | `pbox session list BOX` |
+| List terminals across all boxes | `pbox session list` |
+| List terminals in one box | `pbox session list BOX` |
 | End a terminal and its processes | `pbox session close BOX build` |
 
 The agent keeps sessions alive; tmux is not required. Reconnecting moves the
@@ -212,6 +213,36 @@ stops. Agent updates are deferred while sessions are running.
 `pbox ssh BOX -- COMMAND` still runs a one-off command. Add `--session NAME`
 to keep that command in a named terminal. Working directory, user and environment
 options apply when a session is created; reconnecting keeps its existing shell.
+
+#### Control a session from a script or agent
+
+These commands work with pipes and `TERM=dumb`. No local terminal emulator is needed.
+
+```sh
+pbox session start BOX codex -- codex
+pbox session read BOX codex
+pbox session send BOX codex --text "Explain this project"
+pbox session send BOX codex --key Enter
+pbox --json session read BOX codex
+```
+
+| Command | Result |
+| --- | --- |
+| `start BOX NAME -- COMMAND` | Creates a detached terminal; an existing name is an error |
+| `read BOX NAME` | Prints the current screen as plain text |
+| `send BOX NAME --text TEXT` | Types or pastes text; does not add Enter |
+| `send BOX NAME --key KEY` | Presses a key, such as `Enter`, `Escape`, `Up` or `Ctrl+C` |
+| `send BOX NAME --stdin` | Reads text from a pipe, up to 64 KiB |
+
+Repeat `--key` for a sequence. When combined, text is sent before keys.
+Reads and sends leave any SSH attachment in place. `read` shows the current
+screen, not a full output log; its JSON includes dimensions and a zero-based
+cursor position. `send` acknowledges input accepted by the agent; read again
+to see the application's response. If a send loses its connection, check the
+screen before repeating it to avoid sending the same input twice.
+
+The agent handles terminal queries while detached. You can still attach at any
+time with `pbox ssh BOX --session NAME`.
 
 ### Save an environment
 

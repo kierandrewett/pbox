@@ -38,7 +38,7 @@ fn add_completers(
     recipes: ArgValueCompleter,
 ) -> clap::Command {
     let desktop = command.get_name() == "desktop";
-    let session_close = command.get_name() == "close";
+    let existing_session = matches!(command.get_name(), "close" | "read" | "send");
     let box_source = matches!(command.get_name(), "create" | "repair-source");
     let mut command = command.mut_args(|arg| match arg.get_id().as_str() {
         "id" | "box_id" => arg.add(boxes.clone()),
@@ -47,7 +47,8 @@ fn add_completers(
         "recipe" => arg.add(recipes.clone()),
         "session" if desktop => arg.add(ArgValueCompleter::new(desktop_sessions)),
         "session" => arg.add(ArgValueCompleter::new(terminal_sessions)),
-        "name" if session_close => arg.add(ArgValueCompleter::new(terminal_sessions)),
+        "name" if existing_session => arg.add(ArgValueCompleter::new(terminal_sessions)),
+        "keys" => arg.add(ArgValueCompleter::new(terminal_keys)),
         _ => arg,
     });
     for child in command.get_subcommands_mut() {
@@ -137,6 +138,50 @@ fn desktop_sessions(current: &OsStr) -> Vec<CompletionCandidate> {
 #[cfg(test)]
 fn no_completions(_: &OsStr) -> Vec<CompletionCandidate> {
     Vec::new()
+}
+
+fn terminal_keys(current: &OsStr) -> Vec<CompletionCandidate> {
+    let prefix = current.to_string_lossy().to_ascii_lowercase();
+    [
+        "Enter",
+        "Tab",
+        "Escape",
+        "Backspace",
+        "Space",
+        "Up",
+        "Down",
+        "Left",
+        "Right",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+        "Insert",
+        "Delete",
+        "Ctrl+C",
+        "Ctrl+D",
+        "Ctrl+L",
+        "Ctrl+U",
+        "Ctrl+W",
+        "Shift+Tab",
+        "Alt+Enter",
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "F5",
+        "F6",
+        "F7",
+        "F8",
+        "F9",
+        "F10",
+        "F11",
+        "F12",
+    ]
+    .into_iter()
+    .filter(|key| key.to_ascii_lowercase().starts_with(&prefix))
+    .map(CompletionCandidate::new)
+    .collect()
 }
 
 fn terminal_sessions(current: &OsStr) -> Vec<CompletionCandidate> {

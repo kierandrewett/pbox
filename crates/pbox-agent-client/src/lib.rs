@@ -346,6 +346,46 @@ impl AgentClient {
             .sessions)
     }
 
+    pub async fn start_session(
+        &mut self,
+        mut request: ExecRequest,
+    ) -> Result<TerminalSession, AgentClientError> {
+        request.protocol_version = PROTOCOL_VERSION;
+        request.allocate_pty = true;
+        Ok(self.inner.start_session(request).await?.into_inner())
+    }
+
+    pub async fn read_session(
+        &mut self,
+        name: impl Into<String>,
+    ) -> Result<pbox_proto::agent::ReadSessionResponse, AgentClientError> {
+        Ok(self
+            .inner
+            .read_session(pbox_proto::agent::SessionRequest {
+                protocol_version: PROTOCOL_VERSION,
+                name: name.into(),
+            })
+            .await?
+            .into_inner())
+    }
+
+    pub async fn send_session(
+        &mut self,
+        name: impl Into<String>,
+        text: String,
+        keys: Vec<String>,
+    ) -> Result<(), AgentClientError> {
+        self.inner
+            .send_session(pbox_proto::agent::SendSessionRequest {
+                protocol_version: PROTOCOL_VERSION,
+                name: name.into(),
+                text,
+                keys,
+            })
+            .await?;
+        Ok(())
+    }
+
     pub async fn close_session(&mut self, name: impl Into<String>) -> Result<(), AgentClientError> {
         self.inner
             .close_session(pbox_proto::agent::CloseSessionRequest {

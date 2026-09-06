@@ -11,8 +11,40 @@ enum Action {
     /// Show running terminals, including detached shells.
     #[command(visible_alias = "ls")]
     List {
-        #[arg(default_value = "current")]
+        /// Limit the list to one box (all boxes by default).
+        id: Option<String>,
+    },
+    /// Start a detached terminal without a local TTY.
+    Start {
         id: String,
+        name: String,
+        #[arg(long, default_value = "")]
+        cwd: String,
+        #[arg(long, default_value = "")]
+        user: String,
+        #[arg(long = "env")]
+        env: Vec<String>,
+        #[arg(long, default_value_t = 24)]
+        rows: u32,
+        #[arg(long, default_value_t = 100)]
+        cols: u32,
+        #[arg(last = true)]
+        argv: Vec<String>,
+    },
+    /// Read the current screen as plain text without attaching.
+    Read { id: String, name: String },
+    /// Send text, then keys, without attaching. Does not retry input.
+    Send {
+        id: String,
+        name: String,
+        #[arg(long, conflicts_with = "stdin")]
+        text: Option<String>,
+        /// Read up to 64 KiB of text from standard input.
+        #[arg(long)]
+        stdin: bool,
+        /// Key name (repeat for a sequence): Enter, Tab, Escape, Up, Ctrl+C.
+        #[arg(long = "key")]
+        keys: Vec<String>,
     },
     /// End a terminal and its running processes.
     Close {
@@ -116,40 +148,262 @@ fn detach_key(sequence: &[u8]) -> bool {
         && modifiers.is_some_and(|value| value > 0 && (value - 1) & !(64 | 128) == 4)
 }
 
+type SessionQuery = (BoxRecord, Result<Vec<pbox_agent_client::TerminalSession>>);
+
+pub(super) struct SessionGroup {
+    pub box_id: String,
+    pub box_name: Option<String>,
+    pub state: String,
+    pub sessions: Vec<pbox_agent_client::TerminalSession>,
+    pub unavailable: bool,
+}
+
+async fn query_sessions(
+    config: &Config,
+    record: &BoxRecord,
+) -> Result<Vec<pbox_agent_client::TerminalSession>> {
+    let box_id = record.id.to_string();
+    let endpoint = agent_endpoint(config, record)?;
+    let materials = agent_materials(config, &box_id)?;
+    let mut client = relay::connect_agent(
+        config,
+        &endpoint,
+        &box_id,
+        &materials.ca.certificate_pem,
+        &materials.client,
+    )
+    .await?;
+    let info = client.info().await?;
+    // Agents predating persistent terminals cannot hold any sessions.
+    if !info
+        .capabilities
+        .iter()
+        .any(|cap| cap == "terminal-sessions")
+    {
+        return Ok(Vec::new());
+    }
+    Ok(client.list_sessions().await?)
+}
+
+fn show_sessions(
+    mut results: Vec<SessionQuery>,
+    filter: Option<&str>,
+    json: bool,
+) -> Result<RunOutcome> {
+    results.sort_by(|a, b| a.0.name.cmp(&b.0.name).then(a.0.id.cmp(&b.0.id)));
+    let mut groups = Vec::new();
+    let mut incomplete = false;
+    for (record, result) in results {
+        let unavailable = result.is_err();
+        let sessions = match result {
+            Ok(mut sessions) => {
+                sessions.sort_by(|a, b| a.name.cmp(&b.name));
+                sessions
+            }
+            Err(error) => {
+                incomplete = true;
+                ui::stderr().warning(&format!("{}: {}", record.id, ui::concise_error(&error)));
+                Vec::new()
+            }
+        };
+        groups.push(SessionGroup {
+            box_id: record.id.to_string(),
+            box_name: record.name,
+            state: record.state,
+            sessions,
+            unavailable,
+        });
+    }
+    if json {
+        let values: Vec<_> = groups.iter().flat_map(|group| group.sessions.iter().map(|session| serde_json::json!({
+            "box_id": group.box_id, "box_name": group.box_name,
+            "name": session.name, "user": session.user, "cwd": session.cwd,
+            "argv": session.argv, "attached": session.attached, "created_unix": session.created_unix,
+            "rows": session.rows, "cols": session.cols
+        }))).collect();
+        ui::json_text(&serde_json::to_string_pretty(&values)?);
+    } else {
+        ui::terminal_sessions(filter, &groups, incomplete);
+    }
+    Ok(if incomplete {
+        RunOutcome::Exit(1)
+    } else {
+        RunOutcome::Success
+    })
+}
+
+fn endpoint(config: &Config, id: &str) -> Result<(String, String)> {
+    // A known relay identity is enough to contact its agent. Reading or sending
+    // to a running terminal must not depend on the Proxmox management API.
+    if config.relay.url.is_some() && id.parse::<PboxId>().is_ok() {
+        return Ok((id.to_owned(), relay::ENDPOINT.to_owned()));
+    }
+    resolve_agent_endpoint(config, id, None)
+}
+
+async fn connect(
+    config: &Config,
+    box_id: &str,
+    endpoint: &str,
+    capability: &str,
+) -> Result<AgentClient> {
+    let materials = agent_materials(config, box_id)?;
+    let mut client = relay::connect_agent(
+        config,
+        endpoint,
+        box_id,
+        &materials.ca.certificate_pem,
+        &materials.client,
+    )
+    .await?;
+    let info = client.info().await?;
+    anyhow::ensure!(
+        info.capabilities.iter().any(|cap| cap == capability),
+        "the guest agent needs an update for this command; end its running sessions, then connect with `pbox ssh {box_id}` to update it"
+    );
+    Ok(client)
+}
+
 pub fn run(store: &ConfigStore, command: SessionCommand, json: bool) -> Result<RunOutcome> {
-    let id = match &command.action {
-        Action::List { id } | Action::Close { id, .. } => id,
-    };
     let config = load_config(store)?;
-    let (box_id, endpoint) = resolve_agent_endpoint(&config, id, None)?;
-    let materials = agent_materials(&config, &box_id)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("create session runtime")?;
-    let mut client = runtime.block_on(async {
-        let mut client = relay::connect_agent(&config, &endpoint, &box_id, &materials.ca.certificate_pem, &materials.client).await?;
-        let info = client.info().await?;
-        anyhow::ensure!(info.capabilities.iter().any(|cap| cap == "terminal-sessions"),
-            "the guest agent needs an update for terminal sessions; connect with `pbox ssh {box_id}` to update it");
-        Ok::<_, anyhow::Error>(client)
-    })?;
     match command.action {
-        Action::List { .. } => {
-            let sessions = runtime.block_on(client.list_sessions())?;
-            if json {
-                let values: Vec<_> = sessions.iter().map(|session| serde_json::json!({
-                    "name": session.name, "user": session.user, "cwd": session.cwd,
-                    "argv": session.argv, "attached": session.attached, "created_unix": session.created_unix,
-                    "rows": session.rows, "cols": session.cols
-                })).collect();
-                ui::json_text(&serde_json::to_string_pretty(&values)?);
+        Action::List { id } => {
+            let pve = client_from_config(&config)?;
+            let records = if let Some(id) = &id {
+                vec![find_box(&pve, id)?]
             } else {
-                ui::terminal_sessions(&box_id, &sessions);
+                discover_boxes(&pve)?
+            };
+            let filter = id.as_ref().map(|_| records[0].id.to_string());
+            let results = runtime.block_on(async {
+                let mut results = Vec::new();
+                // Bound simultaneous agent connections and time spent on an unreachable box.
+                for batch in records.chunks(8) {
+                    let mut queries = tokio::task::JoinSet::new();
+                    for record in batch {
+                        if record.state != "running" {
+                            results.push((record.clone(), Ok(Vec::new())));
+                            continue;
+                        }
+                        let config = config.clone();
+                        let record = record.clone();
+                        queries.spawn(async move {
+                            let result = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                query_sessions(&config, &record),
+                            )
+                            .await
+                            .context("agent did not respond within 5 seconds")
+                            .and_then(|result| result);
+                            (record, result)
+                        });
+                    }
+                    while let Some(result) = queries.join_next().await {
+                        results.push(result.context("query terminal sessions")?);
+                    }
+                }
+                Ok::<_, anyhow::Error>(results)
+            })?;
+            return show_sessions(results, filter.as_deref(), json);
+        }
+        action @ (Action::Start { .. } | Action::Read { .. } | Action::Send { .. }) => {
+            let (id, name) = match &action {
+                Action::Start { id, name, .. }
+                | Action::Read { id, name }
+                | Action::Send { id, name, .. } => (id, name),
+                _ => unreachable!(),
+            };
+            validate_name(name)?;
+            let (box_id, endpoint) = endpoint(&config, id)?;
+            let mut client =
+                runtime.block_on(connect(&config, &box_id, &endpoint, "session-control"))?;
+            match action {
+                Action::Start {
+                    name,
+                    cwd,
+                    user,
+                    env,
+                    rows,
+                    cols,
+                    argv,
+                    ..
+                } => {
+                    let env = ssh_environment(&env, Some("xterm-256color".to_owned()), None)?;
+                    runtime.block_on(client.start_session(pbox_agent_client::ExecRequest {
+                        session_name: name.clone(),
+                        argv: ssh_command_argv(&argv),
+                        cwd,
+                        user,
+                        env: env.into_iter().collect(),
+                        terminal_rows: rows,
+                        terminal_cols: cols,
+                        ..Default::default()
+                    }))?;
+                    if json {
+                        ui::json_text(
+                            &serde_json::json!({"box_id":box_id,"name":name,"started":true})
+                                .to_string(),
+                        );
+                    } else {
+                        ui::stdout().success(&format!("Started session {name} on {box_id}"));
+                    }
+                }
+                Action::Read { name, .. } => {
+                    let screen = runtime.block_on(client.read_session(&name))?;
+                    if json {
+                        let session = screen.session.context("agent omitted terminal details")?;
+                        ui::json_text(&serde_json::json!({
+                            "box_id": box_id, "name": session.name, "user": session.user,
+                            "cwd": session.cwd, "argv": session.argv, "attached": session.attached,
+                            "rows": session.rows, "cols": session.cols, "created_unix": session.created_unix,
+                            "text": screen.text, "cursor_row": screen.cursor_row, "cursor_col": screen.cursor_col,
+                        }).to_string());
+                    } else {
+                        ui::session_screen(&screen.text);
+                    }
+                }
+                Action::Send {
+                    name,
+                    text,
+                    stdin,
+                    keys,
+                    ..
+                } => {
+                    anyhow::ensure!(
+                        text.is_some() || stdin || !keys.is_empty(),
+                        "provide --text, --stdin or --key"
+                    );
+                    let text = if stdin {
+                        let mut bytes = Vec::new();
+                        io::stdin().lock().take(65537).read_to_end(&mut bytes)?;
+                        anyhow::ensure!(bytes.len() <= 65536, "text exceeds 64 KiB");
+                        String::from_utf8(bytes).context("text must be UTF-8")?
+                    } else {
+                        text.unwrap_or_default()
+                    };
+                    // Never retry this mutation: a lost reply does not mean input was not delivered.
+                    runtime.block_on(client.send_session(&name, text, keys))?;
+                    if json {
+                        ui::json_text(
+                            &serde_json::json!({"box_id":box_id,"name":name,"sent":true})
+                                .to_string(),
+                        );
+                    } else {
+                        ui::stdout().success(&format!("Sent input to {name}"));
+                    }
+                }
+                _ => unreachable!(),
             }
         }
-        Action::Close { name, yes, .. } => {
+        Action::Close { id, name, yes } => {
             validate_name(&name)?;
+            let (box_id, endpoint) = endpoint(&config, &id)?;
+            let mut client =
+                runtime.block_on(connect(&config, &box_id, &endpoint, "terminal-sessions"))?;
             if !yes {
                 anyhow::ensure!(
                     !json && io::stdin().is_terminal() && io::stderr().is_terminal(),
@@ -219,6 +473,97 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn list_defaults_to_all_boxes_and_accepts_an_explicit_filter() {
+        for (args, expected) in [
+            (vec!["pbox", "session", "list"], None),
+            (vec!["pbox", "session", "list", "current"], Some("current")),
+            (vec!["pbox", "session", "ls", "work"], Some("work")),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Session(SessionCommand {
+                action: Action::List { id },
+            }) = cli.command
+            else {
+                panic!("expected session list")
+            };
+            assert_eq!(id.as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn relay_session_control_with_an_id_does_not_need_proxmox() {
+        let mut config = Config::default();
+        config.relay.url = Some("https://relay.invalid".into());
+        assert_eq!(
+            endpoint(&config, "pbx_t3yzd9y3").unwrap(),
+            ("pbx_t3yzd9y3".into(), relay::ENDPOINT.into())
+        );
+    }
+
+    #[test]
+    fn headless_commands_parse_text_keys_and_command_arguments() {
+        for args in [
+            vec![
+                "pbox",
+                "session",
+                "start",
+                "work",
+                "codex",
+                "--",
+                "codex",
+                "--no-alt-screen",
+            ],
+            vec!["pbox", "session", "read", "work", "codex"],
+            vec![
+                "pbox", "session", "send", "work", "codex", "--text", "hello", "--key", "Enter",
+            ],
+            vec![
+                "pbox", "session", "send", "work", "codex", "--stdin", "--key", "Enter",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        assert!(
+            Cli::try_parse_from([
+                "pbox", "session", "send", "work", "codex", "--text", "hello", "--stdin"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn partial_session_results_have_a_failure_exit_status() {
+        assert_eq!(
+            show_sessions(
+                vec![(
+                    BoxRecord {
+                        id: "pbx_t3yzd9y3".parse().unwrap(),
+                        name: Some("work".into()),
+                        state: "running".into(),
+                        vmid: 9000,
+                        node: "pve".into(),
+                        ip: None,
+                        ipv6: None,
+                        image: None,
+                        recipes: Vec::new(),
+                        capabilities: Vec::new(),
+                        ping: None,
+                    },
+                    Err(anyhow!("unreachable"))
+                )],
+                None,
+                true
+            )
+            .unwrap(),
+            RunOutcome::Exit(1)
+        );
+        assert_eq!(
+            show_sessions(Vec::new(), None, true).unwrap(),
+            RunOutcome::Success
+        );
+    }
+
     #[test]
     fn ssh_session_layout_keeps_command_arguments_and_simple_defaults() {
         for args in [

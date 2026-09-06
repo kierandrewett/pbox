@@ -529,6 +529,13 @@ pub(crate) fn concise_error(error: &anyhow::Error) -> String {
     if message.contains("peer closed connection without sending TLS close_notify") {
         return "pbox-agent connection closed unexpectedly; retry the command".to_owned();
     }
+    for cause in error.chain() {
+        if let Some(pbox_agent_client::AgentClientError::Rpc(status)) =
+            cause.downcast_ref::<pbox_agent_client::AgentClientError>()
+        {
+            return safe_terminal_text(status.message());
+        }
+    }
     safe_terminal_text(&message)
 }
 
@@ -1326,44 +1333,89 @@ pub(crate) fn session_connected(box_id: &str, name: &str) {
     stderr().hint("Ctrl-] detaches. Type exit to end this shell.");
 }
 
-pub(crate) fn terminal_sessions(box_id: &str, sessions: &[pbox_agent_client::TerminalSession]) {
+/// A decoded guest screen is data, without headings, styling or terminal escapes.
+pub(crate) fn session_screen(text: &str) {
+    println!("{text}");
+}
+
+pub(crate) fn terminal_sessions(
+    filter: Option<&str>,
+    groups: &[super::sessions::SessionGroup],
+    incomplete: bool,
+) {
     let style = stdout();
-    style.stdout_heading(&format!("Terminal sessions · {box_id}"));
-    if sessions.is_empty() {
-        style.stdout_hint("No running sessions.");
-    } else {
-        let width = sessions
+    style.stdout_heading("Terminal sessions");
+    if incomplete {
+        style.stdout_hint("Incomplete list: some boxes could not be checked.");
+    }
+    if groups.is_empty() {
+        style.stdout_hint("No boxes found.");
+        return;
+    }
+    let columns = terminal_columns();
+    for group in groups {
+        println!();
+        style.stdout_heading(&format!(
+            "{} · {} · {}",
+            safe_terminal_text(group.box_name.as_deref().unwrap_or("Unnamed box")),
+            group.box_id,
+            safe_terminal_text(&group.state)
+        ));
+        if group.unavailable {
+            style.stdout_hint("Sessions unavailable: agent could not be reached.");
+            continue;
+        }
+        if group.sessions.is_empty() {
+            style.stdout_hint("No running sessions.");
+            continue;
+        }
+        let name_width = group
+            .sessions
             .iter()
             .map(|s| s.name.len())
             .max()
+            .unwrap_or(7)
+            .clamp(7, 20);
+        let user_width = group
+            .sessions
+            .iter()
+            .map(|s| s.user.len())
+            .max()
             .unwrap_or(4)
-            .max(4);
+            .clamp(4, 12);
+        let directory_width = group
+            .sessions
+            .iter()
+            .map(|s| s.cwd.chars().count())
+            .max()
+            .unwrap_or(9)
+            .clamp(9, (columns / 3).max(9));
         style.stdout_heading(&format!(
-            "{:<width$}  {:<8}  {:<12}  COMMAND",
-            "NAME", "STATE", "USER"
+            "  {:<name_width$}  {:<8}  {:<user_width$}  {:<directory_width$}  COMMAND",
+            "SESSION", "STATE", "USER", "DIRECTORY"
         ));
-        for session in sessions {
+        for session in &group.sessions {
             println!(
-                "{:<width$}  {:<8}  {:<12}  {}",
-                safe_terminal_text(&session.name),
+                "  {:<name_width$}  {:<8}  {:<user_width$}  {:<directory_width$}  {}",
+                clip_terminal_text(&session.name, name_width),
                 if session.attached {
                     "attached"
                 } else {
                     "detached"
                 },
-                safe_terminal_text(&session.user),
+                clip_terminal_text(&session.user, user_width),
+                clip_terminal_text(&session.cwd, directory_width),
                 clip_terminal_text(
                     &session.argv.join(" "),
-                    terminal_columns().saturating_sub(width + 26)
+                    columns.saturating_sub(name_width + user_width + directory_width + 18)
                 )
             );
         }
     }
-    if sessions.is_empty() {
-        style.command(&format!("pbox ssh {box_id}"));
-    } else {
-        style.command(&format!("pbox ssh {box_id} --session NAME"));
-    }
+    style.command(&format!(
+        "pbox ssh {} --session NAME",
+        filter.unwrap_or("BOX")
+    ));
 }
 
 pub(crate) fn snapshot_deletion_queued(saved: &super::snapshots::SavedEnvironment, upid: &str) {
