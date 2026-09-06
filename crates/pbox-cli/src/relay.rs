@@ -109,7 +109,7 @@ pub(crate) fn write_payload(directory: &Path, config: &Config, box_id: &str) -> 
     fs::write(
         unit,
         format!(
-            "[Unit]\nDescription=pbox guest agent\nWants=network.target\nAfter=network.target\n\n[Service]\nExecStart=/usr/local/bin/pbox-agent {agent_args}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"
+            "[Unit]\nDescription=pbox guest agent\nAfter=local-fs.target\n\n[Service]\nExecStart=/usr/local/bin/pbox-agent {agent_args}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"
         ),
     )?;
     let openrc = directory.join("etc/init.d/pbox-agent");
@@ -117,7 +117,7 @@ pub(crate) fn write_payload(directory: &Path, config: &Config, box_id: &str) -> 
     fs::write(
         &openrc,
         format!(
-            "#!/sbin/openrc-run\nname=pbox-agent\ncommand=/usr/local/bin/pbox-agent\ncommand_args=\"{agent_args}\"\ncommand_background=true\npidfile=/run/${{RC_SVCNAME}}.pid\nrespawn_delay=2\nrespawn_max=0\ndepend() {{\n    need net\n}}\n"
+            "#!/sbin/openrc-run\nname=pbox-agent\ncommand=/usr/local/bin/pbox-agent\ncommand_args=\"{agent_args}\"\ncommand_background=true\npidfile=/run/${{RC_SVCNAME}}.pid\nrespawn_delay=2\nrespawn_max=0\ndepend() {{\n    after net\n}}\n"
         ),
     )?;
     fs::set_permissions(&openrc, fs::Permissions::from_mode(0o755))?;
@@ -466,7 +466,7 @@ mod tests {
             fs::read_to_string(directory.join("etc/systemd/system/pbox-agent.service")).unwrap();
         assert!(unit.contains("--relay-config /etc/pbox/relay.json"));
         assert!(unit.contains("--listen 127.0.0.1:7443"));
-        assert!(unit.contains("After=network.target"));
+        assert!(unit.contains("After=local-fs.target"));
         assert!(!unit.contains("After=network-online.target"));
         let openrc = fs::read_to_string(directory.join("etc/init.d/pbox-agent")).unwrap();
         assert!(openrc.contains("command_background=true"));
