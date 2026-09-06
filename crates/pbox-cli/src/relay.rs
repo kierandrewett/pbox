@@ -109,6 +109,14 @@ pub(crate) fn write_payload(directory: &Path, config: &Config, box_id: &str) -> 
             config.agent.port, box_id
         ),
     )?;
+    // First-boot presets can remove an enable symlink on distributions such as
+    // Fedora. Keep the managed agent enabled when systemd applies that policy.
+    let presets = directory.join("etc/systemd/system-preset");
+    fs::create_dir_all(&presets)?;
+    fs::write(
+        presets.join("00-pbox.preset"),
+        "enable pbox-agent.service\n",
+    )?;
     Ok(())
 }
 
@@ -408,6 +416,30 @@ mod tests {
             fs::read_to_string(directory.join("etc/systemd/system/pbox-agent.service")).unwrap();
         assert!(unit.contains("--relay-config /etc/pbox/relay.json"));
         assert!(unit.contains("--listen 127.0.0.1:7443"));
+        // Fedora applies a disable-all preset on first boot. Exercise systemd's
+        // real preset resolution against the generated guest filesystem.
+        let presets = directory.join("usr/lib/systemd/system-preset");
+        fs::create_dir_all(&presets).unwrap();
+        fs::write(presets.join("99-default.preset"), "disable *\n").unwrap();
+        fs::write(
+            directory.join("etc/systemd/system/multi-user.target"),
+            "[Unit]\nDescription=Multi-user target\n",
+        )
+        .unwrap();
+        for action in ["enable", "preset", "is-enabled"] {
+            let output = std::process::Command::new("systemctl")
+                .arg("--root")
+                .arg(&directory)
+                .args([action, "pbox-agent.service"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "systemctl {action}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         key.cleanup().unwrap();
     }
 }
