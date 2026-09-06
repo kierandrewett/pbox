@@ -9,6 +9,7 @@ mod inventory;
 mod progress;
 mod snapshots;
 mod ui;
+mod update;
 use ui::*;
 mod recipes;
 mod relay;
@@ -545,6 +546,17 @@ fn run() -> Result<RunOutcome> {
         cli.config
             .unwrap_or_else(pbox_core::config::default_config_path),
     );
+    if !matches!(
+        &cli.command,
+        Command::Update
+            | Command::Completions { .. }
+            | Command::Id
+            | Command::Config(_)
+            | Command::Relay(_)
+            | Command::Setup(_)
+    ) {
+        update::maybe_notify(cli.json);
+    }
     let daemon_command = matches!(&cli.command, Command::Daemon);
     if !daemon_command
         && !matches!(

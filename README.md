@@ -42,6 +42,10 @@ pbox update
 `pbox update` uses cargo-binstall when it is available and otherwise uses
 `cargo install`.
 
+When a newer published version is available, pbox prints a hint after a normal
+command. It checks at most once a day and ignores network failures. Set
+`PBOX_NO_UPDATE_CHECK=1` to disable the check.
+
 ## Quick start
 
 You need a Linux workstation with Podman, access to a Proxmox cluster, and a
