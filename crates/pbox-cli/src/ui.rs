@@ -524,31 +524,76 @@ pub(crate) fn format_box_cell(style: CliStyle, value: &str, width: usize, code: 
 pub(crate) fn print_box_records(records: &[BoxRecord], colour: bool) {
     let style = CliStyle::from_enabled(colour);
     let has_ipv6 = records.iter().any(|record| record.ipv6.is_some());
-    let header = format!(
-        "{:<16} {:<10} {:<8} {:<16} {:<16} {}NAME",
-        "ID",
+    let width = |header: &str, values: Vec<String>, minimum: usize| {
+        values
+            .into_iter()
+            .map(|value| value.chars().count())
+            .chain(std::iter::once(header.chars().count()))
+            .max()
+            .unwrap_or(minimum)
+            .max(minimum)
+    };
+    let id_width = width("ID", records.iter().map(|r| r.id.to_string()).collect(), 16);
+    let state_width = width(
         "STATE",
+        records.iter().map(|r| r.state.clone()).collect(),
+        10,
+    );
+    let ping_width = width(
         "PING",
-        "NODE",
+        records
+            .iter()
+            .map(|r| r.ping.as_deref().unwrap_or("-").to_owned())
+            .collect(),
+        8,
+    );
+    let node_width = width("NODE", records.iter().map(|r| r.node.clone()).collect(), 16);
+    let ipv4_width = width(
         "IPV4",
-        if has_ipv6 {
-            format!("{:<39} ", "IPV6")
+        records
+            .iter()
+            .map(|r| r.ip.as_deref().unwrap_or("-").to_owned())
+            .collect(),
+        16,
+    );
+    let ipv6_width = width(
+        "IPV6",
+        records
+            .iter()
+            .map(|r| r.ipv6.as_deref().unwrap_or("-").to_owned())
+            .collect(),
+        39,
+    );
+    let header = format!(
+        "{id:<id_width$} {state:<state_width$} {ping:<ping_width$} {node:<node_width$} {ipv4:<ipv4_width$} {ipv6}NAME",
+        id = "ID",
+        state = "STATE",
+        ping = "PING",
+        node = "NODE",
+        ipv4 = "IPV4",
+        ipv6 = if has_ipv6 {
+            format!("{:<width$} ", "IPV6", width = ipv6_width)
         } else {
             String::new()
-        }
+        },
     );
     println!("{}", style.paint(ANSI_BOLD_CYAN, &header));
     for record in records {
-        let id = format_box_cell(style, &record.id.to_string(), 16, ANSI_CYAN);
-        let state = format_box_cell(style, &record.state, 10, box_state_colour(&record.state));
-        let ping = format_box_cell(style, record.ping.as_deref().unwrap_or("-"), 8, "");
-        let node = format_box_cell(style, &record.node, 16, ANSI_CYAN);
-        let ip = format_box_cell(style, record.ip.as_deref().unwrap_or("-"), 16, "");
+        let id = format_box_cell(style, &record.id.to_string(), id_width, ANSI_CYAN);
+        let state = format_box_cell(
+            style,
+            &record.state,
+            state_width,
+            box_state_colour(&record.state),
+        );
+        let ping = format_box_cell(style, record.ping.as_deref().unwrap_or("-"), ping_width, "");
+        let node = format_box_cell(style, &record.node, node_width, ANSI_CYAN);
+        let ip = format_box_cell(style, record.ip.as_deref().unwrap_or("-"), ipv4_width, "");
         let name = style.text(record.name.as_deref().unwrap_or("-"));
         let ipv6 = if has_ipv6 {
             format!(
                 "{} ",
-                format_box_cell(style, record.ipv6.as_deref().unwrap_or("-"), 39, "")
+                format_box_cell(style, record.ipv6.as_deref().unwrap_or("-"), ipv6_width, "")
             )
         } else {
             String::new()
