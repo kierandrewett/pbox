@@ -85,9 +85,24 @@ Copy the relay master key securely to the workstation, then:
 chmod 600 "$HOME/.config/pbox/relay.key"
 pbox config set relay.key-file "$HOME/.config/pbox/relay.key"
 pbox config set relay.url https://pbox.example.com
+pbox relay check
 pbox new --image ghcr.io/your-account/your-image:latest
 pbox ssh BOX_ID
 ```
+
+For a new workstation, let pbox create the key and write its local
+configuration:
+
+```sh
+pbox relay keygen
+pbox config set relay.url https://pbox.example.com
+pbox relay check
+```
+
+`pbox relay check` verifies the relay health endpoint and sends a scoped test
+credential. It does not send the master key over the network. A passing check
+means this workstation can reach the relay and the configured key matches it;
+it does not check whether a particular guest agent is connected.
 
 For a private registry, use `podman login REGISTRY` on the workstation first.
 Pbox prepares the OCI image locally with Podman, so registry credentials remain

@@ -116,6 +116,8 @@ enum Command {
     Setup(SetupCommand),
     /// Manage local pbox configuration.
     Config(ConfigCommand),
+    /// Create and verify relay configuration.
+    Relay(relay::RelayCommand),
     /// Search OCI images, list tags, and prepare PVE templates.
     Image(ImageCommand),
     /// Create a pbox-managed LXC container.
@@ -551,6 +553,7 @@ fn run() -> Result<RunOutcome> {
                 | Command::Completions { .. }
                 | Command::Id
                 | Command::Config(_)
+                | Command::Relay(_)
                 | Command::Setup(_)
         )
     {
@@ -569,6 +572,9 @@ fn run() -> Result<RunOutcome> {
         .map(|_| RunOutcome::Success),
         Command::Config(command) => {
             run_config(command.command, &store, cli.json).map(|_| RunOutcome::Success)
+        }
+        Command::Relay(command) => {
+            relay::run(command, &store, cli.json).map(|_| RunOutcome::Success)
         }
         Command::Image(command) => {
             run_image(command.command, &store, cli.json, cli.color).map(|_| RunOutcome::Success)

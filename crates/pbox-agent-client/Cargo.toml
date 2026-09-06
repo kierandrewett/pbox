@@ -8,10 +8,10 @@ description = "Authenticated client for the pbox guest agent"
 repository.workspace = true
 
 [dependencies]
-pbox-relay = { version = "0.1.0", path = "../pbox-relay" }
+pbox-relay = { version = "0.1.1", path = "../pbox-relay" }
 thiserror.workspace = true
-pbox-crypto = { version = "0.1.0", path = "../pbox-crypto" }
-pbox-proto = { version = "0.1.0", path = "../pbox-proto" }
+pbox-crypto = { version = "0.1.1", path = "../pbox-crypto" }
+pbox-proto = { version = "0.1.1", path = "../pbox-proto" }
 tonic.workspace = true
 rustls.workspace = true
 pem.workspace = true

@@ -44,22 +44,64 @@ pbox update
 
 ## Quick start
 
-Configure the Proxmox API once:
+You need a Linux workstation with Podman, access to a Proxmox cluster, and a
+bridge and storage pool available to the node that will run the box. Pbox uses
+Podman on the workstation to prepare OCI images, then uploads them to PVE.
+
+Install pbox:
+
+```sh
+cargo binstall pbox
+# or, without cargo-binstall:
+cargo install pbox --locked
+```
+
+Configure the Proxmox API. The setup wizard discovers usable nodes, storage and
+network bridges, then verifies the saved configuration:
 
 ```sh
 pbox setup
+pbox config list
 ```
 
-Create and open a box:
+If the workstation cannot route to the guest network, configure a relay before
+creating a box. Generate the workstation key, copy that file to the relay host,
+and use the same key for the relay service:
+
+```sh
+pbox relay keygen
+pbox config set relay.url https://pbox.example.com
+pbox relay check
+```
+
+`pbox relay check` checks both the public health endpoint and the scoped-key
+authentication path. Follow [relay.md](docs/relay.md) for installing the relay
+and copying its master key securely.
+
+Create a box. Pbox waits for the guest agent before reporting success:
 
 ```sh
 pbox new --image debian:13
 pbox list
+```
+
+Connect to it through the agent:
+
+```sh
 pbox ssh current
 ```
 
-`current` works when exactly one pbox exists. Use a box ID or name when
-there is more than one.
+Install tools with recipes, then open a desktop in a native VNC window:
+
+```sh
+pbox recipe apply --box-id current dev/base language/rust
+pbox recipe apply --box-id current desktop/xfce
+pbox desktop current
+```
+
+`current` works when exactly one pbox exists. Use a box ID or name when there is
+more than one. Run `pbox --help` or `pbox COMMAND --help` for the full command
+list.
 
 ## Examples
 
@@ -178,10 +220,48 @@ See [snapshots.md](docs/snapshots.md) for lifecycle and recovery details.
 
 ## Relay
 
-Use the relay when the workstation cannot route to the private guest network.
-See [relay.md](docs/relay.md) for deployment and configuration.
+The relay lets pbox work when the workstation cannot route directly to a
+private guest network. The guest opens an outbound WebSocket connection to the
+relay. The CLI connects to the same relay, and the relay joins the two
+authenticated connections.
+
+The relay carries the existing encrypted agent connection. It does not receive
+guest shell, file or forwarding contents. It does handle connection metadata
+and can interrupt a connection. Each box has its own scoped relay credential.
+
+Configure a relay on the workstation:
+
+```sh
+pbox relay keygen
+pbox config set relay.url https://pbox.example.com
+pbox relay check
+pbox new --image debian:13
+pbox ssh current
+```
+
+Use a private relay address when both the workstation and guests can reach it:
+
+```sh
+pbox config set relay.url http://100.120.0.10:8080
+```
+
+Use HTTPS or an encrypted private network. The relay key is an operator secret;
+keep it outside the repository and do not copy it into guests. See
+[relay.md](docs/relay.md) for Docker, Proxmox LXC, reverse proxy and recovery
+instructions.
 
 ## Development
+
+Clone the recipes repository as a submodule:
+
+```sh
+git clone https://github.com/kierandrewett/pbox.git
+cd pbox
+git submodule update --init --recursive
+```
+
+The recipes are available in `recipes/`. The standalone repository remains the
+source of truth for recipe releases.
 
 Build the CLI and guest agent:
 
@@ -203,4 +283,4 @@ and the local image test matrix.
 
 ## License
 
-MIT
+MPL-2.0

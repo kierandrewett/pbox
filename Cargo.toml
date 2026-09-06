@@ -13,10 +13,10 @@ members = [
 [workspace.package]
 edition = "2024"
 rust-version = "1.95"
-license = "MIT"
+license = "MPL-2.0"
 repository = "https://github.com/kierandrewett/pbox"
 description = "Proxmox-backed developer sandbox components"
-version = "0.1.0"
+version = "0.1.1"
 
 [workspace.dependencies]
 anyhow = "1.0"

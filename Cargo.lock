@@ -1211,18 +1211,21 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "pbox"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64",
  "clap",
  "clap_complete",
  "dirs",
+ "hex",
  "nix",
  "pbox-agent-client",
  "pbox-core",
  "pbox-crypto",
  "pbox-relay",
+ "rand 0.8.7",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1233,7 +1236,7 @@ dependencies = [
 
 [[package]]
 name = "pbox-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1256,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "pbox-agent-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hyper-util",
  "pbox-crypto",
@@ -1274,7 +1277,7 @@ dependencies = [
 
 [[package]]
 name = "pbox-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "dirs",
@@ -1288,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "pbox-crypto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -1304,7 +1307,7 @@ dependencies = [
 
 [[package]]
 name = "pbox-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "prost",
  "tonic",
@@ -1314,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "pbox-relay"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",

@@ -1,11 +1,180 @@
 //! Relay credentials stay outside URLs, logs and guest images (except the scoped guest token).
-use anyhow::{Context, Result};
+use crate::ui;
+use anyhow::{Context, Result, bail};
+use clap::{Args, Subcommand};
 use pbox_agent_client::AgentClient;
-use pbox_core::config::Config;
+use pbox_core::{Config, ConfigStore};
 use pbox_crypto::CertificateMaterial;
 use pbox_relay::RelayAccess;
+use rand::RngCore;
+use std::path::{Path, PathBuf};
 
 pub const ENDPOINT: &str = "https://pbox-relay.invalid:443";
+
+#[derive(Debug, Args)]
+pub(crate) struct RelayCommand {
+    #[command(subcommand)]
+    pub command: RelaySubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum RelaySubcommand {
+    /// Generate a relay master key and save it with restricted permissions.
+    Keygen {
+        /// Key file to create. Defaults to ~/.config/pbox/relay.key.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// Replace an existing key file.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Check the configured relay and its local master key.
+    Check,
+}
+
+pub(crate) fn run(command: RelayCommand, store: &ConfigStore, json: bool) -> Result<()> {
+    match command.command {
+        RelaySubcommand::Keygen { key_file, force } => keygen(store, key_file, force, json),
+        RelaySubcommand::Check => check(store, json),
+    }
+}
+
+fn default_key_file() -> Result<PathBuf> {
+    dirs::config_dir()
+        .map(|path| path.join("pbox/relay.key"))
+        .context("find the user configuration directory")
+}
+
+fn keygen(store: &ConfigStore, requested: Option<PathBuf>, force: bool, json: bool) -> Result<()> {
+    let path = requested.map(Ok).unwrap_or_else(default_key_file)?;
+    if path.exists() && !force {
+        bail!(
+            "relay key already exists at {}; use --force to replace it",
+            path.display()
+        );
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("create relay key directory")?;
+    }
+    let mut bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let contents = format!("{}\n", hex::encode(bytes));
+    std::fs::write(&path, contents).context("write relay key")?;
+    set_private_permissions(&path)?;
+
+    let mut config = store.load_file().context("load pbox configuration")?;
+    config.set_value("relay.key-file", &path.display().to_string())?;
+    store.save(&config).context("save pbox configuration")?;
+    if json {
+        ui::json_text(
+            &serde_json::json!({
+                "key_file": path,
+                "configured": true,
+            })
+            .to_string(),
+        );
+    } else {
+        ui::stdout().success("Relay key generated");
+        ui::stdout().metadata("key file", &path.display().to_string());
+        ui::stdout().hint("Copy the same key to the relay host before running pbox relay check.");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn check(store: &ConfigStore, json: bool) -> Result<()> {
+    let config = store.load_file().context("load pbox configuration")?;
+    let url = config
+        .relay
+        .url
+        .as_deref()
+        .context("relay.url is not configured")?;
+    let key_path = config
+        .relay
+        .key_file
+        .as_deref()
+        .context("relay.key-file is not configured; run pbox relay keygen")?;
+    let key = std::fs::read_to_string(key_path).context("read relay key")?;
+    anyhow::ensure!(key.trim().len() >= 32, "relay key is too short");
+    let health = health_url(url)?;
+    let response = reqwest::blocking::get(&health).context("connect to relay health endpoint")?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "relay health check returned {}",
+        response.status()
+    );
+    let body = response.text().context("read relay health response")?;
+    anyhow::ensure!(
+        body.trim() == "ok",
+        "relay health endpoint returned an unexpected response"
+    );
+    let check = authenticated_check_url(url)?;
+    let token = pbox_relay::scoped_token(key.trim(), "client", "pbx_check000");
+    let response = reqwest::blocking::Client::new()
+        .get(check)
+        .bearer_auth(token)
+        .send()
+        .context("check relay credentials")?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "relay rejected the configured key ({})",
+        response.status()
+    );
+    if json {
+        ui::json_text(
+            &serde_json::json!({
+                "relay": url,
+                "key_file": key_path,
+                "healthy": true,
+            })
+            .to_string(),
+        );
+    } else {
+        ui::stdout().success("Relay is configured and reachable");
+        ui::stdout().metadata("relay", url);
+        ui::stdout().metadata("key file", &key_path.display().to_string());
+    }
+    Ok(())
+}
+
+fn health_url(origin: &str) -> Result<String> {
+    let mut url = relay_http_url(origin)?;
+    url.set_path("/healthz");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+fn authenticated_check_url(origin: &str) -> Result<String> {
+    let mut url = relay_http_url(origin)?;
+    url.set_path("/v1/check/client/pbx_check000");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+fn relay_http_url(origin: &str) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(origin).context("parse relay URL")?;
+    match url.scheme() {
+        "ws" => url.set_scheme("http").ok(),
+        "wss" => url.set_scheme("https").ok(),
+        "http" | "https" => Some(()),
+        _ => None,
+    }
+    .context("relay URL must use http, https, ws, or wss")?;
+    Ok(url)
+}
 
 pub(super) fn workspace_network(net: &str) -> Result<String> {
     let fields: std::collections::BTreeMap<_, _> =
@@ -102,7 +271,6 @@ use super::{
 };
 use std::{
     fs,
-    path::Path,
     time::{Duration, Instant},
 };
 

@@ -37,6 +37,7 @@ pub fn router(key: String, max_connections: usize) -> anyhow::Result<Router> {
     );
     Ok(Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
+        .route("/v1/check/{role}/{box_id}", get(check))
         .route("/v1/{role}/{box_id}", get(upgrade))
         .with_state(Arc::new(Relay {
             key,
@@ -46,6 +47,26 @@ pub fn router(key: String, max_connections: usize) -> anyhow::Result<Router> {
             available: Notify::new(),
             next: Default::default(),
         })))
+}
+
+async fn check(
+    State(state): State<Arc<Relay>>,
+    Path((role, box_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> StatusCode {
+    let token = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if matches!(role.as_str(), "agent" | "client")
+        && valid_route(&box_id)
+        && authorised(&state.key, &role, &box_id, token)
+    {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::UNAUTHORIZED
+    }
 }
 
 async fn upgrade(
