@@ -1,170 +1,180 @@
-# Relay access
+# Relay setup
 
-The relay lets a workstation reach a guest without an inbound route to that guest.
-The agent opens an outbound WebSocket. `pbox ssh`, `exec`, `scp`, and `forward` use
-that connection. The PVE API still handles container creation and lifecycle.
+[Quick start](../README.md#quick-start) · [Networking](configuration.md#networking)
 
-The same relay runs in Docker or as a systemd service in an unprivileged Proxmox
-LXC. It needs no PVE credentials, host mounts, Docker socket, TUN device, or host
-privileges. Both the workstation and the guest must reach its address.
+A relay lets pbox reach boxes that have no inbound route from the machine running
+the CLI. Both ends connect to the relay. Proxmox API access is still required
+separately.
 
-## Address and encryption
+## Choose an address
 
-Use `https://pbox.example.com` behind a reverse proxy for internet access. Caddy
-forwards WebSocket upgrades automatically. Point the hostname at the proxy, allow
-TCP 443 to the proxy, and route it to the relay's TCP port 8080. A hostname alone
-does not make a private container reachable.
+| Deployment | Address example | Requirements |
+| --- | --- | --- |
+| HTTPS reverse proxy | `https://relay.example.com` | DNS points to the proxy; TCP 443 is reachable; proxy forwards WebSocket upgrades to the relay |
+| Encrypted private network | `http://192.0.2.10:8080` | Both ends can reach that address through the protected network |
+| Private IPv6 | `http://[fd00::10]:8080` | IPv6 routing from both ends and a listener/proxy accepting IPv6 |
 
-Use `http://100.x.y.z:8080` if both callers can reach that IP through an existing
-Tailscale connection or subnet route. IPv6 literals also work, for example
-`http://[fd00::10]:8080`. HTTP is suitable only on an already protected network:
-agent session contents have their own encryption, but relay bearer credentials
-need HTTPS or an encrypted network to protect them in transit.
+These are examples, not addresses to copy unchanged. The default service listens
+on IPv4 port 8080. Use HTTPS for access over untrusted networks.
 
-The relay carries the existing TLS 1.3 connection between CLI and agent. Each end
-checks certificates from the configured pbox context. HTTPS certificates at the
-reverse proxy do not replace this check. The relay cannot read shell or file
-contents, but it can see connection metadata and interrupt connections.
+## Connect to an existing relay
 
-## Docker
-
-From the repository root:
+Obtain the service URL and its key file from the operator. On the machine running
+pbox:
 
 ```sh
-mkdir -p deploy/relay
-(umask 077; openssl rand -hex 32 > deploy/relay/relay.key)
-# Compose bind-mounted secrets need to be readable by the container user.
-# Keep this directory private if the key file is made readable.
-chmod 700 deploy/relay
-chmod 644 deploy/relay/relay.key
-docker compose -f deploy/relay/compose.yml up -d --build
+pbox config set relay.url https://relay.example.com
+pbox config set relay.key-file /absolute/path/to/relay.key
+pbox relay check
+```
+
+Use the existing key. Generating a different one will fail authentication.
+
+## Set up a new relay
+
+### 1. Generate the key
+
+On the machine running pbox:
+
+```sh
+pbox relay keygen
+```
+
+This writes a key with mode `600` and saves its path in pbox configuration.
+Use the reported path in the deployment steps below. The same key is needed by
+the relay service and pbox; box credentials are generated automatically.
+
+### 2. Install the relay service
+
+Choose one deployment below. Source builds currently require
+[Rust](https://rust-lang.org/tools/install/), Git and a C toolchain.
+
+<details>
+<summary><strong>Docker Compose</strong></summary>
+
+On the relay host, install [Docker Compose](https://docs.docker.com/compose/install/)
+and download the deployment files:
+
+```sh
+git clone https://github.com/kierandrewett/pbox.git
+cd pbox
+```
+
+Transfer the key from step 1 to this host. Keep it outside the checkout by
+overriding the supplied Compose file's secret path. From the checkout, run
+these commands as root, replacing `/path/to/transferred/relay.key`:
+
+```sh
+install -d -m 700 /etc/pbox-relay
+install -m 644 /path/to/transferred/relay.key /etc/pbox-relay/relay.key
+cat > /etc/pbox-relay/compose.override.yml <<'YAML'
+secrets:
+  relay-key:
+    file: /etc/pbox-relay/relay.key
+YAML
+docker compose -f deploy/relay/compose.yml \
+  -f /etc/pbox-relay/compose.override.yml up -d --build
 curl --fail http://127.0.0.1:8080/healthz
 ```
 
-The image builds `pbox-relay` from this checkout. It runs as UID 10001, with a
-read-only filesystem and no capabilities. The example publishes port 8080. If a
-reverse proxy shares its Docker network, remove the published port and connect
-the proxy to `pbox-relay:8080` instead. See `deploy/relay/Caddyfile`.
+Expected response: `ok`. The container runs as UID 10001, so the bind-mounted
+key must be readable by that user. The enclosing directory has mode `700`
+to restrict host access. Use both `-f` arguments for later Compose commands.
 
-Do not commit `relay.key`. Keep a backup of the master key. Changing it invalidates
-all derived relay credentials, so existing guests need new relay configuration.
-The first version uses one operator key per relay, not separate user accounts.
+The supplied [Compose file](../deploy/relay/compose.yml) publishes TCP 8080.
+For HTTPS, configure a reverse proxy; a [Caddy example](../deploy/relay/Caddyfile)
+is included. If the proxy runs in a separate container, both containers need a
+shared network for the `pbox-relay:8080` address to resolve.
 
-## Proxmox LXC
+</details>
 
-Create an ordinary unprivileged Debian 13 LXC with network access. Docker and
-nesting are not required. Build the binary on a compatible Linux system:
+<details>
+<summary><strong>Systemd, including an unprivileged Proxmox LXC</strong></summary>
+
+Use a Linux host or LXC with systemd and network access. On that host, build the
+relay from source:
 
 ```sh
+git clone https://github.com/kierandrewett/pbox.git
+cd pbox
 cargo build --locked --release -p pbox-relay
 ```
 
-Copy the binary and `deploy/relay/pbox-relay.service` into the LXC using your usual
-initialisation or file-transfer process. Then run these commands **inside it**:
+Transfer the key from step 1 to this host. Install the binary, key and
+[service unit](../deploy/relay/pbox-relay.service) as root:
 
 ```sh
-apt-get update && apt-get install -y --no-install-recommends openssl curl
-install -m 755 pbox-relay /usr/local/bin/pbox-relay
+install -m 755 target/release/pbox-relay /usr/local/bin/pbox-relay
 install -d -m 700 /etc/pbox-relay
-(umask 077; openssl rand -hex 32 > /etc/pbox-relay/relay.key)
-install -m 644 pbox-relay.service /etc/systemd/system/pbox-relay.service
+install -m 600 /path/to/transferred/relay.key /etc/pbox-relay/relay.key
+install -m 644 deploy/relay/pbox-relay.service /etc/systemd/system/pbox-relay.service
 systemctl daemon-reload
 systemctl enable --now pbox-relay
 curl --fail http://127.0.0.1:8080/healthz
 ```
 
-Systemd supplies the key through its credentials directory. The service uses a
-dynamic unprivileged user. Make its IP reachable, or put an HTTPS reverse proxy
-in front of it. Installing a relay in LXC does not require changes to the PVE host.
+Expected response: `ok`. Systemd gives the key to the service through its
+credentials directory. The service uses a dynamic user. Put an HTTPS proxy in
+front of it or use an encrypted private network.
 
-## Configure pbox
+</details>
 
-Copy the relay master key securely to the workstation, then:
+### 3. Configure pbox and verify
 
-```sh
-chmod 600 "$HOME/.config/pbox/relay.key"
-pbox config set relay.key-file "$HOME/.config/pbox/relay.key"
-pbox config set relay.url https://pbox.example.com
-pbox relay check
-pbox new --image ghcr.io/your-account/your-image:latest
-pbox ssh BOX_ID
-```
-
-For a new workstation, let pbox create the key and write its local
-configuration:
+After the service and its public/private address are ready, on the machine
+running pbox:
 
 ```sh
-pbox relay keygen
-pbox config set relay.url https://pbox.example.com
+pbox config set relay.url https://relay.example.com
 pbox relay check
+pbox new --image debian:13
+pbox exec current -- true
+pbox ssh current
 ```
 
-`pbox relay check` verifies the relay health endpoint and sends a scoped test
-credential. It does not send the master key over the network. A passing check
-means this workstation can reach the relay and the configured key matches it;
-it does not check whether a particular guest agent is connected.
+Use a box ID instead of `current` when several boxes exist. Configure the relay
+before creating boxes; setting a URL does not install relay settings into
+existing guests.
 
-For a private registry, use `podman login REGISTRY` on the workstation first.
-Pbox prepares the OCI image locally with Podman, so registry credentials remain
-on the workstation. The image author chooses the development and LLM tools.
-Pbox adds the system services and its agent, with fresh credentials for each box.
-No relay master key or PVE API token is installed in a guest workspace.
+## Verify the connection
 
-Relay creation accepts OCI images through `--image`, including the `debian-13`
-default alias. It cannot personalise an existing PVE `--ostemplate` through the
-API, so it rejects that combination before creating resources. Use a glibc-based
-systemd image compatible with your agent binary; Debian 13 is the validated base.
-An ordinary OCI ENTRYPOINT is not the LXC boot command. LXC boots systemd, and image
-authors should configure background services as systemd units. OCI runtime
-USER, WORKDIR and ENV metadata are not currently restored by filesystem export.
+| Check | Meaning |
+| --- | --- |
+| `curl --fail http://127.0.0.1:8080/healthz` on the relay host | The local relay HTTP service responds |
+| `pbox relay check` | This client reaches the relay and its key matches |
+| Successful box creation and `pbox exec BOX -- true` | The guest connects through the relay and authenticated command execution works |
 
-## Lifecycle and recovery
+The key check needs a relay version with the `/v1/check` endpoint. It does not
+test WebSocket forwarding or connectivity from a guest.
 
-Pbox installs the agent and credentials before uploading a unique temporary
-root filesystem. PVE extracts it and starts the guest. Pbox deletes the temporary
-PVE template and local archive, then checks the agent through the relay. It never
-uses host SSH or PVE console commands to bootstrap a relay guest.
+| Failure | Check |
+| --- | --- |
+| Connection refused / timeout | Service state, listener, firewall and route |
+| TLS failure | Hostname, reverse-proxy certificate and local CA trust |
+| HTTP 401 | Client and service are using the same key |
+| HTTP 404 during credential check | Relay version and proxy routing for `/v1/check/` |
+| Health passes but guest connection fails | Guest DNS/outbound route and proxy WebSocket support |
 
-The guest listens on loopback and connects outbound. Stop/start preserves its
-identity. Deleting the guest removes that running agent; box IDs are not reused
-intentionally. Restoring a copy with the same identity can conflict with its
-original. Independent clone/rekey support is not implemented yet.
+## Sessions and recovery
 
-The agent reconnects after a relay restart. Existing shells fail when their
-connection is lost; pbox does not replay commands. Run `pbox ssh` again. Existing
-agent session time limits still apply, including its one-hour command limit.
+Agents reconnect after a relay restart. An interrupted shell must be reopened
+with `pbox ssh BOX`; commands are not replayed.
 
-Interrupted creation records recovery state locally. Run `pbox repair BOX_ID`.
-A running PVE task must finish before its private template can be deleted. If no
-guest was created, repair removes the temporary template and local credentials.
-If a guest exists, repair checks its agent before completing cleanup. You can also
-use `pbox delete BOX_ID --yes` to delete a failed guest and its recorded template.
+```sh
+pbox repair BOX
+```
 
-The relay allows 1024 waiting/active agent connections by default. Each agent
-allows up to 32 connections, including its waiting connection. `--max-connections`
-sets the relay limit. `/healthz` checks the relay process, not guest readiness.
+Use repair after correcting a failed creation's network or service problem.
+It resumes bootstrap and cleanup where possible. To discard the box instead,
+use `pbox rm BOX`.
 
-## Implementation references
+Independent copies should use [pbox snapshots](snapshots.md); restoring a raw
+copy with the same agent identity can conflict with the original box.
 
-- WebSocket client API: https://docs.rs/tokio-tungstenite/0.29.0/tokio_tungstenite/fn.connect_async.html
-- PVE storage API: https://github.com/proxmox/pve-storage/blob/master/src/PVE/API2/Storage/Content.pm
-- Image payload copying: https://docs.podman.io/en/latest/markdown/podman-cp.1.html
+The relay forwards the encrypted CLI-to-agent connection. It can see connection
+metadata but cannot read shell or file contents. The URL's HTTPS layer protects
+relay credentials in transit.
 
-## Validation on 2026-09-05
-
-- A real Debian 13 guest was created through the PVE API on a private subnet.
-  Its agent bound only to loopback and connected through the HTTPS relay.
-- Concurrent execution, a terminal session, and a 2 MiB binary file round trip passed.
-- Port forwarding reached a second relay running under the supplied systemd unit
-  inside the unprivileged LXC. An authenticated command passed through that relay.
-  The workstation reached this private LXC relay through the tested port forward.
-- Relay restart and guest stop/start both restored access. The test guest and
-  temporary template were deleted afterwards.
-- The provided Dockerfile built successfully. Its image served its health endpoint
-  as UID 10001 with a read-only filesystem and all capabilities removed.
-- All 159 workspace tests, strict Clippy checks and formatting checks passed.
-  Similarity review found existing API/test repetition, with no new relay duplication
-  that needed a separate abstraction.
-
-The bsociety deployment uses `https://pbox.drewett.dev`. Its Compose service runs
-on the host's intranet Docker network behind the existing Caddy proxy.
+**Keep the service key when upgrading.** Replacing it invalidates existing
+relay credentials. Deploy the updated binary/container and restart the service;
+`pbox update` updates only the CLI.

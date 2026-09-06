@@ -1,45 +1,18 @@
-# pbox implementation plan
+# Architecture and validation
 
-## Goal
+| Responsibility | Component |
+| --- | --- |
+| Authoritative inventory and lifecycle | Proxmox VE API |
+| Commands and orchestration | pbox CLI |
+| Local inventory refresh | pboxd cache, rebuilt from PVE |
+| Guest access | pbox-agent with mutual TLS |
+| Access without a direct guest route | Authenticated connection relay |
+| Software installation | Ansible recipes |
+| Reusable environments | Full PVE copies with fresh restored identities |
 
-Deliver a usable pbox CLI in small increments while keeping PVE as the source
-of truth and keeping guest access separate from infrastructure control.
+PVE VMIDs and public pbox IDs are distinct. Local caches are not authoritative.
+Interrupted provisioning must retain enough state for repair.
 
-## Completed slices
-
-1. Rust workspace and CLI shell.
-2. Typed configuration, redaction, and XDG paths.
-3. Public ID and VMID-pattern allocation logic.
-4. PVE metadata parsing and preservation.
-5. Typed PVE REST client with task polling primitives.
-6. Human and JSON renderers for read-only commands.
-7. LXC creation, lifecycle operations, and guest-agent bootstrap.
-8. Authenticated agent operations for shell, exec, files, and forwarding.
-9. Ansible recipe discovery and application.
-10. PVE snapshot operations.
-11. OCI registry search, image pulls, and template selection.
-
-All completed slices have local unit or fake-PVE coverage. Live PVE and guest
-network verification remains outstanding.
-
-## Next dependency order
-
-```text
-current-box shell state + command aliases
-        |
-        +--> fork and agent identity re-keying
-        |
-        +--> desktop recipe transport
-        |
-        +--> PVE console relay fallback
-        |
-        +--> release packaging, upgrades, and end-to-end verification
-```
-
-## Product invariants
-
-- PVE VMIDs are never the public box identifier.
-- No local database is the source of truth for boxes.
-- Secrets never appear in metadata, normal output, or agent messages.
-- Normal output and JSON output share the same domain result.
-- Failed provisioning preserves enough PVE state for repair.
+Validate changes with the [contributor checks](docs/development.md#checks).
+Image tests and live PVE tests cover different boundaries; see
+[image validation](docs/development.md#image-tests).

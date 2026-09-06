@@ -1,72 +1,100 @@
 # Saved environments and checkpoints
 
-A pbox **snapshot** is an independent PVE LXC template with a `psn_` ID and a
-human-readable name. Its source box is provenance, not an ownership relationship.
-Both capture and restore explicitly request **full clones**, never linked clones.
-The resource consumes a VMID and storage in PVE; no filesystem archive is kept on
-the workstation. Deleting a source, template, or restored box does not delete the
-other full copies.
+[Quick start](../README.md#quick-start) · [Storage setup](configuration.md#placement-and-resources)
 
-A **checkpoint** is PVE's native per-container rollback point. Existing checkpoint
-operations remain available under `pbox checkpoint`; their API behaviour and JSON
-results are retained. Checkpoints disappear with their box.
+| | Snapshot | Checkpoint |
+| --- | --- | --- |
+| Use it to | Create new boxes with the same installed tools and files | Undo changes to one box |
+| Stored as | Independent Proxmox LXC template | Proxmox rollback point on the box |
+| Identifier | `psn_` ID or chosen name | Checkpoint name plus box ID |
+| Survives deleting the source box | Yes | No |
+| Needs | Storage supporting full container copies/templates | Storage supporting native snapshots |
 
-## Capture
+## Save an environment
 
-`pbox snapshot create current --name llm-ready` prepares a bootstrap service through
-the authenticated guest agent, gracefully shuts down the source, full-clones it,
-and converts the stopped copy to a template through the PVE API. The source's
-previous running/stopped state is restored and its preparation files are removed.
-This interrupts running processes; it is a saved disk environment, not suspended RAM.
-Host bind mounts and device passthrough cannot become independent copies and are
-rejected. The chosen storage must support PVE container templates/full copies.
+```sh
+pbox snapshot create current --name tools-ready
+pbox snapshot list
+pbox snapshot info tools-ready
+```
 
-The snapshot list includes incomplete copies so a failed operation remains visible.
-Snapshot removal targets only its recorded PVE resource. A failed task is never
-reported as a completed snapshot.
+Save work first: capture stops the source box while making a full disk copy,
+then restores its previous running/stopped state. Running processes and RAM
+are not saved.
 
-## Restore and bootstrap identity
+The snapshot uses a separate Proxmox VMID and disk space. It contains the box's
+files, including application configuration and credentials stored there.
+Host bind mounts and device passthrough are rejected because they cannot become
+independent copies.
 
-`pbox new --snapshot llm-ready` full-clones the template on its PVE node. Disk sizes
-are inherited; resource and network overrides use normal PVE configuration fields.
-Primary networking defaults to DHCP on the configured bridge. Extra interfaces keep
-their bridge/VLAN settings but get fresh MACs and dynamic addressing instead of
-copying static addresses and gateways.
+Names accept 1–63 letters, digits, hyphens or underscores and cannot start with
+`psn_`. Use the snapshot ID if a name is ambiguous.
 
-The clone initially uses a generated hostname. The source agent's systemd condition
-prevents it from connecting under the old box identity. A separate bootstrap agent
-then receives fresh credentials and the normal agent unit. Its first boot also
-regenerates machine ID and SSH host keys, and restores the source root-directory
-permissions (some PVE template storage backends change those permissions). A second
-boot makes the new machine ID effective for PID 1. A requested custom hostname is
-applied at that point. `--stopped` leaves the personalised box stopped.
+## Create a box from a snapshot
 
-Relay bootstrap routes are `BOOTSTRAP_ID~NEW_BOX_ID`. A snapshot receives an
-agent-only seed scoped to its bootstrap ID. It can authenticate bootstrap routes
-within that namespace, but cannot authenticate clients, normal box routes, or
-another snapshot's bootstrap routes. Each clone has its own route; simultaneous
-restores cannot consume each other's connections. Mutual TLS remains in place.
-Bootstrap credentials and files are removed from the restored box after handoff.
-Snapshots, like their underlying images, are trusted root-level guest content.
-They remain tied to the pbox authentication context in which they were captured.
+```sh
+pbox new --snapshot tools-ready
+```
 
-The updated relay is required for these bootstrap routes. Direct mode instead
-uses the clone's reachable guest address and the same TLS bootstrap identity;
-it still requires a network route to the guest. Neither mode needs PVE host SSH,
-console injection, hook scripts, or a privileged management container.
+The new box is a full copy with its own box ID, agent credentials, machine ID
+and SSH host keys. Deleting the original box or snapshot leaves existing copies
+intact.
 
-## Recovery
+| Setting | Restore behaviour |
+| --- | --- |
+| Node | Same PVE node as the snapshot |
+| Disk size | Inherited; resizing during restore is not supported |
+| Primary network | DHCP on the configured bridge by default |
+| Extra interfaces | Preserve bridge/VLAN settings with fresh MACs and dynamic addresses |
+| `--stopped` | Complete initialisation, then leave the new box stopped |
 
-Pending clone metadata is written into PVE before the clone task runs, including
-requested resource/network overrides and final running/stopped state.
-`pbox repair BOX_ID` resumes personalisation after interruption; it can also finish
-an already completed credential handoff. The source snapshot need not still exist.
+Snapshots remain tied to the pbox authentication context used to capture them.
+They are not a portable replacement for publishing an OCI image.
 
-An exclusive preparation directory prevents overlapping captures of one source.
-If the controller is killed while capturing, stop that operation first, then use
-`pbox snapshot repair-source BOX_ID` to remove its preparation files and restore
-its recorded prior running/stopped state. Normal success and handled failures
-restore that state automatically.
+## Delete a saved environment
 
-Names can collide across controllers; use the `psn_` ID when a name is ambiguous.
-Cross-node restores and disk resizing are not implemented by `new --snapshot`.
+```sh
+pbox snapshot rm tools-ready
+```
+
+Only the saved template is removed. Existing full copies keep their data.
+
+## Checkpoints
+
+```sh
+pbox checkpoint create current before-change
+pbox checkpoint list current
+pbox checkpoint rollback current before-change --start
+pbox checkpoint delete current before-change
+```
+
+Rollback restores the box's saved disk state and prompts for confirmation.
+`--start` starts it afterwards. Checkpoint names are positional arguments;
+`--name` is used for independent snapshot creation.
+
+Native snapshot support depends on the storage backend. See
+[Proxmox storage](https://pve.proxmox.com/pve-docs/chapter-pvesm.html).
+Recipe rollback uses this native mechanism; its
+[policy is configurable](recipes.md#rollback-and-storage).
+
+## Recover an interrupted operation
+
+| Operation | Recovery |
+| --- | --- |
+| Creating a box from a snapshot | `pbox repair BOX` resumes initialisation |
+| Capturing a source box | After ensuring capture is no longer running, use `pbox snapshot repair-source BOX` |
+| Incomplete saved copy | Inspect `pbox snapshot list` / `info`, then remove the failed copy if no longer needed |
+
+Source repair removes preparation files and restores the recorded prior state.
+Incomplete copies stay visible so they can be inspected and removed.
+
+<details>
+<summary>How restored identities work</summary>
+
+The source agent is prevented from connecting as the old box. The systemd service
+or workspace supervisor runs a bootstrap agent to give the clone a fresh
+identity, then removes bootstrap credentials.
+Relay restores use separate routes for each clone; direct restores need a route
+to the guest. Restore may boot more than once while installing the new identity.
+
+</details>

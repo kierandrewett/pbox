@@ -1,161 +1,122 @@
 # pbox
 
-Create disposable Proxmox workspaces for development and LLM tools.
+Linux development environments on Proxmox. Create a box from a container image,
+install tools with Ansible recipes, and open a shell or desktop.
 
-Choose an image, create a box, install the tools you need, and connect from
-your terminal or desktop.
-
-## Install
-
-Install the published CLI with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall):
-
-```sh
-cargo binstall pbox
-```
-
-Or install it directly with Cargo:
-
-```sh
-cargo install pbox --locked
-```
-
-Install shell completion after installing pbox:
-
-```sh
-# zsh
-source <(pbox completions zsh)
-
-# bash
-source <(pbox completions bash)
-
-# fish
-mkdir -p ~/.config/fish/completions
-pbox completions fish > ~/.config/fish/completions/pbox.fish
-```
-
-Update an installed pbox:
-
-```sh
-pbox update
-```
-
-`pbox update` uses cargo-binstall when it is available and otherwise uses
-`cargo install`.
-
-When a newer published version is available, pbox prints a hint after a normal
-command. It checks at most once a day and ignores network failures. Set
-`PBOX_NO_UPDATE_CHECK=1` to disable the check.
+[Quick start](#quick-start) · [Configuration](docs/configuration.md) ·
+[Relay setup](docs/relay.md) · [Recipes](docs/recipes.md) ·
+[Help](#troubleshooting)
 
 ## Quick start
 
-Pbox runs on a Linux machine and creates Linux containers on Proxmox.
-Podman prepares the image locally; PVE provides the CPU, memory, disk and
-network for the running box.
+Run the commands below on the Linux machine where you want to use pbox.
+A **box** is a Linux container running on Proxmox VE (PVE).
 
-### 1. Check the setup
+### 1. Check the requirements
 
-You need:
-
-| Component | What it is used for |
+| Component | Needed for |
 | --- | --- |
-| Machine running pbox | Runs the `pbox` CLI and [Podman](https://podman.io/docs/installation) |
-| [Podman](https://podman.io/docs/installation) | Pulls and prepares OCI images |
-| [Proxmox VE](https://www.proxmox.com/en/proxmox-virtual-environment/overview) API token | Lets pbox create and manage LXCs |
-| [PVE bridge](https://pve.proxmox.com/wiki/Network_Configuration) | Connects the LXC to a network |
-| [PVE storage](https://pve.proxmox.com/pve-docs/pvesm.1.html) | Holds the LXC root filesystem |
+| [Proxmox VE](https://www.proxmox.com/en/proxmox-virtual-environment/overview) | Running boxes on a standalone node or cluster |
+| [Proxmox API token](https://pve.proxmox.com/pve-docs/chapter-pveum.html#pveum_tokens) | Giving pbox access to the nodes, containers and storage it manages |
+| [Network bridge](https://pve.proxmox.com/wiki/Network_Configuration) | Connecting boxes to a network with addressing, DNS and access to package repositories |
+| [Storage](https://pve.proxmox.com/pve-docs/chapter-pvesm.html) | Container disks (`rootdir`) and uploaded templates (`vztmpl`); these can use different storage pools |
+| [Podman](https://podman.io/docs/installation) and [Git](https://git-scm.com/downloads) | Preparing images locally and downloading recipes |
+| [Ansible](https://docs.ansible.com/projects/ansible/latest/installation_guide/intro_installation.html) | Applying recipes; `ansible-playbook` must be available locally |
+| [TigerVNC viewer](https://tigervnc.org/) | Opening a desktop; optional for shell-only use |
 
-The machine running pbox needs a route to the guest network for direct connections.
-Use a [relay](docs/relay.md) when it does not.
+The default box network uses DHCP. A bridge alone does not supply DHCP or DNS.
+See [network configuration](docs/configuration.md#networking) for static addresses
+and direct or relay access.
 
-| Network path | Choose this when | Configure |
-| --- | --- | --- |
-| **Direct** | The machine running pbox can reach the guest IP | Nothing extra |
-| **Relay** | The guest network is private or unreachable | `relay.url` and `relay.key-file` |
+### 2. Install
 
-> **Common gap:** the PVE API address and the guest network are separate paths.
-> A working `pbox setup` proves API access; it does not prove that the machine
-> running pbox can reach a guest IP.
-
-### 2. Install pbox
+The intended package install uses [cargo-binstall](https://github.com/cargo-bins/cargo-binstall)
+or Cargo:
 
 ```sh
 cargo binstall pbox
-```
-
-<details>
-<summary>Without cargo-binstall</summary>
-
-```sh
+# Or compile with Cargo:
 cargo install pbox --locked
 ```
 
-This requires a [Rust installation](https://www.rust-lang.org/tools/install/).
+> [!NOTE]
+> The CLI and agent are not yet published on crates.io. Use the source install
+> below until a release is available.
+
+<details open>
+<summary><strong>Install from source</strong></summary>
+
+Install [Rust](https://rust-lang.org/tools/install/), a C toolchain and
+[`protoc`](https://protobuf.dev/installation/), then:
+
+```sh
+git clone https://github.com/kierandrewett/pbox.git
+cd pbox
+cargo install --locked --path crates/pbox-cli
+cargo install --locked --path crates/pbox-agent
+```
+
+Keep `~/.cargo/bin` on your `PATH`. The agent must run on the box's CPU
+architecture and Linux distribution. This native build suits matching glibc
+guests; for Alpine or a portable agent, see [agent builds](docs/development.md#build-the-agent).
 
 </details>
 
-### 3. Configure Proxmox
+**Both binaries are needed.** Pbox copies `pbox-agent` into boxes automatically.
+It looks beside the CLI binary, or uses an explicit path:
 
-Run the wizard. It discovers nodes, storage and bridges, then verifies the
-configuration it saves:
+```sh
+pbox config set agent.binary /absolute/path/to/pbox-agent
+```
+
+### 3. Connect to Proxmox
+
+[Create an API token](docs/configuration.md#api-token), then run:
 
 ```sh
 pbox setup
-pbox config list       # secrets are redacted
 ```
 
-The values normally map like this:
+The wizard asks for credentials and discovers nodes, storage and bridges.
 
-| Pbox setting | Proxmox concept |
+| Value | Expected format | Example |
+| --- | --- | --- |
+| API URL | HTTPS address of the PVE API | `https://pve.example.com:8006` |
+| Token ID | `USER@REALM!TOKEN_NAME` | `pbox@pve!cli` |
+| Token secret | The separate value shown when creating the token | Paste into the hidden prompt |
+| Node | A PVE node name, or `auto` | Select from the wizard |
+| Rootfs storage | Storage supporting container disks | Select from the wizard |
+| Template storage | Storage supporting container templates | May differ from rootfs storage |
+| Bridge | The network to attach new boxes to | Select the bridge for your setup |
+
+**Expected result:** `Configuration saved` and `PVE connection verified`.
+This checks API access; creating a box also needs allocation and storage
+permissions. [Permissions and configuration details](docs/configuration.md).
+
+### 4. Choose the connection path
+
+| Your setup | Connection |
 | --- | --- |
-| `pve.url` | `https://HOST:8006` |
-| `pve.token_id` / `pve.token_secret` | API token credentials |
-| `pve.node` | Target PVE node |
-| `pve.bridge` | PVE bridge attached to the required network |
-| `pve.storage` | LXC disk storage |
-| `pve.template_storage` | Temporary image/template storage |
+| Pbox can reach guest addresses on a LAN, routed network or VPN | **Direct.** Guest SSH is used during initial setup; later sessions use the agent. |
+| Pbox cannot reach guest addresses, but both pbox and the boxes can reach a relay | **Relay.** Follow [relay setup](docs/relay.md) before creating a box. |
+| Boxes have no outbound route or working DNS | Configure the guest network first; a relay still needs to be reachable. |
 
-#### Proxmox references
+> [!IMPORTANT]
+> Reaching the Proxmox web interface does not imply that pbox can reach a box.
+> A relay provides guest access; pbox still connects to the Proxmox API separately.
 
-These are the relevant parts of the Proxmox documentation:
-
-- [API tokens and permissions](https://pve.proxmox.com/pve-docs/pve-admin-guide.pdf)
-  — token creation, privileges and token scope.
-- [`pveum` reference](https://pve.proxmox.com/pve-docs/pveum.1.html) — the token
-  ID format is `USER@REALM!TOKEN_NAME`; pbox stores that value as `pve.token_id`.
-- [Network configuration](https://pve.proxmox.com/wiki/Network_Configuration) —
-  bridges, routed networks, NAT and VLANs.
-- [`pct` reference](https://pve.proxmox.com/pve-docs/pct.1.html) — container
-  network settings such as `bridge`, `ip`, `ip6` and `gw`.
-- [`pvesm` reference](https://pve.proxmox.com/pve-docs/pvesm.1.html) — storage
-  types and the `rootdir` and `vztmpl` content types pbox uses.
-
-The API URL normally has this form:
-
-```text
-https://PROXMOX_HOST:8006
-```
-
-The token secret is separate from the token ID. Keep both private; `pbox config
-list` redacts the secret.
-
-### 4. Add a relay when needed
-
-Use a relay when the box cannot be reached directly from the machine running
-pbox. The box makes an outbound connection to the relay, so that machine does not
-need a route to the guest network.
+For an **existing relay**, obtain its URL and key file from whoever operates it:
 
 ```sh
-pbox relay keygen
-pbox config set relay.url https://pbox.example.com
+pbox config set relay.url https://relay.example.com
+pbox config set relay.key-file /absolute/path/to/relay.key
 pbox relay check
 ```
 
-Copy the generated key to the relay host using a secure channel and configure
-the relay service with that same file. Keep the key outside your repositories;
-never copy it into a box. `pbox relay check` verifies health and authentication.
-See [relay.md](docs/relay.md) for deployment.
+For a **new relay**, [generate a key and deploy the service](docs/relay.md#set-up-a-new-relay),
+then run the check. Generating a key alone does not start a relay.
 
-### 5. Create and connect
+### 5. Create a box and open a shell
 
 ```sh
 pbox new --image debian:13
@@ -163,175 +124,142 @@ pbox list
 pbox ssh current
 ```
 
-Pbox prepares the image, creates the LXC, installs `pbox-agent`, and waits for
-the agent to become ready. `current` means the only box; otherwise use its ID:
+Pbox waits for the guest agent before completing creation. Type `exit` to
+disconnect; the box keeps running.
 
-```sh
-pbox ssh pbx_d7ky95gz
-```
-
-### 6. Add tools or a desktop
-
-Recipes are Ansible playbooks. Apply several in one command when they belong to
-the same setup:
-
-```sh
-pbox recipe apply --box-id current dev/base language/rust
-```
-
-Desktop recipes install a VNC server when required. `pbox desktop` opens the
-desktop in a native window on the machine running pbox:
-
-```sh
-pbox recipe apply --box-id current desktop/xfce
-pbox desktop current
-```
+`current` selects the only box. With several boxes, use a `pbx_` ID or unique
+name from `pbox list`. Shell access uses pbox's agent; you do not need to
+configure a separate SSH login.
 
 <details>
-<summary>If something fails</summary>
+<summary>Example terminal output</summary>
 
-| Symptom | Check |
-| --- | --- |
-| `pbox setup` cannot connect | PVE URL, token permissions and API reachability |
-| Box exists but has no IP | PVE bridge, DHCP and guest network access |
-| Agent is not ready | `pbox info BOX`; retry with `pbox repair BOX` |
-| Direct SSH cannot reach the box | Configure and check the relay |
-| Recipe output is too short | Add `--verbose` for full Ansible output |
-| Desktop opens but is blank | Confirm the desktop recipe completed, then retry `pbox desktop BOX` |
-
-</details>
-
-Run `pbox --help` or `pbox COMMAND --help` for the complete command list.
-
-## Examples
-
-List boxes:
+Illustrative output; IDs, addresses and installed tools will differ.
 
 ```text
 $ pbox list
 ID            STATE    PING  NODE  IPV4          NAME           IMAGE
-pbx_d7ky95gz  running  ok    pve   172.30.0.134  pbox-d7ky95gz  docker.io/cachyos/cachyos:latest
-```
+pbx_d7ky95gz  running  ok    pve   172.30.0.134  pbox-d7ky95gz  docker.io/library/debian:13
 
-Inspect a box:
-
-```text
-$ pbox info current
-box pbx_d7ky95gz
-  vmid         9000
-  state        running
-  node         pve
-  ipv4         172.30.0.134
-  name         pbox-d7ky95gz
-  recipes      agent/codex, browser/helium, desktop/xfce, dev/base, language/rust
-```
-
-Apply recipes:
-
-```text
-$ pbox recipe apply --box-id current dev/base language/rust
-! Snapshots are unavailable on this storage; applying the recipe without a snapshot.
-dev/base, language/rust → pbx_d7ky95gz
-ok Preparing guest (1s)
-> Applying recipes
-> Install Rust with rustup
-ok Install Rust with rustup (8s)
-```
-
-Open a shell:
-
-```text
 $ pbox ssh current
 > Connected to pbx_d7ky95gz. Type exit to disconnect.
-[pbox@pbox-d7ky95gz ~]$ rustup --version
-rustup 1.28.2
 [pbox@pbox-d7ky95gz ~]$
 ```
 
-The exact task lines and timings depend on the image and the recipes already
-installed. Use `--verbose` to stream the complete Ansible output.
+</details>
 
-## Boxes
-
-```sh
-pbox list
-pbox info BOX
-pbox start BOX
-pbox stop BOX
-pbox rm BOX
-```
-
-`pbox new` accepts an OCI image reference or a saved snapshot:
-
-```sh
-pbox new --image docker.io/library/debian:13
-pbox new --snapshot llm-ready
-```
-
-Use `pbox image search` and `pbox image tags` to find images. The image
-keeps its own user, shell, environment and working directory. pbox adds the
-guest agent and prepares the network during creation.
-
-## Recipes
-
-Recipes are Ansible playbooks stored in
-[pbox-recipes](https://github.com/kierandrewett/pbox-recipes).
+### 6. Install tools
 
 ```sh
 pbox recipe list
-pbox recipe apply --box-id current desktop/xfce
 pbox recipe apply --box-id current dev/base language/rust
 ```
 
-Recipes install software inside a box. They can add desktops, browsers, IDEs,
-programming languages and coding agents. Multiple recipes in one command share
-one preparation step and run in the order given.
+Recipes run in the order given. Browse
+[pbox-recipes](https://github.com/kierandrewett/pbox-recipes) for languages,
+browsers, IDEs and coding agents. [Recipe logs and recovery](docs/recipes.md).
 
-## Desktops
-
-Install a desktop recipe, then open it in a native VNC window:
+For a desktop, install a desktop recipe and open the viewer:
 
 ```sh
 pbox recipe apply --box-id current desktop/xfce
 pbox desktop current
 ```
 
-Desktop recipes install and configure a VNC server when needed. See
-[desktop.md](docs/desktop.md).
+This opens a local TigerVNC window. Closing it leaves applications running.
+[Desktop requirements and sessions](docs/desktop.md).
 
-## Saved environments
+## Everyday commands
 
-Snapshots are independent PVE templates:
+Replace `BOX` with an ID, unique name or `current`.
+
+| Task | Command |
+| --- | --- |
+| List boxes | `pbox list` |
+| Inspect a box | `pbox info BOX` |
+| Run a command | `pbox exec BOX -- uname -a` |
+| Copy a file into a box | `pbox scp ./file.txt BOX:/tmp/file.txt` |
+| Reach an app on port 3000 | `pbox forward BOX 3000` |
+| Stop / start | `pbox stop BOX` / `pbox start BOX` |
+| Delete | `pbox rm BOX` |
+| Find images | `pbox image search debian` |
+| List image tags | `pbox image tags debian` |
+
+`pbox list` uses a background inventory cache; changes can take a refresh to
+appear. Use `pbox COMMAND --help` for options and `--json` for structured
+results where supported.
+
+### Save an environment
+
+| | Snapshot | Checkpoint |
+| --- | --- | --- |
+| Purpose | Create new boxes from a saved environment | Roll back the same box |
+| Lifetime | Independent of the source box | Deleted with the box |
+| Storage | Full copy in Proxmox | Requires native snapshot support |
 
 ```sh
-pbox snapshot create current --name llm-ready
-pbox snapshot list
-pbox snapshot rm llm-ready
+pbox snapshot create current --name tools-ready
+pbox new --snapshot tools-ready
+
+pbox checkpoint create current before-change
 ```
 
-Checkpoints are short-lived rollback points attached to one box:
+Snapshot capture stops the source while copying; save work first.
+[Capture, restore and recovery](docs/snapshots.md).
+
+### Shell completion
+
+<details>
+<summary>Zsh, Bash and Fish</summary>
+
+For Zsh, add to `~/.zshrc`:
 
 ```sh
-pbox checkpoint list BOX
-pbox checkpoint create BOX --name before-change
+source <(pbox completions zsh)
 ```
 
-See [snapshots.md](docs/snapshots.md) for lifecycle and recovery details.
+For Bash, add to `~/.bashrc`:
 
-## Relay
+```sh
+source <(pbox completions bash)
+```
 
-Use a relay when the machine running pbox cannot route directly to a box. The box opens
-an outbound connection to the relay, and the CLI uses the same relay to reach
-it. Pbox still needs separate access to the Proxmox API.
+For Fish, run once:
 
-The relay forwards the encrypted agent connection. It does not read shell,
-file-transfer or port-forwarding data. Each box uses a credential scoped to
-that box.
+```sh
+mkdir -p ~/.config/fish/completions
+pbox completions fish > ~/.config/fish/completions/pbox.fish
+```
 
-The relay master key belongs on the relay host and on the machine that manages
-it. Keep it outside repositories and never copy it into a box. See
-[relay.md](docs/relay.md) for deployment, HTTPS and recovery instructions.
+</details>
+
+### Updates
+
+`pbox update` installs the latest published CLI through cargo-binstall or Cargo.
+Until packages are published, repeat the source-install steps after updating
+the checkout.
+
+Pbox checks for published updates before selected commands and caches successful
+checks for a day. Network failures are silent. Set `PBOX_NO_UPDATE_CHECK=1` to
+disable checks. The CLI update does not update the local agent binary or relay;
+`pbox ssh` compares the guest agent with the local binary before connecting.
+
+## Troubleshooting
+
+| Problem | Next step |
+| --- | --- |
+| `pbox-agent binary was not found` | Install the agent or set `agent.binary`; see [installation](#2-install). |
+| PVE rejects credentials or permissions | Check the full token ID, secret and [user/token permissions](docs/configuration.md#api-token). |
+| Box has no address | Check bridge, DHCP or static addressing in [networking](docs/configuration.md#networking). |
+| Creation stops while waiting for the agent | Inspect the box in PVE, correct the reported problem, then run `pbox repair BOX`. |
+| Relay check fails | Check the URL, running service and matching key using the [relay guide](docs/relay.md#verify-the-connection). |
+| Recipe fails | Read the saved log path or rerun with `--verbose`; see [recipes](docs/recipes.md). |
+| Desktop will not start | Check local viewer and guest session requirements in [desktop help](docs/desktop.md#troubleshooting). |
+
+[Report an issue](https://github.com/kierandrewett/pbox/issues) with the command,
+pbox version or source commit, guest image and relevant error output. Remove
+credentials from logs before sharing them.
 
 ## License
 
-MPL-2.0
+[Mozilla Public License 2.0](LICENSE).

@@ -1,8 +1,13 @@
-# Relay implementation
+# Follow-up work
 
-- [x] Add an authenticated WebSocket relay and shared outbound transport.
-- [x] Carry existing agent mutual TLS through relay connections.
-- [x] Add relay configuration and initialise agents in per-box OCI templates.
-- [x] Verify shell, files, reconnects, isolation, and provisioning failures.
-- [x] Package the relay for Docker and systemd in an unprivileged PVE LXC.
-- [x] Document hostname and private-IP setup and verify the full workspace.
+Use [GitHub issues](https://github.com/kierandrewett/pbox/issues) to track work.
+
+Current documented limitations:
+
+- Publish the CLI and agent packages and verify installation from a clean environment.
+- Align release agent archives with the portable musl build.
+- Snapshot restore does not support cross-node placement or disk resizing.
+- The relay workspace path does not support an explicit static IPv6 gateway.
+- Desktop recipes require a compatible VNC backend; Wayland-only sessions need their own recipe.
+
+See the [documentation index](docs/README.md) for current behaviour.

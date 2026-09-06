@@ -73,7 +73,8 @@ JSON mode leaves stdout empty on failure and emits unstyled guidance on stderr.
 
 | Commands | Shared presentation |
 | --- | --- |
-| `setup`, `config` | Headings, metadata, prompts, hints, success, errors |
+| `setup`, `config`, `relay keygen/check` | Headings, metadata, prompts, hints, success, errors |
+| `update` | Installer command and completion status |
 | `image search/tags/pull` | Headings, metadata, success, verbose diagnostics |
 | `new`, `repair`, `start`, `stop` | Progress, box details, success, next command |
 | `rm` / `delete` | Section, metadata, warning, prompt, progress, success |
@@ -111,9 +112,9 @@ and upload sizes without implying that cached bytes were downloaded.
 Deletion confirmation includes image provenance (and snapshot provenance when
 available); older boxes without recorded provenance show `Not recorded`.
 `ls` and `ps` are visible aliases of `list` and share its output.
-`list` probes the guest agent and shows `PING`; a PVE-running container with no
-agent response is shown as `disconnected`. A small per-user `pboxd` process owns
-that probe cache and is restarted automatically by the next CLI invocation.
+`list` shows cached agent status in `PING`; a PVE-running container with no
+agent response is shown as `disconnected`. A small per-user `pboxd` process
+performs the probes and is restarted automatically by the next CLI invocation.
 
 `list` shows `deleting` when PVE reports an active destroy task or the
 `destroyed` configuration lock. Agent pings are skipped for that state. Cached
@@ -128,6 +129,8 @@ The daemon refreshes independently and restarts on demand after exiting. Caches
 are scoped to configuration. A missing initial cache reports background loading;
 an old cache is displayed immediately with its age on human stderr. Queued local
 deletions overlay the cached row immediately, before the next PVE refresh.
+
+## Recipe progress
 
 Recipe application shows the recipe and target, then timed preparation and apply
 stages on stderr. Recipe stages reuse the box-creation display: terminals expand
