@@ -20,16 +20,16 @@ name = "pbox"
 path = "src/main.rs"
 
 [dependencies]
-pbox-relay = { version = "0.1.1", path = "../pbox-relay" }
+pbox-relay = { version = "0.1.2", path = "../pbox-relay" }
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 dirs.workspace = true
 hex = "0.4"
-pbox-agent-client = { version = "0.1.1", path = "../pbox-agent-client" }
-pbox-core = { version = "0.1.1", path = "../pbox-core" }
-pbox-crypto = { version = "0.1.1", path = "../pbox-crypto" }
+pbox-agent-client = { version = "0.1.2", path = "../pbox-agent-client" }
+pbox-core = { version = "0.1.2", path = "../pbox-core" }
+pbox-crypto = { version = "0.1.2", path = "../pbox-crypto" }
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true

@@ -732,6 +732,9 @@ mod tests {
         .unwrap();
         for action in ["enable", "preset", "is-enabled"] {
             let output = std::process::Command::new("systemctl")
+                // The payload also contains an OpenRC script. This checks only
+                // the native systemd unit, without running a SysV helper/chroot.
+                .env("SYSTEMCTL_SKIP_SYSV", "1")
                 .arg("--root")
                 .arg(&directory)
                 .args([action, "pbox-agent.service"])
