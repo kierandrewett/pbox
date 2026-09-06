@@ -7,7 +7,7 @@ your terminal or desktop.
 
 ## Install
 
-Install the published CLI with cargo-binstall:
+Install the published CLI with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall):
 
 ```sh
 cargo binstall pbox
@@ -58,11 +58,11 @@ You need:
 
 | Component | What it is used for |
 | --- | --- |
-| Machine running pbox | Runs the `pbox` CLI and Podman |
-| Podman | Pulls and prepares OCI images |
-| Proxmox API token | Lets pbox create and manage LXCs |
-| PVE bridge | Connects the LXC to a network |
-| PVE storage | Holds the LXC root filesystem |
+| Machine running pbox | Runs the `pbox` CLI and [Podman](https://podman.io/docs/installation) |
+| [Podman](https://podman.io/docs/installation) | Pulls and prepares OCI images |
+| [Proxmox VE](https://www.proxmox.com/en/proxmox-virtual-environment/overview) API token | Lets pbox create and manage LXCs |
+| [PVE bridge](https://pve.proxmox.com/wiki/Network_Configuration) | Connects the LXC to a network |
+| [PVE storage](https://pve.proxmox.com/pve-docs/pvesm.1.html) | Holds the LXC root filesystem |
 
 The machine running pbox needs a route to the guest network for direct connections.
 Use a [relay](docs/relay.md) when it does not.
@@ -88,6 +88,8 @@ cargo binstall pbox
 ```sh
 cargo install pbox --locked
 ```
+
+This requires a [Rust installation](https://www.rust-lang.org/tools/install/).
 
 </details>
 
