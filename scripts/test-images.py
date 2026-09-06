@@ -107,6 +107,13 @@ class Suite:
     def guardrails(self, boot, log):
         self.docker("cp", self.fixture / "preflight.sh", f"{boot}:/tmp/pbox-preflight.sh")
         self.docker("cp", self.fixture / "user.sh", f"{boot}:/tmp/pbox-user.sh")
+        # Reproduce an image that can execute the agent but would block before
+        # launching it at first boot. Restore policy before other guardrails.
+        self.docker("exec", boot, "rm", "/etc/systemd/system/systemd-firstboot.service")
+        interactive = self.docker("exec", boot, "/bin/sh", "/tmp/pbox-preflight.sh", check=False, log=log)
+        self.docker("exec", boot, "ln", "-s", "/dev/null", "/etc/systemd/system/systemd-firstboot.service")
+        if interactive.returncode == 0 or "Interactive first-boot setup" not in interactive.stdout:
+            raise RuntimeError("interactive first-boot wizard was not rejected")
         # Exercise failure diagnostics using the production preflight, not mocked checks.
         self.docker("exec", boot, "/bin/sh", "-ec",
                     "mv /usr/local/bin/pbox-agent /usr/local/bin/pbox-agent.saved; "

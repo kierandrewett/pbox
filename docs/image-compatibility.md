@@ -25,6 +25,7 @@ The matrix is in `tests/images/matrix.json`. Each positive case checks:
 - Authenticated agent RPC as the generated pbox user and passwordless sudo.
 - Agent container restart and reconnection.
 - Clear rejection of a broken agent binary and a masked agent service.
+- Rejection of an unmasked interactive first-boot wizard before upload.
 - Preservation of an existing pbox user's sudo policy.
 
 Alpine is an expected rejection: the current guest integration uses glibc and
@@ -50,10 +51,24 @@ python3 scripts/test-images.py --cleanup-only test-results/images/resources-RUN_
 A successful Docker run proves preparation and agent compatibility with those
 specific image IDs and the tested agent build. It does **not** prove LXC boot,
 PVE's generated network configuration, DHCP, IPv6 routing or relay reachability.
-Those require a separate PVE integration test. Rolling tags can change; the
-report records the tested image ID. The agent's minimum glibc version depends on
+Those require a separate PVE integration test. The prepared systemd guest masks
+`systemd-firstboot.service`, whose interactive
+locale/timezone/password prompts otherwise block `sysinit.target` and the agent
+on fresh images such as CachyOS. Machine ID generation and presets remain active;
+existing locale, timezone and account settings are preserved.
+Rolling tags can change; the report records the tested image ID.
+The agent's minimum glibc version depends on
 its build toolchain; older distro releases may require a compatible agent build
 via `agent.binary` even when their package manager is supported.
+
+Live verification on 6 September 2026: a CachyOS guest blocked on
+`systemd-firstboot --prompt-locale --prompt-keymap-auto --prompt-timezone
+--prompt-root-password` with the agent queued behind `sysinit.target`. Masking
+and stopping that wizard released the existing guest immediately. A new guest
+prepared with the mask completed `pbox new`, authenticated exec, passwordless
+sudo, DNS lookup, PTY SSH, and stop/start/reconnection. The temporary PVE guest
+and local Docker regression resources were deleted after verification. The fix
+is embedded in the guest image; it adds no host-shell requirement to pbox.
 
 ## Distribution choices and research
 

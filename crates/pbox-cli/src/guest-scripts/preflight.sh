@@ -22,6 +22,7 @@ else
 fi
 agent_error=$(/usr/local/bin/pbox-agent --help 2>&1 >/dev/null) || fail_image "pbox-agent cannot run in this image: ${agent_error:-the executable returned an error}. Check its CPU architecture, libc and shared libraries. Use a compatible image or configure agent.binary with a build for this image."
 if [ "$systemd" = true ]; then
+    [ "$(readlink /etc/systemd/system/systemd-firstboot.service)" = /dev/null ] || fail_image 'Interactive first-boot setup is enabled; unattended guest startup could wait for console input.'
     systemctl --root=/ preset pbox-agent.service >/dev/null || fail_image 'Cannot apply the pbox-agent service preset; check systemd masks and presets in your image.'
     systemctl --root=/ is-enabled --quiet pbox-agent.service || fail_image 'Image policy disables pbox-agent.service. Remove its mask or add an earlier systemd preset that enables pbox-agent.service.'
 elif [ -x /etc/init.d/pbox-agent ]; then

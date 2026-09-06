@@ -6,6 +6,11 @@ chmod 0600 /etc/pbox/server-key.pem
 if [ -f /etc/pbox/relay.json ]; then chmod 0600 /etc/pbox/relay.json; fi
 mkdir -p /etc/systemd/system/multi-user.target.wants
 if command -v systemctl >/dev/null 2>&1 || [ -d /run/systemd/system ]; then
+    # These guests boot unattended. The distro first-boot wizard prompts on the
+    # console before sysinit.target, preventing every normal service (including
+    # the agent) from starting. Keep machine-id generation and presets intact;
+    # disable only the interactive wizard, without changing image user settings.
+    ln -sf /dev/null /etc/systemd/system/systemd-firstboot.service
     ln -sf /etc/systemd/system/pbox-agent.service /etc/systemd/system/multi-user.target.wants/pbox-agent.service
 fi
 if command -v openrc >/dev/null 2>&1 || command -v openrc-run >/dev/null 2>&1; then
