@@ -315,7 +315,7 @@ pub(crate) fn print_snapshot_action(
     }
     let style = CliStyle::for_stdout(color, json);
     style.success(&format!(
-        "{} snapshot {} on {}",
+        "{} checkpoint {} on {}",
         output.action, output.name, output.id
     ));
     if output.started == Some(true) {
@@ -847,6 +847,35 @@ pub(crate) fn image_search_results(entries: &[super::images::ImageSearchEntry]) 
     }
     style.stdout_hint("List versions: pbox image tags IMAGE");
     style.stdout_hint("Create a box:  pbox new --image IMAGE:TAG");
+}
+
+pub(crate) fn saved_environments(saved: &[super::snapshots::SavedEnvironment]) {
+    let style = stdout();
+    style.stdout_heading("Snapshots");
+    if saved.is_empty() {
+        style.stdout_hint("No saved environments. Use pbox snapshot create current --name NAME.");
+    }
+    for snapshot in saved {
+        style.stdout_metadata("name", &snapshot.name);
+        style.stdout_metadata("id", &snapshot.id);
+        style.stdout_metadata(
+            "state",
+            if snapshot.ready {
+                "ready"
+            } else {
+                "incomplete"
+            },
+        );
+        style.stdout_metadata("created", &snapshot.created);
+        style.stdout_metadata(
+            "location",
+            &format!("{} / VMID {}", snapshot.node, snapshot.vmid),
+        );
+        style.stdout_metadata("source", &snapshot.source);
+    }
+    if !saved.is_empty() {
+        style.command("pbox new --snapshot NAME");
+    }
 }
 
 #[cfg(test)]

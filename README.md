@@ -25,9 +25,37 @@ within that registry. Search uses local Podman and does not require PVE setup.
 Registries must support search; for a known image, list versions with
 `pbox image tags docker.io/library/debian`.
 
-`pbox snapshot list` lists snapshots grouped by box. An optional ID or `current`
-filters to one box. Unfiltered JSON groups each box's snapshots with its ID, name,
-and node; filtered JSON retains the existing snapshot array.
+Snapshots are independent saved environments stored as PVE container templates:
+
+```sh
+pbox snapshot create current --name llm-ready
+pbox snapshot list
+pbox new --snapshot llm-ready
+pbox snapshot rm llm-ready
+```
+
+Saving briefly shuts down the source for a full disk copy, then restores its prior
+running/stopped state. The template remains in PVE after the source is deleted.
+Restoring makes another full copy; deleting the template does not delete those
+boxes. Each new box receives fresh pbox credentials, machine ID, and SSH host keys.
+Snapshot names are labels; `psn_` identifiers are unambiguous resource identities.
+
+The source's filesystem and managed disks are saved, not running processes.
+Host bind mounts and devices cannot be independent copies and are rejected.
+Restore currently runs on the template's node and preserves disk sizes; CPU,
+memory, hostname, and network can be overridden. Networking defaults to fresh DHCP
+on the configured bridge rather than copying a static source address.
+
+Snapshots stay in the same pbox authentication context. Relay deployments need
+the updated pbox-relay for scoped bootstrap connections; no local archive or
+privileged management server is involved. If provisioning is interrupted,
+`pbox repair BOX_ID` resumes the new box. If a source capture was interrupted,
+`pbox snapshot repair-source BOX_ID` removes its preparation files; only use it
+once that capture is no longer active.
+
+Existing per-container rollback points are available through `pbox checkpoint`.
+They remain attached to their source and are deleted with it. They are not
+converted automatically into independent snapshots. See [snapshot lifecycle and recovery](docs/snapshots.md).
 
 `pbox info` and `pbox list` show both address families when assigned; loopback and
 link-local IPv6 addresses are omitted. JSON retains `ip` for IPv4 and adds `ipv6`.

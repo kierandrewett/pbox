@@ -13,7 +13,7 @@ pub fn access(config: &Config, box_id: &str, role: &str) -> Result<RelayAccess> 
         .url
         .as_ref()
         .context("relay.url is not configured")?;
-    pbox_relay::websocket_url(url, role, box_id)?;
+    pbox_relay::websocket_url(url, if role == "snapshot" { "agent" } else { role }, box_id)?;
     let path = config
         .relay
         .key_file
@@ -28,6 +28,13 @@ pub fn access(config: &Config, box_id: &str, role: &str) -> Result<RelayAccess> 
         url: url.clone(),
         token: pbox_relay::scoped_token(key.trim(), role, box_id),
     })
+}
+
+pub fn snapshot_access(config: &Config, parent: &str) -> Result<RelayAccess> {
+    access(config, parent, "snapshot")
+}
+pub fn route_access(config: &Config, route: &str) -> Result<RelayAccess> {
+    access(config, route, "client")
 }
 
 pub async fn connect_agent(
@@ -57,21 +64,24 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn write_payload(directory: &Path, config: &Config, box_id: &str) -> Result<()> {
+pub(crate) fn write_payload(directory: &Path, config: &Config, box_id: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let materials = agent_materials(config, box_id)?;
     let etc = directory.join("etc/pbox");
     fs::create_dir_all(&etc)?;
     fs::set_permissions(&etc, fs::Permissions::from_mode(0o700))?;
-    for (name, contents) in [
+    let mut files = vec![
         ("server.pem", materials.server.certificate_pem),
         ("server-key.pem", materials.server.private_key_pem),
         ("client-ca.pem", materials.ca.certificate_pem),
-        (
+    ];
+    if config.relay.url.is_some() {
+        files.push((
             "relay.json",
             serde_json::to_string(&access(config, box_id, "agent")?)?,
-        ),
-    ] {
+        ));
+    }
+    for (name, contents) in files {
         fs::write(etc.join(name), contents)?;
         fs::set_permissions(etc.join(name), fs::Permissions::from_mode(0o600))?;
     }
@@ -81,11 +91,21 @@ fn write_payload(directory: &Path, config: &Config, box_id: &str) -> Result<()> 
     fs::set_permissions(binary, fs::Permissions::from_mode(0o755))?;
     let unit = directory.join("etc/systemd/system/pbox-agent.service");
     fs::create_dir_all(unit.parent().unwrap())?;
+    let listen = if config.relay.url.is_some() {
+        "127.0.0.1"
+    } else {
+        "0.0.0.0"
+    };
+    let relay_arg = if config.relay.url.is_some() {
+        " --relay-config /etc/pbox/relay.json"
+    } else {
+        ""
+    };
     // Start immediately; the agent retries outbound connections while DHCP becomes ready.
     fs::write(
         unit,
         format!(
-            "[Unit]\nDescription=pbox guest agent\nAfter=network.target\n\n[Service]\nExecStart=/usr/local/bin/pbox-agent --listen 127.0.0.1:{} --box-id {} --certificate /etc/pbox/server.pem --private-key /etc/pbox/server-key.pem --client-ca /etc/pbox/client-ca.pem --relay-config /etc/pbox/relay.json\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
+            "[Unit]\nDescription=pbox guest agent\nAfter=network.target\n\n[Service]\nExecStart=/usr/local/bin/pbox-agent --listen {listen}:{} --box-id {} --certificate /etc/pbox/server.pem --private-key /etc/pbox/server-key.pem --client-ca /etc/pbox/client-ca.pem {relay_arg}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
             config.agent.port, box_id
         ),
     )?;

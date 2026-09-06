@@ -65,7 +65,7 @@ before human display. Calculate table padding before applying colour.
 | `rm` / `delete` | Section, metadata, warning, prompt, progress, success |
 | `list`, `info`, `id` | Tables, metadata, resource titles |
 | `recipe` | Tables, metadata, success, warnings |
-| `snapshot` | Tables, success, errors |
+| `snapshot`, `checkpoint` | Tables, success, errors |
 | `ssh`, `exec`, `scp`, `forward` | Connection/transfer status and errors; unchanged guest data |
 | All help | Shared Clap palette |
 
@@ -84,4 +84,5 @@ another style helper to a command module.
 Image search displays image names and descriptions with next-command hints; tag
 listing is a separate command. Missing interactive search terms use the shared
 prompt, while redirected input gets a concrete usage hint. Snapshot listing needs
-no ID and groups results under box names and identifiers; an ID is an optional filter.
+no box ID and lists independent saved environments by name and psn_ ID. Source
+box IDs are provenance only. Per-box PVE rollback points are called checkpoints.

@@ -47,7 +47,13 @@ fn help_for_every_command_uses_the_shared_palette() {
         "recipe apply",
         "snapshot list",
         "snapshot create",
-        "snapshot rollback",
+        "snapshot info",
+        "snapshot repair-source",
+        "checkpoint",
+        "checkpoint list",
+        "checkpoint create",
+        "checkpoint rollback",
+        "checkpoint delete",
         "snapshot delete",
     ] {
         let mut args = vec!["--color=always"];

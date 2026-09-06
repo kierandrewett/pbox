@@ -4,6 +4,7 @@ mod bootstrap;
 mod guest;
 mod images;
 mod progress;
+mod snapshots;
 mod ui;
 use ui::*;
 mod recipes;
@@ -119,8 +120,10 @@ enum Command {
     Forward(ForwardCommand),
     /// Discover and apply Ansible recipes.
     Recipe(RecipeCommand),
-    /// Manage PVE snapshots for a pbox.
-    Snapshot(SnapshotCommand),
+    /// Manage independent saved environments stored as PVE templates.
+    Snapshot(snapshots::SnapshotCommand),
+    /// Manage per-box PVE rollback checkpoints (deleted with their box).
+    Checkpoint(CheckpointCommand),
     /// List pbox-managed containers discovered from PVE metadata.
     List,
     /// Show one pbox discovered from PVE metadata.
@@ -151,6 +154,9 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct NewCommand {
+    /// Create an independent box from a saved snapshot ID or name.
+    #[arg(long, conflicts_with_all = ["image", "ostemplate"])]
+    snapshot: Option<String>,
     /// PVE node. Defaults to automatic selection from online nodes.
     #[arg(long)]
     node: Option<String>,
@@ -339,29 +345,29 @@ enum RecipeSubcommand {
 }
 
 #[derive(Debug, Args)]
-struct SnapshotCommand {
+struct CheckpointCommand {
     #[command(subcommand)]
-    command: SnapshotSubcommand,
+    command: CheckpointSubcommand,
 }
 
 #[derive(Debug, Subcommand)]
-enum SnapshotSubcommand {
-    /// List snapshots across boxes, or filter by box ID/current.
+enum CheckpointSubcommand {
+    /// List checkpoints across boxes, or filter by box ID/current.
     List {
-        /// Optional box filter. Omit to list snapshots across all boxes.
+        /// Optional box filter. Omit to list checkpoints across all boxes.
         id: Option<String>,
     },
-    /// Create a snapshot of a pbox.
+    /// Create a checkpoint of a pbox.
     Create {
         /// Public pbox identifier.
         id: String,
         /// Snapshot name.
         name: String,
-        /// Optional snapshot description.
+        /// Optional checkpoint description.
         #[arg(long)]
         description: Option<String>,
     },
-    /// Roll back a pbox to a snapshot.
+    /// Roll back a pbox to a checkpoint.
     Rollback {
         /// Public pbox identifier.
         id: String,
@@ -374,7 +380,7 @@ enum SnapshotSubcommand {
         #[arg(long)]
         yes: bool,
     },
-    /// Delete a snapshot from a pbox.
+    /// Delete a checkpoint from a pbox.
     Delete {
         /// Public pbox identifier.
         id: String,
@@ -536,6 +542,9 @@ fn run() -> Result<RunOutcome> {
             run_recipe(command.command, &store, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
         Command::Snapshot(command) => {
+            snapshots::run(command, &store, cli.json, cli.color).map(|_| RunOutcome::Success)
+        }
+        Command::Checkpoint(command) => {
             run_snapshot(command.command, &store, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
         Command::List => run_list(&store, cli.json, cli.color).map(|_| RunOutcome::Success),
@@ -3387,6 +3396,9 @@ fn prepare_new_template_with_progress(
 fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorChoice) -> Result<()> {
     let progress = CliStyle::for_stderr(color, json);
     let config = load_config(store)?;
+    if command.snapshot.is_some() {
+        return snapshots::restore(&config, command, json, color);
+    }
     if config.relay.url.is_some() {
         return relay::run_new(&config, command, json, color);
     }
@@ -3582,6 +3594,9 @@ fn run_repair(
     let id: PboxId = requested_id.parse().context("parse pbox id")?;
     let id_text = id.to_string();
     let config = load_config(store)?;
+    if snapshots::repair(&config, requested_id, json, color)? {
+        return Ok(());
+    }
     let (key, mut operation) = BootstrapKey::find_pending(&id_text)?
         .ok_or_else(|| anyhow!("no interrupted bootstrap operation found for {id_text}"))?;
     if operation.relay {
@@ -4049,25 +4064,25 @@ fn run_delete(
 }
 
 fn run_snapshot(
-    command: SnapshotSubcommand,
+    command: CheckpointSubcommand,
     store: &ConfigStore,
     json: bool,
     color: ColorChoice,
 ) -> Result<()> {
     match command {
-        SnapshotSubcommand::List { id } => run_snapshot_list(store, id.as_deref(), json, color),
-        SnapshotSubcommand::Create {
+        CheckpointSubcommand::List { id } => run_snapshot_list(store, id.as_deref(), json, color),
+        CheckpointSubcommand::Create {
             id,
             name,
             description,
         } => run_snapshot_create(store, &id, &name, description.as_deref(), json, color),
-        SnapshotSubcommand::Rollback {
+        CheckpointSubcommand::Rollback {
             id,
             name,
             start,
             yes,
         } => run_snapshot_rollback(store, &id, &name, start, yes, json, color),
-        SnapshotSubcommand::Delete { id, name, yes } => {
+        CheckpointSubcommand::Delete { id, name, yes } => {
             run_snapshot_delete(store, &id, &name, yes, json, color)
         }
     }
@@ -4410,10 +4425,21 @@ fn wait_for_task_with_progress(
     progress::substep(description);
     let started = Instant::now();
     let mut log_cursor = 0;
+    let mut read_failures = 0;
     let mut last_log = None::<Instant>;
     let result = loop {
         let status = match client.get_task_status(node, &task.upid) {
-            Ok(status) => status,
+            Ok(status) => {
+                read_failures = 0;
+                status
+            }
+            Err(PveError::Http { status, .. })
+                if matches!(status.as_u16(), 502 | 503 | 504 | 596) && read_failures < 3 =>
+            {
+                read_failures += 1;
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            }
             Err(error) => break Err(anyhow!("read PVE task status: {error}")),
         };
         if (progress::has_details() || progress::verbose())
@@ -5060,6 +5086,18 @@ mod tests {
             Err(Self::unsupported())
         }
 
+        fn clone_lxc(
+            &self,
+            _node: &str,
+            _vmid: u64,
+            request: &pbox_core::LxcCloneRequest,
+        ) -> Result<PveTaskResponse, PveError> {
+            self.events
+                .borrow_mut()
+                .push(format!("clone:{}:{}", request.newid, request.full));
+            Ok(Self::task("clone"))
+        }
+
         fn delete_lxc(&self, _node: &str, _vmid: u64) -> Result<PveTaskResponse, PveError> {
             self.events.borrow_mut().push("delete".to_owned());
             Ok(Self::task("delete"))
@@ -5148,6 +5186,26 @@ mod tests {
             );
             assert!(String::from_utf8(output).unwrap().contains("[y/N]"));
         }
+    }
+
+    #[test]
+    fn saved_environment_cloning_explicitly_copies_all_disks_and_waits() {
+        let record = test_record();
+        let fake = FakePve::new(&test_metadata(&record), "test");
+        let vmid = super::snapshots::clone_full(
+            &fake,
+            &Config::default(),
+            "pve01",
+            9007,
+            "pbox-test",
+            |vmid| Ok(format!("copy {vmid}")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            *fake.events.borrow(),
+            [format!("clone:{vmid}:1"), "wait:clone".to_owned()]
+        );
     }
 
     #[test]
@@ -5374,6 +5432,7 @@ mod tests {
             &fake,
             &Config::default(),
             &NewCommand {
+                snapshot: None,
                 node: None,
                 image: None,
                 ostemplate: None,
@@ -5413,6 +5472,7 @@ mod tests {
             &fake,
             &Config::default(),
             &NewCommand {
+                snapshot: None,
                 node: None,
                 image: None,
                 ostemplate: None,
@@ -5454,6 +5514,7 @@ mod tests {
             &fake,
             &Config::default(),
             &NewCommand {
+                snapshot: None,
                 node: None,
                 image: None,
                 ostemplate: None,
@@ -5516,6 +5577,7 @@ mod tests {
             &fake,
             &Config::default(),
             &NewCommand {
+                snapshot: None,
                 node: None,
                 image: Some("debian-13".to_owned()),
                 ostemplate: None,
@@ -5583,6 +5645,7 @@ mod tests {
             &fake,
             &Config::default(),
             &NewCommand {
+                snapshot: None,
                 node: Some("pve01".to_owned()),
                 image: None,
                 ostemplate: Some("local:vztmpl/custom.tar.zst".to_owned()),
@@ -5619,6 +5682,7 @@ mod tests {
             &fake,
             &Config::default(),
             &NewCommand {
+                snapshot: None,
                 node: None,
                 image: None,
                 ostemplate: None,
@@ -5644,6 +5708,7 @@ mod tests {
             &fake,
             &Config::default(),
             &NewCommand {
+                snapshot: None,
                 node: None,
                 image: None,
                 ostemplate: None,
@@ -6423,18 +6488,18 @@ mod tests {
     }
     #[test]
     fn discovery_commands_accept_missing_filters() {
-        let cli = Cli::try_parse_from(["pbox", "snapshot", "list"]).unwrap();
+        let cli = Cli::try_parse_from(["pbox", "checkpoint", "list"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Snapshot(super::SnapshotCommand {
-                command: super::SnapshotSubcommand::List { id: None }
+            Command::Checkpoint(super::CheckpointCommand {
+                command: super::CheckpointSubcommand::List { id: None }
             })
         ));
-        let cli = Cli::try_parse_from(["pbox", "snapshot", "list", "current"]).unwrap();
+        let cli = Cli::try_parse_from(["pbox", "checkpoint", "list", "current"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Snapshot(super::SnapshotCommand {
-                command: super::SnapshotSubcommand::List { id: Some(_) }
+            Command::Checkpoint(super::CheckpointCommand {
+                command: super::CheckpointSubcommand::List { id: Some(_) }
             })
         ));
         assert!(Cli::try_parse_from(["pbox", "image", "search"]).is_ok());
@@ -6576,6 +6641,7 @@ mod tests {
             "user note",
         );
         let command = NewCommand {
+            snapshot: None,
             node: Some("pve01".to_owned()),
             image: Some("ghcr.io/example/base:latest".to_owned()),
             ostemplate: None,
