@@ -1,19 +1,19 @@
 # pbox
 
-Disposable Proxmox LXC workspaces for development and LLM tools.
+Create disposable Proxmox workspaces for development and LLM tools.
 
-Create a box from an OCI image, install tools with Ansible recipes, and connect
-with a local terminal or desktop window.
+Choose an image, create a box, install the tools you need, and connect from
+your terminal or desktop.
 
 ## Install
 
-The normal install uses a published Rust package:
+Install the published CLI with cargo-binstall:
 
 ```sh
 cargo binstall pbox
 ```
 
-If cargo-binstall is not installed, compile pbox with Cargo:
+Or install it directly with Cargo:
 
 ```sh
 cargo install pbox --locked
@@ -114,8 +114,9 @@ The values normally map like this:
 
 ### 4. Add a relay when needed
 
-The relay is an outbound path from the guest to a reachable host. It does not
-replace Proxmox API access, and it does not make the guest directly routable.
+Use a relay when the box cannot be reached directly from your workstation. The
+box makes an outbound connection to the relay, so the workstation does not
+need a route to the guest network.
 
 ```sh
 pbox relay keygen
@@ -124,8 +125,9 @@ pbox relay check
 ```
 
 Copy the generated key to the relay host using a secure channel and configure
-the relay service with that same file. `pbox relay check` verifies both health
-and scoped-key authentication. See [relay.md](docs/relay.md) for deployment.
+the relay service with that same file. Keep the key outside your repositories;
+never copy it into a box. `pbox relay check` verifies health and authentication.
+See [relay.md](docs/relay.md) for deployment.
 
 ### 5. Create and connect
 
@@ -292,66 +294,17 @@ See [snapshots.md](docs/snapshots.md) for lifecycle and recovery details.
 
 ## Relay
 
-The relay lets pbox work when the workstation cannot route directly to a
-private guest network. The guest opens an outbound WebSocket connection to the
-relay. The CLI connects to the same relay, and the relay joins the two
-authenticated connections.
+Use a relay when the workstation cannot route directly to a box. The box opens
+an outbound connection to the relay, and the CLI uses the same relay to reach
+it. Pbox still needs separate access to the Proxmox API.
 
-The relay carries the existing encrypted agent connection. It does not receive
-guest shell, file or forwarding contents. It does handle connection metadata
-and can interrupt a connection. Each box has its own scoped relay credential.
+The relay forwards the encrypted agent connection. It does not read shell,
+file-transfer or port-forwarding data. Each box uses a credential scoped to
+that box.
 
-Configure a relay on the workstation:
-
-```sh
-pbox relay keygen
-pbox config set relay.url https://pbox.example.com
-pbox relay check
-pbox new --image debian:13
-pbox ssh current
-```
-
-Use a private relay address when both the workstation and guests can reach it:
-
-```sh
-pbox config set relay.url http://100.120.0.10:8080
-```
-
-Use HTTPS or an encrypted private network. The relay key is an operator secret;
-keep it outside the repository and do not copy it into guests. See
-[relay.md](docs/relay.md) for Docker, Proxmox LXC, reverse proxy and recovery
-instructions.
-
-## Development
-
-Clone the recipes repository as a submodule:
-
-```sh
-git clone https://github.com/kierandrewett/pbox.git
-cd pbox
-git submodule update --init --recursive
-```
-
-The recipes are available in `recipes/`. The standalone repository remains the
-source of truth for recipe releases.
-
-Build the CLI and guest agent:
-
-```sh
-just build
-```
-
-Run the checks:
-
-```sh
-just check
-just test
-```
-
-The CLI is a Linux application. The guest agent is built as a portable musl
-binary for supported Linux images. See
-[image-compatibility.md](docs/image-compatibility.md) for image requirements
-and the local image test matrix.
+The relay master key belongs on the relay host and on the workstation that
+manages it. Keep it outside repositories and never copy it into a box. See
+[relay.md](docs/relay.md) for deployment, HTTPS and recovery instructions.
 
 ## License
 
