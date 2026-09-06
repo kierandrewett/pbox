@@ -48,29 +48,74 @@ command. It checks at most once a day and ignores network failures. Set
 
 ## Quick start
 
-You need a Linux workstation with Podman, access to a Proxmox cluster, and a
-bridge and storage pool available to the node that will run the box. Pbox uses
-Podman on the workstation to prepare OCI images, then uploads them to PVE.
+Pbox runs on your workstation and creates Linux containers on Proxmox.
+Podman prepares the image locally; PVE provides the CPU, memory, disk and
+network for the running box.
 
-Install pbox:
+### 1. Check the setup
+
+You need:
+
+| Component | What it is used for |
+| --- | --- |
+| Linux workstation | Runs the `pbox` CLI and Podman |
+| Podman | Pulls and prepares OCI images |
+| Proxmox API token | Lets pbox create and manage LXCs |
+| PVE bridge | Connects the LXC to a network |
+| PVE storage | Holds the LXC root filesystem |
+
+Your workstation needs a route to the guest network for direct connections.
+Use a [relay](docs/relay.md) when it does not.
+
+| Network path | Choose this when | Configure |
+| --- | --- | --- |
+| **Direct** | The workstation can reach the guest IP | Nothing extra |
+| **Relay** | The guest network is private or unreachable | `relay.url` and `relay.key-file` |
+
+> **Common gap:** the PVE API address and the guest network are separate paths.
+> A working `pbox setup` proves API access; it does not prove that your laptop
+> can reach a guest IP.
+
+### 2. Install pbox
 
 ```sh
 cargo binstall pbox
-# or, without cargo-binstall:
+```
+
+<details>
+<summary>Without cargo-binstall</summary>
+
+```sh
 cargo install pbox --locked
 ```
 
-Configure the Proxmox API. The setup wizard discovers usable nodes, storage and
-network bridges, then verifies the saved configuration:
+</details>
+
+### 3. Configure Proxmox
+
+Run the wizard. It discovers nodes, storage and bridges, then verifies the
+configuration it saves:
 
 ```sh
 pbox setup
-pbox config list
+pbox config list       # secrets are redacted
 ```
 
-If the workstation cannot route to the guest network, configure a relay before
-creating a box. Generate the workstation key, copy that file to the relay host,
-and use the same key for the relay service:
+The values normally map like this:
+
+| Pbox setting | Proxmox concept |
+| --- | --- |
+| `pve.url` | `https://HOST:8006` |
+| `pve.token_id` / `pve.token_secret` | API token credentials |
+| `pve.node` | Target PVE node |
+| `pve.bridge` | Linux bridge, often `vmbr0` |
+| `pve.storage` | LXC disk storage |
+| `pve.template_storage` | Temporary image/template storage |
+
+### 4. Add a relay when needed
+
+The relay is an outbound path from the guest to a reachable host. It does not
+replace Proxmox API access, and it does not make the guest directly routable.
 
 ```sh
 pbox relay keygen
@@ -78,34 +123,57 @@ pbox config set relay.url https://pbox.example.com
 pbox relay check
 ```
 
-`pbox relay check` checks both the public health endpoint and the scoped-key
-authentication path. Follow [relay.md](docs/relay.md) for installing the relay
-and copying its master key securely.
+Copy the generated key to the relay host using a secure channel and configure
+the relay service with that same file. `pbox relay check` verifies both health
+and scoped-key authentication. See [relay.md](docs/relay.md) for deployment.
 
-Create a box. Pbox waits for the guest agent before reporting success:
+### 5. Create and connect
 
 ```sh
 pbox new --image debian:13
 pbox list
-```
-
-Connect to it through the agent:
-
-```sh
 pbox ssh current
 ```
 
-Install tools with recipes, then open a desktop in a native VNC window:
+Pbox prepares the image, creates the LXC, installs `pbox-agent`, and waits for
+the agent to become ready. `current` means the only box; otherwise use its ID:
+
+```sh
+pbox ssh pbx_d7ky95gz
+```
+
+### 6. Add tools or a desktop
+
+Recipes are Ansible playbooks. Apply several in one command when they belong to
+the same setup:
 
 ```sh
 pbox recipe apply --box-id current dev/base language/rust
+```
+
+Desktop recipes install a VNC server when required. `pbox desktop` opens the
+desktop in a native window on the workstation:
+
+```sh
 pbox recipe apply --box-id current desktop/xfce
 pbox desktop current
 ```
 
-`current` works when exactly one pbox exists. Use a box ID or name when there is
-more than one. Run `pbox --help` or `pbox COMMAND --help` for the full command
-list.
+<details>
+<summary>If something fails</summary>
+
+| Symptom | Check |
+| --- | --- |
+| `pbox setup` cannot connect | PVE URL, token permissions and API reachability |
+| Box exists but has no IP | PVE bridge, DHCP and guest network access |
+| Agent is not ready | `pbox info BOX`; retry with `pbox repair BOX` |
+| Direct SSH cannot reach the box | Configure and check the relay |
+| Recipe output is too short | Add `--verbose` for full Ansible output |
+| Desktop opens but is blank | Confirm the desktop recipe completed, then retry `pbox desktop BOX` |
+
+</details>
+
+Run `pbox --help` or `pbox COMMAND --help` for the complete command list.
 
 ## Examples
 
