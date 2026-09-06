@@ -15,8 +15,10 @@ For an existing checkout, run `git submodule update --init --recursive`.
 Recipe changes are committed and pushed there before updating the parent gitlink.
 
 Install Rust (see `rust-version` in [Cargo.toml](../Cargo.toml)), a C toolchain,
-[`protoc`](https://protobuf.dev/installation/), Python 3 and
+Python 3 and
 [`just`](https://github.com/casey/just).
+The protocol crate includes its `.proto` source and downloads a packaged
+`protoc` compiler through Cargo; no system protobuf compiler is required.
 
 ## Build the CLI
 
@@ -103,15 +105,17 @@ not evidence that those paths work.
 | `crates/pbox-agent-client` | Authenticated agent client |
 | `crates/pbox-relay` | Relay server and WebSocket transport |
 | `crates/pbox-crypto` | Guest/client certificate material |
-| `proto/` | Active gRPC contract, compiled by `crates/pbox-proto/build.rs` using protoc |
+| `crates/pbox-proto/proto/` | Active gRPC contract, packaged with its code generator |
 | `deploy/relay/` | Compose, systemd and reverse-proxy examples |
 
 ## Releases
 
 [The release workflow](../.github/workflows/release.yml) runs for `v*` tags.
-It publishes workspace crates in dependency order, then builds separate CLI and
-agent archives. It requires `CARGO_REGISTRY_TOKEN` in repository secrets.
+It runs checks, verifies the packaged crates and builds static x86-64 Linux
+binaries before publishing. Cargo publishes the workspace in dependency order.
+The workflow requires `CARGO_REGISTRY_TOKEN` in repository secrets.
 
-Review both package and binary jobs before announcing a release. The current
-binary job targets GNU/Linux; `just build-agent` targets musl. Do not describe
-GNU agent archives as portable to Alpine.
+Releases include separate CLI, agent and relay archives with SHA-256 checksums.
+All three use musl; cargo-binstall discovers them through package metadata.
+Before announcing a release, verify both `cargo install --locked pbox pbox-agent`
+and `cargo binstall pbox pbox-agent` with an empty installation directory.

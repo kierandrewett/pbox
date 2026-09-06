@@ -10,6 +10,11 @@ readme = "../../README.md"
 keywords = ["proxmox", "lxc", "workspace", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
 [[bin]]
 name = "pbox"
 path = "src/main.rs"

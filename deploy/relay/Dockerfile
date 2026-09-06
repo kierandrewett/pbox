@@ -2,8 +2,6 @@ FROM rust:1.95-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-COPY proto ./proto
-RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler && rm -rf /var/lib/apt/lists/*
 RUN cargo build --locked --release -p pbox-relay
 
 FROM debian:13-slim

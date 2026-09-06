@@ -30,24 +30,29 @@ and direct or relay access.
 
 ### 2. Install
 
-The intended package install uses [cargo-binstall](https://github.com/cargo-bins/cargo-binstall)
-or Cargo:
+Install the CLI and guest agent with
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall):
 
 ```sh
-cargo binstall pbox
-# Or compile with Cargo:
-cargo install pbox --locked
+cargo binstall pbox pbox-agent
 ```
 
-> [!NOTE]
-> The CLI and agent are not yet published on crates.io. Use the source install
-> below until a release is available.
+Prebuilt binaries are available for x86-64 Linux and work with glibc or musl.
+Alternatively, compile the [CLI](https://crates.io/crates/pbox) and
+[agent](https://crates.io/crates/pbox-agent) with Rust and a C toolchain:
 
-<details open>
+```sh
+cargo install --locked pbox pbox-agent
+```
+
+Cargo builds for the current machine. The agent must also match the guest's
+CPU architecture and libc; use the prebuilt agent for Alpine, or see
+[agent builds](docs/development.md#build-the-agent).
+
+<details>
 <summary><strong>Install from source</strong></summary>
 
-Install [Rust](https://rust-lang.org/tools/install/), a C toolchain and
-[`protoc`](https://protobuf.dev/installation/), then:
+Install [Rust](https://rust-lang.org/tools/install/) and a C toolchain, then:
 
 ```sh
 git clone https://github.com/kierandrewett/pbox.git
@@ -56,13 +61,10 @@ cargo install --locked --path crates/pbox-cli
 cargo install --locked --path crates/pbox-agent
 ```
 
-Keep `~/.cargo/bin` on your `PATH`. The agent must run on the box's CPU
-architecture and Linux distribution. This native build suits matching glibc
-guests; for Alpine or a portable agent, see [agent builds](docs/development.md#build-the-agent).
-
 </details>
 
-**Both binaries are needed.** Pbox copies `pbox-agent` into boxes automatically.
+Keep `~/.cargo/bin` on your `PATH`. **Both binaries are needed.**
+Pbox copies `pbox-agent` into boxes automatically.
 It looks beside the CLI binary, or uses an explicit path:
 
 ```sh

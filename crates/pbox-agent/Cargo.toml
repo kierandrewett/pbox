@@ -7,6 +7,11 @@ license.workspace = true
 description = "Authenticated guest agent for pbox workspaces"
 repository.workspace = true
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
 [[bin]]
 name = "pbox-agent"
 path = "src/main.rs"
