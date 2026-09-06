@@ -806,6 +806,8 @@ pub struct LxcCloneRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct LxcCreateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ostype: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ostemplate: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
@@ -1291,6 +1293,7 @@ mod tests {
 
     fn lifecycle_requests_serialize_only_set_values() {
         let request = LxcCreateRequest {
+            ostype: Some("archlinux".to_owned()),
             ostemplate: Some("local:vztmpl/debian-12.tar.zst".to_owned()),
             memory: Some(1024),
             net0: Some("name=eth0,bridge=vmbr0".to_owned()),
@@ -1306,6 +1309,7 @@ mod tests {
         let value = serde_json::to_value(form).unwrap();
         assert_eq!(value["vmid"], 100);
         assert_eq!(value["ostemplate"], "local:vztmpl/debian-12.tar.zst");
+        assert_eq!(value["ostype"], "archlinux");
         assert_eq!(value["memory"], 1024);
         assert_eq!(value["net0"], "name=eth0,bridge=vmbr0");
         assert_eq!(value["ssh-public-keys"], "ssh-ed25519 AAAA bootstrap");
