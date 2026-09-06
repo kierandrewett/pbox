@@ -2285,7 +2285,7 @@ fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOu
         .build()
         .context("create async runtime for pbox-agent shell")?;
     let style = ui::stderr();
-    let (mut client, info) = runtime.block_on(async move {
+    let connection = runtime.block_on(async move {
         let connect = async {
             let mut client =
                 relay::connect_agent(&config, &endpoint, &box_id, &ca_pem, &client_identity)
@@ -2316,8 +2316,9 @@ fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOu
                 }
             }
         }
-    })?;
+    });
     style.clear_progress_line();
+    let (mut client, info) = connection?;
     if !info
         .capabilities
         .iter()
