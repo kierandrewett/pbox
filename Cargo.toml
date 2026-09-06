@@ -16,7 +16,7 @@ rust-version = "1.95"
 license = "MPL-2.0"
 repository = "https://github.com/kierandrewett/pbox"
 description = "Proxmox-backed developer sandbox components"
-version = "0.1.9"
+version = "0.1.10"
 
 [workspace.dependencies]
 anyhow = "1.0"
