@@ -18,12 +18,12 @@ path = "src/main.rs"
 
 [dependencies]
 serde_json.workspace = true
-pbox-relay = { version = "0.1.8", path = "../pbox-relay" }
+pbox-relay = { version = "0.1.9", path = "../pbox-relay" }
 clap.workspace = true
 anyhow.workspace = true
 ipnet.workspace = true
-pbox-proto = { version = "0.1.8", path = "../pbox-proto" }
-pbox-crypto = { version = "0.1.8", path = "../pbox-crypto" }
+pbox-proto = { version = "0.1.9", path = "../pbox-proto" }
+pbox-crypto = { version = "0.1.9", path = "../pbox-crypto" }
 sha2.workspace = true
 nix.workspace = true
 tonic.workspace = true
@@ -36,4 +36,4 @@ tokio-stream.workspace = true
 vt100 = "0.16.2"
 hyper-util.workspace = true
 tower = { version = "0.5", features = ["util"] }
-pbox-agent-client = { version = "0.1.8", path = "../pbox-agent-client" }
+pbox-agent-client = { version = "0.1.9", path = "../pbox-agent-client" }

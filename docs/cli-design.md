@@ -36,9 +36,9 @@ before human display. Calculate table padding before applying colour.
 - Interactive SSH saves the host terminal title, sets the box name, and
   restores the title on disconnect using the terminal title stack. Guest OSC 0/1/2 title
   changes receive a `box-name · ` prefix, including across transport chunks. Terminals without title-stack support may not restore it.
-- Guest output from `exec` and `ssh`, and transferred files, are data streams. Preserve their bytes; do not style or sanitise them, except
-  for interactive SSH title prefixes, the reserved status row and initial
-  session replay described below. Non-terminal streams remain unchanged.
+- Guest output from `exec`, one-off `ssh`, and transferred files are data streams.
+  Preserve their bytes. Persistent interactive SSH uses the terminal viewport
+  below; redirected streams retain their byte-stream behavior.
 - Creation keeps each completed step with a green `ok` and its elapsed time, then
   shows a new spinner for the active step on a capable terminal. Failed steps are
   never marked complete. Redirected output
@@ -249,15 +249,38 @@ The confirmation warns about stopped programs and unsaved work. `--yes` requires
 `--kill-sessions` and skips that prompt for automation. There is no implicit
 kill or SSH prerequisite, and user input is never retried after an update.
 
-Persistent interactive SSH reserves one bottom row for the box, session and
-`Ctrl+] detach`. The advertised guest PTY height excludes that row, including on
-resize. Scroll margins are constrained to the guest area. The status is drawn
-without overwriting the guest's saved cursor; local history is not cleared.
-Initial shell snapshots append at the local cursor, including snapshots from
-older agents. Full-screen applications retain their alternate-screen behavior.
+Persistent interactive SSH reserves a bottom row for the session and controls.
+Pass guest screen, cursor, mouse and keyboard controls through to the terminal;
+do not render a virtual screen, capture the wheel or add scrolling shortcuts.
+Only constrain scroll margins to the advertised guest area above the bar. Native
+scrollback belongs to the host terminal, so the bar is not pinned while browsing
+history. No pbox-owned alternate screen or screen clear is used on entry or exit.
+Track the cursor only to restore its position after painting the status row.
 
-`ssh` and `attach` accept `--read-only`. It reads decoded snapshots without
-attachment, input or resize RPCs. Ctrl+C leaves the viewer. The status names the
-session, says read-only and shows its exit key. Only the viewer's own lines are
-updated; large screens remain complete in scrollback. No full-screen clear is
-used on entry or exit. Plain output emits changed snapshots without ANSI layout.
+The supervisor retains up to 10,000 ordinary full-screen scrollback lines for
+`session read --history`. This is a headless read API, not an interactive scroll
+implementation. Applications using their own screen or partial scroll regions
+may not leave retained lines. Older supervisors report history as unavailable.
+The plain read prints retained lines before the current screen; JSON adds
+`history` and `history_supported` only when requested.
+
+`ssh` and `attach` accept `--read-only`. Read decoded snapshots without attachment,
+input or resize RPCs. Ctrl+C leaves the viewer. Render inline updates and let the
+host terminal keep scrollback. Viewing does not update or resize the guest.
+
+The status row shows CPU, memory and root-disk percentages from Proxmox on wide
+terminals. Poll every five seconds off the terminal loop, with a three-second
+request timeout. Missing, failed or stale readings display `—`; narrow views keep
+session controls instead. Do not repaint unchanged readings and disturb an idle
+cursor. Preserve guest cursor visibility, blinking and shape, including replay.
+
+Session listings show the foreground process chain and current directory when
+the supervisor supports them. Sample `/proc` only for inspection. Keep original
+`argv` and `cwd` in JSON; add `pid`, `foreground_pid`, `current_cwd` and `processes`
+with parent IDs. Unknown process details fall back to the original command.
+
+Use a dim cyan session label, dim control hints and small Unicode symbols beside
+`⚙ CPU`, `🧠 RAM` and `💾 DISK` labels. Normal readings are green, >=80% amber, >=95% red;
+percentages remain visible without colour. Keep the terminal's default background
+and avoid reverse video or icon-font dependencies. Account for double-width
+Unicode symbols when fitting the row.

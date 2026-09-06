@@ -66,16 +66,29 @@ message TerminalSession {
   uint64 created_unix = 6;
   uint32 rows = 7;
   uint32 cols = 8;
+  uint32 pid = 9;
+  uint32 foreground_pid = 10;
+  string current_cwd = 11;
+  repeated SessionProcess processes = 12;
+}
+message SessionProcess {
+  uint32 pid = 1;
+  uint32 parent_pid = 2;
+  string name = 3;
+  bool foreground = 4;
 }
 message SessionRequest {
   uint32 protocol_version = 1;
   string name = 2;
+  bool include_history = 3;
 }
 message ReadSessionResponse {
   TerminalSession session = 1;
   string text = 2;
   uint32 cursor_row = 3;
   uint32 cursor_col = 4;
+  repeated string history = 5;
+  bool history_supported = 6;
 }
 message SendSessionRequest {
   uint32 protocol_version = 1;

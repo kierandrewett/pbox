@@ -2555,6 +2555,9 @@ fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<R
     let status = session_name
         .as_ref()
         .and_then(|name| ui::TerminalStatus::enter(&box_name, name, false));
+    if let Some(status) = &status {
+        status.monitor_resources(sessions::resource_monitor(config.clone(), box_id.clone()));
+    }
     let result = runtime.block_on(run_ssh_session_with_signals(
         &mut client,
         pbox_agent_client::ExecRequest {
@@ -2818,17 +2821,24 @@ async fn run_ssh_session(
             .await
     }
     .context("open terminal session")?;
-    let input_sender = session.input.clone();
+    let (input_sender, mut local_input) = tokio::sync::mpsc::channel(32);
     let _input_thread = thread::spawn(move || pump_terminal_input(input_sender, persistent));
+    let mut input_open = true;
     #[cfg(unix)]
     let mut window_change =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
             .context("register SIGWINCH handler")?;
+    let mut refresh = tokio::time::interval(Duration::from_secs(1));
     let mut result = ExecResult::default();
     let mut titles = ui::TitlePrefix::new(title);
     loop {
         #[cfg(unix)]
         let event = tokio::select! {
+            _ = refresh.tick(), if status.is_some() => { status.unwrap().refresh_resources(); continue; }
+            input = local_input.recv(), if input_open => {
+                input_open = relay_view_input(input, status, &session.input).await?;
+                continue;
+            }
             event = session.output.message() => event,
             _ = window_change.recv() => {
                 let (rows, cols) = terminal_size();
@@ -2840,7 +2850,14 @@ async fn run_ssh_session(
             }
         };
         #[cfg(not(unix))]
-        let event = session.output.message().await;
+        let event = tokio::select! {
+            _ = refresh.tick(), if status.is_some() => { status.unwrap().refresh_resources(); continue; }
+            input = local_input.recv(), if input_open => {
+                input_open = relay_view_input(input, status, &session.input).await?;
+                continue;
+            }
+            event = session.output.message() => event,
+        };
         let Some(event) = event.context("read pbox-agent PTY output")? else {
             break;
         };
@@ -2891,6 +2908,38 @@ async fn run_ssh_session(
         Err(_) => bail!("pbox-agent PTY stream did not close after exit"),
     }
     Ok(result)
+}
+
+async fn relay_view_input(
+    input: Option<ExecInput>,
+    status: Option<&ui::TerminalStatus>,
+    sender: &tokio::sync::mpsc::Sender<ExecInput>,
+) -> Result<bool> {
+    let Some(input) = input else {
+        return Ok(false);
+    };
+    let input = match (input, status) {
+        (ExecInput::Data(bytes), Some(status)) => {
+            // Input and SIGWINCH may become ready together. Queue the new PTY
+            // size first so a command cannot run with the previous dimensions.
+            let (rows, cols) = terminal_size();
+            if status.size() != (rows.saturating_sub(1).max(1), cols) {
+                status.resize(rows, cols);
+                let (rows, cols) = status.size();
+                sender
+                    .send(ExecInput::Resize { rows, cols })
+                    .await
+                    .map_err(|_| anyhow!("pbox-agent PTY input closed while resizing"))?;
+            }
+            ExecInput::Data(bytes)
+        }
+        (input, _) => input,
+    };
+    sender
+        .send(input)
+        .await
+        .map_err(|_| anyhow!("pbox-agent PTY input closed"))?;
+    Ok(true)
 }
 
 #[cfg(unix)]

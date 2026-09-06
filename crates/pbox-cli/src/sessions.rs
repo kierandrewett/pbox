@@ -39,6 +39,9 @@ enum Action {
         id: String,
         /// Session name when not included in BOX:SESSION.
         name: Option<String>,
+        /// Include retained scrollback before the current screen.
+        #[arg(long)]
+        history: bool,
     },
     /// Send text, then keys, without attaching. Does not retry input.
     Send {
@@ -274,7 +277,10 @@ fn show_sessions(
             "box_id": group.box_id, "box_name": group.box_name,
             "name": session.name, "user": session.user, "cwd": session.cwd,
             "argv": session.argv, "attached": session.attached, "created_unix": session.created_unix,
-            "rows": session.rows, "cols": session.cols
+            "rows": session.rows, "cols": session.cols,
+            "pid": session.pid, "foreground_pid": session.foreground_pid,
+            "current_cwd": session.current_cwd,
+            "processes": session.processes.iter().map(|p| serde_json::json!({"pid":p.pid,"parent_pid":p.parent_pid,"name":p.name,"foreground":p.foreground})).collect::<Vec<_>>()
         }))).collect();
         ui::json_text(&serde_json::to_string_pretty(&values)?);
     } else {
@@ -366,7 +372,7 @@ pub fn run(store: &ConfigStore, command: SessionCommand, json: bool) -> Result<R
         action @ (Action::Start { .. } | Action::Read { .. } | Action::Send { .. }) => {
             let (id, name) = match &action {
                 Action::Start { id, name, .. }
-                | Action::Read { id, name }
+                | Action::Read { id, name, .. }
                 | Action::Send { id, name, .. } => (id, name),
                 _ => unreachable!(),
             };
@@ -409,17 +415,38 @@ pub fn run(store: &ConfigStore, command: SessionCommand, json: bool) -> Result<R
                         ui::stdout().success(&format!("Started session {name} on {box_id}"));
                     }
                 }
-                Action::Read { .. } => {
-                    let screen = runtime.block_on(client.read_session(&name))?;
+                Action::Read { history, .. } => {
+                    let screen = runtime.block_on(async {
+                        if history {
+                            client.read_session_history(&name).await
+                        } else {
+                            client.read_session(&name).await
+                        }
+                    })?;
+                    if history && !screen.history_supported && !json {
+                        ui::stderr().hint("This terminal's older supervisor cannot export scrollback. Existing processes are kept running.");
+                    }
                     if json {
                         let session = screen.session.context("agent omitted terminal details")?;
-                        ui::json_text(&serde_json::json!({
-                            "box_id": box_id, "name": session.name, "user": session.user,
-                            "cwd": session.cwd, "argv": session.argv, "attached": session.attached,
-                            "rows": session.rows, "cols": session.cols, "created_unix": session.created_unix,
-                            "text": screen.text, "cursor_row": screen.cursor_row, "cursor_col": screen.cursor_col,
-                        }).to_string());
+                        let mut value = serde_json::json!({
+                                        "box_id": box_id, "name": session.name, "user": session.user,
+                                        "cwd": session.cwd, "argv": session.argv, "attached": session.attached,
+                                        "rows": session.rows, "cols": session.cols,
+                        "pid": session.pid, "foreground_pid": session.foreground_pid,
+                        "current_cwd": session.current_cwd,
+                        "processes": session.processes.iter().map(|p| serde_json::json!({"pid":p.pid,"parent_pid":p.parent_pid,"name":p.name,"foreground":p.foreground})).collect::<Vec<_>>(), "created_unix": session.created_unix,
+                                        "text": screen.text, "cursor_row": screen.cursor_row, "cursor_col": screen.cursor_col,
+                                    });
+                        if history {
+                            value["history"] = serde_json::json!(screen.history);
+                            value["history_supported"] =
+                                serde_json::json!(screen.history_supported);
+                        }
+                        ui::json_text(&value.to_string());
                     } else {
+                        if history && !screen.history.is_empty() {
+                            ui::session_screen(&screen.history.join("\n"));
+                        }
                         ui::session_screen(&screen.text);
                     }
                 }
@@ -526,7 +553,7 @@ pub(super) fn view(store: &ConfigStore, command: &SshCommand) -> Result<RunOutco
     let initial = runtime.block_on(client.read_session(name))?;
     let signals = runtime.block_on(install_terminal_signals())?;
     let terminal = TerminalModeGuard::enter()?;
-    let (quit, mut input) = tokio::sync::mpsc::channel(1);
+    let (quit, mut input) = tokio::sync::mpsc::channel::<Option<Vec<u8>>>(32);
     if terminal.is_some() {
         let quit = quit.clone();
         thread::spawn(move || {
@@ -534,14 +561,19 @@ pub(super) fn view(store: &ConfigStore, command: &SshCommand) -> Result<RunOutco
             let mut stdin = io::stdin().lock();
             let mut buffer = [0u8; 8192];
             while let Ok(count) = stdin.read(&mut buffer) {
-                if count == 0 || input.push(&buffer[..count]).1 {
-                    let _ = quit.blocking_send(());
+                let (bytes, exit) = input.push(&buffer[..count]);
+                if count == 0 || exit {
+                    let _ = quit.blocking_send(None);
+                    break;
+                }
+                if !bytes.is_empty() && quit.blocking_send(Some(bytes)).is_err() {
                     break;
                 }
             }
         });
     }
     let mut display = ui::SessionViewer::new(&command.id, name);
+    display.monitor_resources(config.clone(), box_id.clone());
     display.render(&initial.text);
     let result: Result<()> = runtime.block_on(async {
         let mut interval = tokio::time::interval(Duration::from_millis(300));
@@ -551,7 +583,10 @@ pub(super) fn view(store: &ConfigStore, command: &SshCommand) -> Result<RunOutco
             let read = async { interval.tick().await; client.read_session(name).await };
             #[cfg(unix)]
             let result = tokio::select! {
-                _ = input.recv() => break,
+                event = input.recv() => match event {
+                    Some(Some(_)) => { continue; }
+                    _ => break,
+                },
                 _ = interrupt.recv() => break,
                 _ = hangup.recv() => break,
                 _ = quit.recv() => break,
@@ -559,7 +594,7 @@ pub(super) fn view(store: &ConfigStore, command: &SshCommand) -> Result<RunOutco
                 result = read => result,
             };
             #[cfg(not(unix))]
-            let result = tokio::select! { _ = input.recv() => break, _ = tokio::signal::ctrl_c() => break, result = read => result };
+            let result = tokio::select! { event = input.recv() => match event { Some(Some(_)) => { continue; }, _ => break }, _ = tokio::signal::ctrl_c() => break, result = read => result };
             display.render(&result?.text);
         }
         Ok(())
@@ -569,6 +604,31 @@ pub(super) fn view(store: &ConfigStore, command: &SshCommand) -> Result<RunOutco
     drop(quit);
     result?;
     Ok(RunOutcome::Success)
+}
+
+/// Poll Proxmox outside the async terminal loop. Failure never closes the PTY,
+/// and dropping the view disconnects the bounded channel and stops the worker.
+pub(super) fn resource_monitor(
+    config: Config,
+    id: String,
+) -> std::sync::mpsc::Receiver<Option<pbox_core::pve::LxcUsage>> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let Ok(client) = client_from_config(&config) else {
+            return;
+        };
+        let Ok(record) = find_box(&client, &id) else {
+            return;
+        };
+        loop {
+            let sample = client.lxc_usage(&record.node, record.vmid).ok();
+            if sender.send(sample).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_secs(5));
+        }
+    });
+    receiver
 }
 
 #[cfg(test)]

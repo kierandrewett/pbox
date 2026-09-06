@@ -1446,12 +1446,12 @@ pub(crate) fn terminal_sessions(
         let directory_width = group
             .sessions
             .iter()
-            .map(|s| s.cwd.chars().count())
+            .map(|s| session_directory(s).chars().count())
             .max()
             .unwrap_or(9)
             .clamp(9, (columns / 3).max(9));
         style.stdout_heading(&format!(
-            "  {:<name_width$}  {:<8}  {:<user_width$}  {:<directory_width$}  COMMAND",
+            "  {:<name_width$}  {:<8}  {:<user_width$}  {:<directory_width$}  RUNNING",
             "SESSION", "STATE", "USER", "DIRECTORY"
         ));
         for session in &group.sessions {
@@ -1464,15 +1464,48 @@ pub(crate) fn terminal_sessions(
                     "detached"
                 },
                 clip_terminal_text(&session.user, user_width),
-                clip_terminal_text(&session.cwd, directory_width),
+                clip_terminal_text(session_directory(session), directory_width),
                 clip_terminal_text(
-                    &session.argv.join(" "),
+                    &session_running(session),
                     columns.saturating_sub(name_width + user_width + directory_width + 18)
                 )
             );
         }
     }
     style.command(&format!("pbox attach {}:NAME", filter.unwrap_or("BOX")));
+}
+
+fn session_directory(session: &pbox_agent_client::TerminalSession) -> &str {
+    if session.current_cwd.is_empty() {
+        &session.cwd
+    } else {
+        &session.current_cwd
+    }
+}
+fn session_running(session: &pbox_agent_client::TerminalSession) -> String {
+    if session.processes.is_empty() {
+        return session.argv.join(" ");
+    }
+    let mut chain = Vec::new();
+    let mut pid = session.foreground_pid;
+    for _ in 0..session.processes.len() {
+        let Some(process) = session.processes.iter().find(|p| p.pid == pid) else {
+            break;
+        };
+        chain.push(process.name.clone());
+        pid = process.parent_pid;
+    }
+    if chain.is_empty() {
+        return session.argv.join(" ");
+    }
+    let foreground = chain.remove(0);
+    chain.reverse();
+    let parents = if chain.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", chain.join(" → "))
+    };
+    format!("{foreground} [{}]{parents}", session.foreground_pid)
 }
 
 pub(crate) fn snapshot_deletion_queued(saved: &super::snapshots::SavedEnvironment, upid: &str) {
@@ -1759,12 +1792,16 @@ pub(crate) fn agent_update_result(
 /// No alternate screen is entered and the existing screen is never cleared.
 pub(crate) struct TerminalStatus(std::cell::RefCell<StatusState>);
 struct StatusState {
-    parser: vt100::Parser,
+    parser: vt100::Parser<NativeControls>,
     filter: ViewportFilter,
     rows: u16,
     cols: u16,
     label: String,
     finished: bool,
+    read_only: bool,
+    colour: bool,
+    resources: Option<std::sync::mpsc::Receiver<Option<pbox_core::pve::LxcUsage>>>,
+    usage: Option<(std::time::Instant, pbox_core::pve::LxcUsage)>,
 }
 impl StatusState {
     fn content_rows(&self) -> u16 {
@@ -1793,24 +1830,33 @@ impl StatusState {
         if self.rows < 3 {
             return Vec::new();
         }
-        use unicode_width::UnicodeWidthChar;
-        let mut label = String::new();
-        let mut width = 0;
-        for character in safe_terminal_text(&self.label).chars() {
-            let next = character.width().unwrap_or(0);
-            if width + next > usize::from(self.cols) {
-                break;
-            }
-            label.push(character);
-            width += next;
-        }
-        label.push_str(&" ".repeat(usize::from(self.cols) - width));
-        let mut output =
-            format!("\x1b[?6l\x1b[{};1H\x1b[0;7m{label}\x1b[0m", self.rows).into_bytes();
+        let usage = self.resources.as_ref().map(|_| {
+            resource_label(
+                self.usage
+                    .as_ref()
+                    .filter(|(time, _)| time.elapsed().as_secs() < 15)
+                    .map(|(_, usage)| usage),
+            )
+        });
+        let suffix = if self.read_only {
+            "Read-only · Ctrl+C exit"
+        } else {
+            "Ctrl+] detach"
+        };
+        let label = fit_resource_bar(&self.label, suffix, usage.as_deref(), self.cols as usize);
+        let label = colour_resource_bar(&label, usage.as_deref(), self.colour);
+        let mut output = format!("\x1b[?6l\x1b[{};1H\x1b[0m{label}\x1b[0m", self.rows).into_bytes();
         if self.filter.origin_mode {
             output.extend_from_slice(b"\x1b[?6h");
         }
         let cursor = self.parser.screen().cursor_state_formatted();
+        // Painting never changes visibility or shape, so only restore position.
+        // Reasserting ?25h here resets cursor blinking in some terminals.
+        let cursor = cursor
+            .strip_prefix(b"\x1b[?25h")
+            .or_else(|| cursor.strip_prefix(b"\x1b[?25l"))
+            .unwrap_or(&cursor)
+            .to_vec();
         output.extend(if self.filter.origin_mode {
             relative_cursor(cursor, self.filter.top.max(1))
         } else {
@@ -1848,18 +1894,15 @@ impl TerminalStatus {
             return None;
         }
         let mut state = StatusState {
-            parser: vt100::Parser::new(rows as u16, cols as u16, 0),
+            parser: vt100::Parser::new_with_callbacks(rows as u16, cols as u16, 0, NativeControls),
             filter: ViewportFilter::default(),
             rows: rows as u16,
             cols: cols as u16,
-            label: format!(
-                " {box_name}:{session}  |  {}",
-                if read_only {
-                    "Read-only · Ctrl+C exit"
-                } else {
-                    "Ctrl+] detach"
-                }
-            ),
+            label: format!("{box_name}:{session}"),
+            read_only,
+            colour: stdout().enabled,
+            resources: None,
+            usage: None,
             finished: false,
         };
         let initial = format!(
@@ -1873,6 +1916,31 @@ impl TerminalStatus {
         let _ = io::stdout().write_all(&output);
         let _ = io::stdout().flush();
         Some(Self(std::cell::RefCell::new(state)))
+    }
+    pub(crate) fn monitor_resources(
+        &self,
+        receiver: std::sync::mpsc::Receiver<Option<pbox_core::pve::LxcUsage>>,
+    ) {
+        self.0.borrow_mut().resources = Some(receiver);
+    }
+    pub(crate) fn refresh_resources(&self) {
+        let mut state = self.0.borrow_mut();
+        let before = resource_label(state.usage.as_ref().map(|(_, usage)| usage));
+        let sample = state.resources.as_ref().and_then(|r| r.try_iter().last());
+        if let Some(sample) = sample {
+            state.usage = sample.map(|s| (std::time::Instant::now(), s));
+        }
+        if state
+            .usage
+            .as_ref()
+            .is_some_and(|(time, _)| time.elapsed().as_secs() >= 15)
+        {
+            state.usage = None;
+        }
+        let after = resource_label(state.usage.as_ref().map(|(_, usage)| usage));
+        if before != after && state.filter.can_paint() {
+            write_view(&state.bar());
+        }
     }
     pub(crate) fn size(&self) -> (u32, u32) {
         let state = self.0.borrow();
@@ -1916,6 +1984,123 @@ impl Drop for TerminalStatus {
     }
 }
 
+struct NativeControls;
+impl vt100::Callbacks for NativeControls {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        prefix: Option<u8>,
+        _: Option<u8>,
+        params: &[&[u16]],
+        action: char,
+    ) {
+        pbox_agent_client::terminal_extension(screen, prefix, params, action);
+    }
+}
+fn write_view(bytes: &[u8]) {
+    if !bytes.is_empty() {
+        let _ = io::stdout().write_all(bytes);
+        let _ = io::stdout().flush();
+    }
+}
+fn resource_label(usage: Option<&pbox_core::pve::LxcUsage>) -> String {
+    let Some(usage) = usage else {
+        return "⚙ CPU —  🧠 RAM —  💾 DISK —".into();
+    };
+    fn percent(used: Option<u64>, total: Option<u64>) -> String {
+        match (used, total.filter(|n| *n > 0)) {
+            (Some(used), Some(total)) => format!("{:.0}%", used as f64 / total as f64 * 100.0),
+            _ => "—".into(),
+        }
+    }
+    let cpu = usage
+        .cpu
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .map(|n| format!("{:.0}%", n * 100.0))
+        .unwrap_or_else(|| "—".into());
+    format!(
+        "⚙ CPU {cpu}  🧠 RAM {}  💾 DISK {}",
+        percent(usage.mem, usage.maxmem),
+        percent(usage.disk, usage.maxdisk)
+    )
+}
+fn colour_resource_bar(bar: &str, usage: Option<&str>, enabled: bool) -> String {
+    if !enabled {
+        return bar.to_owned();
+    }
+    let style = CliStyle::from_enabled(true);
+    let (left, metrics) = usage
+        .and_then(|usage| bar.rfind(usage).map(|start| (&bar[..start], &bar[start..])))
+        .unwrap_or((bar, ""));
+    let mut result = if let Some((name, controls)) = left.split_once("  |  ") {
+        format!(
+            "{}{}",
+            style.paint(&format!("{ANSI_DIM}{ANSI_CYAN}"), name),
+            style.paint(ANSI_DIM, &format!("  |  {controls}"))
+        )
+    } else {
+        style.paint(&format!("{ANSI_DIM}{ANSI_CYAN}"), left)
+    };
+    for (i, metric) in metrics.split("  ").enumerate() {
+        if i > 0 {
+            result.push_str("  ");
+        }
+        let Some((label, value)) = metric.trim_end().rsplit_once(' ') else {
+            result.push_str(metric);
+            continue;
+        };
+        result.push_str(&style.paint(ANSI_DIM, &format!("{label} ")));
+        let percent = value.strip_suffix('%').and_then(|n| n.parse::<u32>().ok());
+        let colour = match percent {
+            Some(95..) => "\x1b[31m",
+            Some(80..) => "\x1b[33m",
+            Some(_) => "\x1b[32m",
+            None => ANSI_DIM,
+        };
+        result.push_str(&style.paint(colour, value));
+        result.push_str(&metric[metric.trim_end().len()..]);
+    }
+    result
+}
+
+fn fit_resource_bar(label: &str, suffix: &str, usage: Option<&str>, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    if let Some(usage) = usage.filter(|usage| width >= usage.width() + 40) {
+        let left = fit_view_label(label, suffix, width - usage.width() - 2);
+        format!("{left} {usage} ")
+    } else {
+        fit_view_label(label, suffix, width)
+    }
+}
+
+fn fit_view_label(label: &str, suffix: &str, width: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let suffix_width = suffix.width();
+    let room = width.saturating_sub(suffix_width + 6);
+    let mut name = String::new();
+    let mut used = 0;
+    for c in safe_terminal_text(label).chars() {
+        let cells = c.width().unwrap_or(0);
+        if used + cells > room {
+            break;
+        }
+        name.push(c);
+        used += cells;
+    }
+    let text = format!(" {name}  |  {suffix}");
+    let mut output = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let cells = c.width().unwrap_or(0);
+        if used + cells > width {
+            break;
+        }
+        output.push(c);
+        used += cells;
+    }
+    output.push_str(&" ".repeat(width - used));
+    output
+}
 #[derive(Default)]
 struct ViewportFilter {
     state: u8, // ground, escape, CSI, string, string escape, escape intermediate
@@ -2122,6 +2307,11 @@ pub(crate) struct SessionViewer {
     previous_size: (u32, u32),
 }
 impl SessionViewer {
+    pub(crate) fn monitor_resources(&self, config: super::Config, id: String) {
+        if let Some(status) = &self.status {
+            status.monitor_resources(super::sessions::resource_monitor(config, id));
+        }
+    }
     pub(crate) fn new(box_name: &str, session: &str) -> Self {
         let status = TerminalStatus::enter(box_name, session, true);
         if status.is_none() {
@@ -2135,6 +2325,9 @@ impl SessionViewer {
         }
     }
     pub(crate) fn render(&mut self, text: &str) {
+        if let Some(status) = &self.status {
+            status.refresh_resources();
+        }
         use unicode_width::UnicodeWidthChar;
         let size = super::terminal_size();
         if size != self.previous_size
@@ -2207,16 +2400,92 @@ impl SessionViewer {
 mod viewport_tests {
     use super::*;
     fn state() -> StatusState {
-        let mut parser = vt100::Parser::new(6, 40, 0);
+        let mut parser = vt100::Parser::new_with_callbacks(6, 40, 0, NativeControls);
         parser.process(b"\x1b[1;5r\x1b[5;1H");
         StatusState {
             parser,
             filter: ViewportFilter::default(),
             rows: 6,
             cols: 40,
-            label: "work:main | Ctrl+] detach".into(),
+            label: "work:main".into(),
+            read_only: false,
+            colour: true,
+            resources: None,
+            usage: None,
             finished: false,
         }
+    }
+    #[test]
+    fn bar_colours_keep_the_background_and_plain_layout() {
+        let usage = "⚙ CPU 12%  🧠 RAM 85%  💾 DISK 96%";
+        let plain = fit_resource_bar("work:main", "Ctrl+] detach", Some(usage), 120);
+        let coloured = colour_resource_bar(&plain, Some(usage), true);
+        let mut terminal = vt100::Parser::new(2, 120, 0);
+        terminal.process(coloured.as_bytes());
+        assert_eq!(terminal.screen().rows(0, 120).next().unwrap(), plain);
+        assert_eq!(
+            terminal.screen().cell(0, 1).unwrap().fgcolor(),
+            vt100::Color::Idx(6)
+        );
+        for col in 0..120 {
+            let cell = terminal.screen().cell(0, col).unwrap();
+            assert_eq!(cell.bgcolor(), vt100::Color::Default);
+            assert!(!cell.inverse());
+        }
+        assert_eq!(colour_resource_bar(&plain, Some(usage), false), plain);
+        assert!(coloured.contains("\x1b[33m85%"));
+        assert!(coloured.contains("\x1b[31m96%"));
+    }
+    #[test]
+    fn resource_bar_is_bounded_and_missing_values_are_not_zero() {
+        use unicode_width::UnicodeWidthStr;
+        let usage = pbox_core::pve::LxcUsage {
+            cpu: Some(0.125),
+            mem: Some(250),
+            maxmem: Some(1000),
+            disk: Some(5),
+            maxdisk: Some(0),
+        };
+        assert_eq!(
+            resource_label(Some(&usage)),
+            "⚙ CPU 12%  🧠 RAM 25%  💾 DISK —"
+        );
+        let bar = fit_resource_bar(
+            "pbox-test:viewer-1234567890",
+            "Ctrl+] detach",
+            Some("⚙ CPU 12%  🧠 RAM 25%  💾 DISK —"),
+            100,
+        );
+        assert!(bar.contains("pbox-test:viewer-1234567890"));
+        assert!(bar.contains("Ctrl+] detach"));
+        for width in [8, 40, 80, 120] {
+            let bar = fit_resource_bar(
+                "box:main",
+                "Ctrl+] detach",
+                Some("⚙ CPU 12%  🧠 RAM 25%  💾 DISK —"),
+                width,
+            );
+            assert_eq!(bar.width(), width);
+            if width >= 40 {
+                assert!(bar.contains("Ctrl+] detach"));
+            }
+            if width >= 80 {
+                assert!(bar.contains("CPU 12%"));
+            }
+        }
+    }
+    #[test]
+    fn native_screen_mouse_and_cursor_controls_pass_through() {
+        let mut state = state();
+        let input = b"\x1b[?1000h\x1b[?1006h\x1b[6 q\x1b[?12l\x1b[?25l\x1b[6n";
+        let output = state.output(input);
+        assert!(output.starts_with(input));
+        assert!(!output.windows(8).any(|part| part == b"\x1b[?1049h"));
+        let output = state.output(b"plain output");
+        assert!(output.starts_with(b"plain output"));
+        assert!(!output.windows(5).any(|part| part == b"\x1b[?25"));
+        assert!(!output.windows(8).any(|part| part == b"\x1b[?1000h"));
+        assert!(state.parser.screen().hide_cursor());
     }
     #[test]
     fn reserved_row_survives_scrolling_and_guest_margin_resets() {

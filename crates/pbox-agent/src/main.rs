@@ -264,6 +264,18 @@ impl Agent for AgentService {
         Pin<Box<dyn tokio_stream::Stream<Item = Result<ForwardEvent, Status>> + Send>>;
 
     async fn info(&self, _request: Request<InfoRequest>) -> Result<Response<InfoResponse>, Status> {
+        let terminal_capabilities = if let Some(host) = &self.terminal_host {
+            host.clone()
+                .info(InfoRequest {})
+                .await?
+                .into_inner()
+                .capabilities
+        } else {
+            vec![
+                "terminal-history".to_owned(),
+                "terminal-processes".to_owned(),
+            ]
+        };
         Ok(Response::new(InfoResponse {
             protocol_version: PROTOCOL,
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -281,6 +293,22 @@ impl Agent for AgentService {
                 "forward".to_owned(),
             ]
             .into_iter()
+            .chain(
+                ["terminal-history", "terminal-processes"]
+                    .into_iter()
+                    .filter(|cap| {
+                        terminal_capabilities
+                            .iter()
+                            .any(|available| available == cap)
+                    })
+                    .map(str::to_owned),
+            )
+            .chain(
+                (self.terminal_host.is_some()
+                    && Path::new("/run/systemd/system").is_dir()
+                    && std::env::var_os("PBOX_TERMINAL_SOCKET").is_none())
+                .then(|| "terminal-owner-refresh".to_owned()),
+            )
             .chain(
                 self.terminal_host
                     .is_some()
@@ -397,7 +425,9 @@ impl Agent for AgentService {
         }
         let request = request.into_inner();
         sessions::check_protocol(request.protocol_version)?;
-        Ok(Response::new(self.sessions.read(&request.name)?))
+        Ok(Response::new(
+            self.sessions.read(&request.name, request.include_history)?,
+        ))
     }
 
     async fn send_session(
@@ -748,7 +778,7 @@ async fn run_command(
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     if request.allocate_pty {
-        run_pty_command(request, requests, sender, None).await;
+        run_pty_command(request, requests, sender, None, None).await;
     } else {
         run_piped_command(request, requests, sender).await;
     }
@@ -847,6 +877,7 @@ async fn run_pty_command(
     requests: impl Stream<Item = Result<ExecRequest, Status>> + Unpin + Send + 'static,
     sender: mpsc::Sender<Result<ExecEvent, Status>>,
     mut started: Option<tokio::sync::oneshot::Sender<Result<(), Status>>>,
+    session_pid: Option<Arc<std::sync::atomic::AtomicU32>>,
 ) {
     let deadline = request
         .session_name
@@ -945,6 +976,12 @@ async fn run_pty_command(
             return;
         }
     };
+    if let Some(pid) = session_pid {
+        pid.store(
+            child.id().unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     drop(command);
     if let Some(started) = started.take() {
         let _ = started.send(Ok(()));
@@ -2343,6 +2380,20 @@ mod tests {
                 .is_err()
         );
         drop(attached);
+        client
+            .send_session(
+                "control",
+                "i=0; while [ $i -lt 500 ]; do printf 'history-%s\\n' \"$i\"; i=$((i+1)); done"
+                    .into(),
+                vec!["Enter".into()],
+            )
+            .await
+            .unwrap();
+        screen(&mut client, "history-499").await;
+        let history = client.read_session_history("control").await.unwrap();
+        assert!(history.history_supported);
+        assert!(history.history.iter().any(|line| line == "history-0"));
+        assert!(!history.text.contains("history-0"));
         client.close_session("control").await.unwrap();
         assert!(client.read_session("control").await.is_err());
         assert!(

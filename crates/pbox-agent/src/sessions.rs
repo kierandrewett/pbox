@@ -15,6 +15,7 @@ type SessionWorker = (
 
 struct Session {
     input: mpsc::Sender<Result<ExecRequest, Status>>,
+    pid: Arc<std::sync::atomic::AtomicU32>,
     state: Mutex<State>,
     close: Notify,
     finished: watch::Sender<bool>,
@@ -72,6 +73,10 @@ impl Sessions {
                     .output
                     .as_ref()
                     .is_some_and(|output| !output.is_closed());
+                describe_processes(
+                    &mut info,
+                    session.pid.load(std::sync::atomic::Ordering::Relaxed),
+                );
                 info
             })
             .collect()
@@ -131,6 +136,7 @@ impl Sessions {
             let (input, receiver) = mpsc::channel(32);
             let session = Arc::new(Session {
                 input,
+                pid: Arc::default(),
                 state: Mutex::new(State {
                     info: TerminalSession {
                         name: first.session_name.clone(),
@@ -144,11 +150,12 @@ impl Sessions {
                             .as_secs(),
                         rows: rows.into(),
                         cols: cols.into(),
+                        ..Default::default()
                     },
                     screen: vt100::Parser::new_with_callbacks(
                         rows,
                         cols,
-                        200,
+                        pbox_agent_client::HISTORY_LINES,
                         TerminalModes::default(),
                     ),
                     generation: 0,
@@ -200,6 +207,7 @@ impl Sessions {
     pub(super) fn read(
         &self,
         name: &str,
+        include_history: bool,
     ) -> Result<pbox_proto::agent::ReadSessionResponse, Status> {
         let session = self.get(name)?;
         let state = session.state.lock().unwrap();
@@ -214,6 +222,12 @@ impl Sessions {
             text: state.screen.screen().contents(),
             cursor_row: row.into(),
             cursor_col: col.into(),
+            history: if include_history {
+                pbox_agent_client::terminal_history(state.screen.screen())
+            } else {
+                Vec::new()
+            },
+            history_supported: true,
         })
     }
 
@@ -260,10 +274,8 @@ impl Sessions {
             // can be lost or replayed twice between the redraw and live delivery.
             state.screen.screen_mut().set_size(rows, cols);
             if !created {
-                let screen = redraw(&state.screen);
-                let _ = output.try_send(Ok(ExecEvent {
-                    event: Some(exec_event::Event::Stdout(screen)),
-                }));
+                let event = exec_event::Event::Stdout(redraw(&state.screen));
+                let _ = output.try_send(Ok(ExecEvent { event: Some(event) }));
             }
             state.output = Some(output.clone());
             state.info.rows = rows.into();
@@ -375,6 +387,7 @@ async fn own_session(
         ReceiverStream::new(input),
         sender,
         started,
+        Some(session.pid.clone()),
     ));
     // The PTY input timeout is a transport safeguard. Its owner stays alive while
     // detached, without waking for every attachment or depending on a client ping.
@@ -434,6 +447,8 @@ struct TerminalModes {
     stack: Vec<u16>,
     modify_keys: u16,
     focus: bool,
+    cursor_style: Option<u16>,
+    cursor_blink: Option<bool>,
 }
 impl vt100::Callbacks for TerminalModes {
     fn unhandled_csi(
@@ -444,6 +459,9 @@ impl vt100::Callbacks for TerminalModes {
         params: &[&[u16]],
         command: char,
     ) {
+        if pbox_agent_client::terminal_extension(screen, i1, params, command) {
+            return;
+        }
         let value = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
         let second = params.get(1).and_then(|p| p.first()).copied().unwrap_or(1);
         if self.headless {
@@ -463,6 +481,9 @@ impl vt100::Callbacks for TerminalModes {
             }
         }
         match (i1, command) {
+            (Some(b' '), 'q') if value <= 6 => self.cursor_style = Some(value),
+            (Some(b'?'), 'h') if value == 12 => self.cursor_blink = Some(true),
+            (Some(b'?'), 'l') if value == 12 => self.cursor_blink = Some(false),
             (Some(b'>'), 'u') => {
                 if self.stack.len() == 16 {
                     self.stack.remove(0);
@@ -659,7 +680,18 @@ fn redraw(parser: &vt100::Parser<TerminalModes>) -> Vec<u8> {
     } else {
         pbox_agent_client::append_terminal_screen(screen)
     };
-    let modes = parser.callbacks();
+    result.extend(restore_modes(parser.callbacks()));
+    result
+}
+
+fn restore_modes(modes: &TerminalModes) -> Vec<u8> {
+    let mut result = Vec::new();
+    if let Some(style) = modes.cursor_style {
+        result.extend(format!("\x1b[{style} q").bytes());
+    }
+    if let Some(blink) = modes.cursor_blink {
+        result.extend(format!("\x1b[?12{}", if blink { 'h' } else { 'l' }).bytes());
+    }
     result.extend_from_slice(b"\x1b[<16u");
     if let Some(initial) = modes.stack.first() {
         result.extend(format!("\x1b[={initial}u").bytes());
@@ -683,6 +715,68 @@ fn redraw(parser: &vt100::Parser<TerminalModes>) -> Vec<u8> {
         .bytes(),
     );
     result
+}
+
+// /proc is sampled only on inspection, never on the PTY output path. Session
+// membership avoids confusing other shells owned by the same guest user.
+fn describe_processes(info: &mut TerminalSession, pid: u32) {
+    info.pid = pid;
+    if pid == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(process_pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some((name, fields)) = stat
+            .split_once('(')
+            .and_then(|(_, rest)| rest.rsplit_once(") "))
+        else {
+            continue;
+        };
+        let fields: Vec<_> = fields.split_whitespace().collect();
+        if fields.len() < 6 || fields[3].parse::<u32>().ok() != Some(pid) {
+            continue;
+        }
+        let foreground = fields[2] == fields[5];
+        info.processes.push(pbox_proto::agent::SessionProcess {
+            pid: process_pid,
+            parent_pid: fields[1].parse().unwrap_or(0),
+            name: name.to_owned(),
+            foreground,
+        });
+    }
+    info.processes.sort_by_key(|p| p.pid);
+    // Prefer the deepest foreground descendant (e.g. the binary underneath a
+    // launcher). All members remain available in JSON for pipelines and trees.
+    let selected = info
+        .processes
+        .iter()
+        .filter(|p| p.foreground)
+        .max_by_key(|p| {
+            let mut depth = 0;
+            let mut parent = p.parent_pid;
+            for _ in 0..info.processes.len() {
+                let Some(ancestor) = info.processes.iter().find(|p| p.pid == parent) else {
+                    break;
+                };
+                depth += 1;
+                parent = ancestor.parent_pid;
+            }
+            (depth, p.pid)
+        });
+    if let Some(process) = selected {
+        info.foreground_pid = process.pid;
+        info.current_cwd = std::fs::read_link(format!("/proc/{}/cwd", process.pid))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+    }
 }
 
 #[cfg(test)]

@@ -245,6 +245,19 @@ impl PveClient {
         })
     }
 
+    /// A bounded, read-only sample for interactive terminal status bars.
+    pub fn lxc_usage(&self, node: &str, vmid: u64) -> Result<LxcUsage, PveError> {
+        let response = self
+            .request(
+                Method::GET,
+                &format!("/nodes/{node}/lxc/{vmid}/status/current"),
+            )
+            .timeout(Duration::from_secs(3))
+            .send()
+            .map_err(PveError::Request)?;
+        decode_response(response)
+    }
+
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
         self.http
             .request(method, format!("{}{}", self.base_url, path))
@@ -742,6 +755,15 @@ pub struct PveStorageContent {
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
+#[derive(Debug, Default, Deserialize)]
+pub struct LxcUsage {
+    pub cpu: Option<f64>,
+    pub mem: Option<u64>,
+    pub maxmem: Option<u64>,
+    pub disk: Option<u64>,
+    pub maxdisk: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 
 pub struct ClusterResource {

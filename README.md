@@ -198,8 +198,14 @@ results where supported.
 
 `pbox ssh BOX` opens your `main` shell. If the connection drops, run it again
 and carry on where you left off. **Ctrl-]** detaches; `exit` ends the shell.
-The bottom row shows the session and detach key. The guest gets the remaining
-rows, so the status line does not cover application output.
+The bottom row shows the session, detach key and **⚙ CPU, 🧠 RAM and 💾 DISK**
+usage on wider terminals. Readings come from Proxmox every five seconds;
+amber means at least 80%, red at least 95%, and `—` means unavailable.
+
+Scrolling, mouse input and cursor settings belong to your terminal and the
+application. pbox does not capture the wheel, add scroll shortcuts or enter its
+own alternate screen. The status row scrolls out of view with native scrollback.
+The guest gets the remaining rows, so the bar does not cover application output.
 
 Use `--read-only` to watch without sending input, resizing the guest, or taking
 over another connection. **Ctrl+C** exits the viewer and leaves the session running.
@@ -209,9 +215,15 @@ over another connection. **Ctrl+C** exits the viewer and leaves the session runn
 | Open a separate terminal | `pbox ssh BOX:build` |
 | Watch without taking control | `pbox attach BOX:build --read-only` |
 | Update the guest agent | `pbox agent update BOX` |
-| List terminals across all boxes | `pbox session list` |
+| List terminals and foreground programs across all boxes | `pbox session list` |
 | List terminals in one box | `pbox session list BOX` |
+| Read the screen and retained history | `pbox session read BOX:build --history` |
 | End a terminal and its processes | `pbox session close BOX:build` |
+
+The list shows the current directory and foreground process chain, such as
+`codex [1234] · bash`. `pbox --json session list` also includes process IDs and
+parent IDs. Older terminal supervisors show only the original command until they
+can update without ending existing sessions.
 
 A separate terminal supervisor keeps shells and programs running during agent
 updates; tmux is not required. Reconnect with `pbox attach BOX:build` after an

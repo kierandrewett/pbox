@@ -111,14 +111,14 @@ pub(super) async fn prepare(
         }
     };
     let (mut expected, path) = binary;
-    if connection.info.agent_digest == expected {
+    if agent_is_current(&mut connection, &expected).await? {
         return Ok(connection);
     }
     // Serialize automatic updates from harnesses on this control machine. Reconnect
     // under the lock: another process may already have replaced the remote agent.
     let _lock = update_lock(box_id).await?;
     (connection.client, connection.info) = raw_connect(config, box_id, endpoint).await?;
-    if connection.info.agent_digest == expected {
+    if agent_is_current(&mut connection, &expected).await? {
         return Ok(connection);
     }
     if connection
@@ -234,6 +234,24 @@ pub(super) async fn prepare(
     (connection.client, connection.info) = refreshed;
     connection.outcome = Outcome::Updated;
     Ok(connection)
+}
+
+async fn agent_is_current(connection: &mut Connection, expected: &str) -> Result<bool> {
+    if connection.info.agent_digest != expected {
+        return Ok(false);
+    }
+    let caps = &connection.info.capabilities;
+    if connection.info.agent_version == env!("CARGO_PKG_VERSION")
+        && caps.iter().any(|cap| cap == "terminal-owner-refresh")
+        && ["terminal-history", "terminal-processes"]
+            .iter()
+            .any(|required| !caps.iter().any(|cap| cap == required))
+    {
+        // Restart only the network agent. Startup refreshes the old terminal
+        // supervisor if it is still idle, checking again after connections stop.
+        return Ok(!connection.client.list_sessions().await?.is_empty());
+    }
+    Ok(true)
 }
 
 async fn update_lock(box_id: &str) -> Result<fs::File> {

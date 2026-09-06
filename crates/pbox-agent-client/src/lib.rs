@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
-pub use terminal::append_terminal_screen;
+pub use terminal::{HISTORY_LINES, append_terminal_screen, terminal_extension, terminal_history};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -360,11 +360,27 @@ impl AgentClient {
         &mut self,
         name: impl Into<String>,
     ) -> Result<pbox_proto::agent::ReadSessionResponse, AgentClientError> {
+        self.read_session_snapshot(name.into(), false).await
+    }
+
+    pub async fn read_session_history(
+        &mut self,
+        name: impl Into<String>,
+    ) -> Result<pbox_proto::agent::ReadSessionResponse, AgentClientError> {
+        self.read_session_snapshot(name.into(), true).await
+    }
+
+    async fn read_session_snapshot(
+        &mut self,
+        name: String,
+        include_history: bool,
+    ) -> Result<pbox_proto::agent::ReadSessionResponse, AgentClientError> {
         Ok(self
             .inner
             .read_session(pbox_proto::agent::SessionRequest {
                 protocol_version: PROTOCOL_VERSION,
-                name: name.into(),
+                name,
+                include_history,
             })
             .await?
             .into_inner())

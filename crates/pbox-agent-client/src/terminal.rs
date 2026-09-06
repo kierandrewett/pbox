@@ -1,4 +1,60 @@
 //! Terminal snapshot encoding; deliberately avoids clearing the normal screen.
+pub const HISTORY_LINES: usize = 10_000;
+
+/// Equivalent screen controls missing from vt100's built-in CSI handling.
+pub fn terminal_extension(
+    screen: &mut vt100::Screen,
+    prefix: Option<u8>,
+    params: &[&[u16]],
+    action: char,
+) -> bool {
+    let sequence: &[u8] = match (prefix, params, action) {
+        (None, [], 's') | (None, [[0]], 's') | (Some(b'?'), [[1048]], 'h') => b"\x1b7",
+        (None, [], 'u') | (None, [[0]], 'u') | (Some(b'?'), [[1048]], 'l') => b"\x1b8",
+        (Some(b'?'), [[1047]], 'h') => b"\x1b[?47h\x1b[2J",
+        (Some(b'?'), [[1047]], 'l') => b"\x1b[?47l",
+        _ => return false,
+    };
+    let (rows, cols) = screen.size();
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    *parser.screen_mut() = screen.clone();
+    parser.process(sequence);
+    *screen = parser.screen().clone();
+    true
+}
+
+/// Read normal-screen history even while an application uses the alternate grid.
+/// Responses are bounded below gRPC's default message limit.
+pub fn terminal_history(screen: &vt100::Screen) -> Vec<String> {
+    let (rows, cols) = screen.size();
+    let mut copy = vt100::Parser::new(rows, cols, 0);
+    *copy.screen_mut() = screen.clone();
+    if screen.alternate_screen() {
+        copy.process(b"\x1b[?1049l");
+    }
+    copy.screen_mut().set_scrollback(usize::MAX);
+    let count = copy.screen().scrollback();
+    let mut lines = Vec::new();
+    let mut remaining = count;
+    while remaining > 0 {
+        copy.screen_mut().set_scrollback(remaining);
+        let take = remaining.min(usize::from(rows));
+        lines.extend(copy.screen().rows(0, cols).take(take));
+        remaining -= take;
+    }
+    let mut bytes = 0;
+    let keep = lines
+        .iter()
+        .rev()
+        .take_while(|line| {
+            bytes += line.len() + 8;
+            bytes <= 1024 * 1024
+        })
+        .count();
+    lines.drain(..lines.len() - keep);
+    lines
+}
+
 pub fn append_terminal_screen(screen: &vt100::Screen) -> Vec<u8> {
     let (_, cols) = screen.size();
     // Shell reattachment is appended at the current local cursor. The
@@ -39,4 +95,22 @@ pub fn append_terminal_screen(screen: &vt100::Screen) -> Vec<u8> {
         b"\x1b[?25h"
     });
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn history_is_bounded_and_remains_available_inside_an_alternate_app() {
+        let mut parser = vt100::Parser::new(5, 30, HISTORY_LINES);
+        for n in 0..10_050 {
+            parser.process(format!("history-{n}\r\n").as_bytes());
+        }
+        let history = terminal_history(parser.screen());
+        assert_eq!(history.len(), HISTORY_LINES);
+        assert_eq!(history.first().unwrap(), "history-46");
+        assert_eq!(history.last().unwrap(), "history-10045");
+        parser.process(b"\x1b[?1049h\x1b[Heditor");
+        assert_eq!(terminal_history(parser.screen()), history);
+    }
 }
