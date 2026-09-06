@@ -130,3 +130,11 @@ Interactive sessions default to `TERM=xterm-256color`; image preparation install
 its base terminfo entries. Use `pbox ssh BOX_ID --env TERM=...` to override it.
 The CLI forwards `COLORTERM=truecolor` or `24bit` when advertised by the local
 terminal. These defaults apply to PTYs, not ordinary `pbox exec` commands.
+
+### Local image compatibility tests
+
+Run `just test-images` to prepare the distro matrix in local Docker and exercise
+agent access, terminal support, preset policy and compatibility failures. Tests
+use ordinary containers and clean up their containers and newly downloaded images.
+See [image compatibility and testing](docs/image-compatibility.md) for prerequisites,
+coverage, individual image selection and interrupted-run cleanup.

@@ -1,0 +1,10 @@
+[
+  {"name":"debian", "image":"docker.io/library/debian:13", "ostype":"debian"},
+  {"name":"ubuntu", "image":"docker.io/library/ubuntu:24.04", "ostype":"ubuntu"},
+  {"name":"fedora", "image":"docker.io/library/fedora:44", "ostype":"fedora"},
+  {"name":"arch", "image":"docker.io/library/archlinux:base", "ostype":"archlinux"},
+  {"name":"cachyos", "image":"docker.io/cachyos/cachyos:latest", "ostype":"archlinux"},
+  {"name":"rocky", "image":"docker.io/rockylinux/rockylinux:10", "ostype":"centos"},
+  {"name":"opensuse", "image":"docker.io/opensuse/tumbleweed:latest", "ostype":"opensuse"},
+  {"name":"alpine", "image":"docker.io/library/alpine:latest", "reject":"Alpine uses musl and OpenRC"}
+]

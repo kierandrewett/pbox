@@ -7,3 +7,7 @@
 banks/
 beads-backup/
 .DS_Store
+
+/test-results/
+
+__pycache__/
