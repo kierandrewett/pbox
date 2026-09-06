@@ -447,6 +447,8 @@ mod tests {
             fs::read_to_string(directory.join("etc/systemd/system/pbox-agent.service")).unwrap();
         assert!(unit.contains("--relay-config /etc/pbox/relay.json"));
         assert!(unit.contains("--listen 127.0.0.1:7443"));
+        let relay_script = include_str!("guest-scripts/relay.sh");
+        assert!(relay_script.contains("systemd-networkd.service"));
         // Fedora applies a disable-all preset on first boot. Exercise systemd's
         // real preset resolution against the generated guest filesystem.
         let presets = directory.join("usr/lib/systemd/system-preset");
