@@ -414,7 +414,25 @@ pub fn build_local_oci_archive(
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow::anyhow!("local OCI workspace has no valid container name"))?
             .to_owned();
-        let preparation = preparation_script(payload.is_some());
+        let preparation = if payload.is_some() {
+            include_str!("guest-scripts/workspace.sh").to_owned()
+        } else {
+            preparation_script(false)
+        };
+        if let Some(payload) = payload {
+            let inspected = Command::new("podman")
+                .args(["image", "inspect", "--format", "{{json .Config}}", &image])
+                .output()?;
+            anyhow::ensure!(
+                inspected.status.success(),
+                "cannot inspect OCI image configuration"
+            );
+            let metadata: serde_json::Value = serde_json::from_slice(&inspected.stdout)?;
+            fs::write(
+                payload.join("etc/pbox/image.json"),
+                serde_json::to_vec(&metadata)?,
+            )?;
+        }
         run_local_command(
             "podman",
             &[
@@ -456,7 +474,7 @@ pub fn build_local_oci_archive(
             run_local_command_streaming(
                 "podman",
                 &["start", "--attach", container.as_str()],
-                "Installing guest prerequisites (systemd, OpenSSH, sudo, Python)",
+                "Preparing workspace networking and checking the agent",
             ).with_context(|| format!("image {image} could not be prepared; no PVE box has been created. Fix the reported prerequisite in your Dockerfile and rebuild the image. Use --verbose to retain preparation logs"))?;
             let manifest = workspace.join("ostype");
             run_local_command(
@@ -472,7 +490,13 @@ pub fn build_local_oci_archive(
             anyhow::ensure!(
                 matches!(
                     ostype.as_str(),
-                    "debian" | "ubuntu" | "fedora" | "centos" | "archlinux" | "opensuse"
+                    "debian"
+                        | "ubuntu"
+                        | "fedora"
+                        | "centos"
+                        | "archlinux"
+                        | "opensuse"
+                        | "unmanaged"
                 ),
                 "invalid image OS type"
             );
@@ -945,7 +969,12 @@ mod tests {
         super::super::relay::write_payload(&directory.join("payload"), &config, "pbx_test1234")
             .unwrap();
         pbox_core::config::save_file(&directory.join("config.toml"), &config).unwrap();
-        fs::write(directory.join("prepare.sh"), preparation_script(true)).unwrap();
+        let prepare = if std::env::var("PBOX_TEST_WORKSPACE").is_ok_and(|v| v == "1") {
+            include_str!("guest-scripts/workspace.sh").to_owned()
+        } else {
+            preparation_script(true)
+        };
+        fs::write(directory.join("prepare.sh"), prepare).unwrap();
         fs::write(directory.join("preflight.sh"), IMAGE_PREFLIGHT).unwrap();
         fs::write(directory.join("user.sh"), super::super::guest::USER_SETUP).unwrap();
     }

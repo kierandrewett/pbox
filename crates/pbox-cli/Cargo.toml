@@ -1,24 +1,29 @@
 [package]
-name = "pbox-cli"
+name = "pbox"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Disposable Proxmox LXC workspaces for development"
+repository = "https://github.com/kierandrewett/pbox"
+readme = "../../README.md"
+keywords = ["proxmox", "lxc", "workspace", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "pbox"
 path = "src/main.rs"
 
 [dependencies]
-pbox-relay = { path = "../pbox-relay" }
+pbox-relay = { version = "0.1.0", path = "../pbox-relay" }
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 dirs.workspace = true
-pbox-agent-client = { path = "../pbox-agent-client" }
-pbox-core = { path = "../pbox-core" }
-pbox-crypto = { path = "../pbox-crypto" }
+pbox-agent-client = { version = "0.1.0", path = "../pbox-agent-client" }
+pbox-core = { version = "0.1.0", path = "../pbox-core" }
+pbox-crypto = { version = "0.1.0", path = "../pbox-crypto" }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

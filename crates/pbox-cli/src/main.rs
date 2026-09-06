@@ -2,15 +2,17 @@
 mod ansible;
 mod bootstrap;
 mod completions;
+mod desktop;
 mod guest;
 mod images;
+mod inventory;
 mod progress;
 mod snapshots;
 mod ui;
 use ui::*;
 mod recipes;
 mod relay;
-use ansible::{AnsibleRun, apply_recipe};
+use ansible::AnsibleRun;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use bootstrap::{
@@ -38,15 +40,15 @@ use pbox_crypto::{
 };
 use recipes::{RecipeCatalog, RecipeRepository};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::net::Ipv4Addr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -69,7 +71,7 @@ const SSH_POST_EXIT_TIMEOUT: Duration = Duration::from_secs(1);
     arg_required_else_help = true
 )]
 struct Cli {
-    /// Show image preparation and provisioning details.
+    /// Show detailed provisioning and Ansible output.
     #[arg(short, long, global = true)]
     verbose: bool,
     #[arg(long, global = true, value_enum, default_value_t = ColorChoice::Auto)]
@@ -100,6 +102,8 @@ enum ColorChoice {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Update pbox to the latest published version.
+    Update,
     /// Generate a shell completion script (no PVE connection required).
     Completions {
         #[arg(value_enum)]
@@ -126,6 +130,8 @@ enum Command {
     Scp(ScpCommand),
     /// Forward a local TCP port to a pbox guest.
     Forward(ForwardCommand),
+    /// Open the installed desktop through an authenticated VNC tunnel.
+    Desktop(desktop::DesktopCommand),
     /// Discover and apply Ansible recipes.
     Recipe(RecipeCommand),
     /// Manage independent saved environments stored as PVE templates.
@@ -162,12 +168,6 @@ enum Command {
     /// Internal local state daemon.
     #[command(hide = true)]
     Daemon,
-}
-
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
-struct DaemonStatus {
-    state: String,
-    ping: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -273,11 +273,11 @@ struct SshCommand {
     /// Agent endpoint override. By default pbox resolves the guest address from PVE.
     #[arg(long)]
     endpoint: Option<String>,
-    /// Working directory for the shell.
-    #[arg(long, default_value = "/home/pbox")]
+    /// Working directory for the shell; defaults to the image working directory.
+    #[arg(long, default_value = "", hide_default_value = true)]
     cwd: String,
-    /// Guest user for the shell.
-    #[arg(long, default_value = "pbox")]
+    /// Guest user for the shell; defaults to the image user.
+    #[arg(long, default_value = "", hide_default_value = true)]
     user: String,
     /// Environment entry in KEY=VALUE form. May be repeated.
     #[arg(long = "env", value_name = "KEY=VALUE")]
@@ -293,11 +293,11 @@ struct ExecCommand {
     /// Agent endpoint override. By default pbox resolves the guest address from PVE.
     #[arg(long)]
     endpoint: Option<String>,
-    /// Working directory for the command.
-    #[arg(long, default_value = "/home/pbox")]
+    /// Working directory for the command; defaults to the image working directory.
+    #[arg(long, default_value = "", hide_default_value = true)]
     cwd: String,
-    /// Guest user for the command.
-    #[arg(long, default_value = "pbox")]
+    /// Guest user for the command; defaults to the image user.
+    #[arg(long, default_value = "", hide_default_value = true)]
     user: String,
     /// Environment entry in KEY=VALUE form. May be repeated.
     #[arg(long = "env", value_name = "KEY=VALUE")]
@@ -354,8 +354,9 @@ enum RecipeSubcommand {
     /// Recipe repositories are trusted controller-side code. They can run
     /// Ansible local actions and use controller file-transfer operations.
     Apply {
-        /// Recipe identifier from `pbox recipe list`.
-        recipe: String,
+        /// Recipe identifiers from `pbox recipe list`, applied in order.
+        #[arg(required = true, num_args = 1..)]
+        recipe: Vec<String>,
         /// Box ID, unique name, or current when exactly one box exists.
         #[arg(long)]
         box_id: String,
@@ -438,8 +439,10 @@ struct SetupOutput {
 struct IdOutput {
     id: PboxId,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 struct BoxRecord {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
     id: PboxId,
     vmid: u64,
     state: String,
@@ -514,10 +517,14 @@ fn main() {
         Ok(RunOutcome::Success) => {}
         Ok(RunOutcome::Exit(code)) => std::process::exit(code),
         Err(error) => {
-            if let Some(failure) = error.downcast_ref::<images::ImagePreparationFailure>() {
+            if let Some(failure) = error.downcast_ref::<ansible::AnsibleFailure>() {
+                ui::recipe_failure(&failure.reason, &failure.log_path);
+            } else if let Some(failure) = error.downcast_ref::<desktop::MissingDesktop>() {
+                ui::desktop_install_help(&failure.box_id);
+            } else if let Some(failure) = error.downcast_ref::<images::ImagePreparationFailure>() {
                 ui::image_preparation_error(&failure.image, &error.root_cause().to_string());
             } else {
-                let message = safe_terminal_text(&format!("{error:#}"));
+                let message = ui::concise_error(&error);
                 ui::stderr().error(&message);
             }
             if let Some(failure) = error.downcast_ref::<relay::AgentStartupFailure>() {
@@ -540,12 +547,17 @@ fn run() -> Result<RunOutcome> {
     if !daemon_command
         && !matches!(
             &cli.command,
-            Command::Completions { .. } | Command::Id | Command::Config(_) | Command::Setup(_)
+            Command::Update
+                | Command::Completions { .. }
+                | Command::Id
+                | Command::Config(_)
+                | Command::Setup(_)
         )
     {
-        ensure_pboxd(store.path());
+        inventory::ensure_daemon(store.path());
     }
     match cli.command {
+        Command::Update => run_update().map(|_| RunOutcome::Success),
         Command::Completions { shell } => ui::completions(shell).map(|_| RunOutcome::Success),
         Command::Id => print_value(
             &IdOutput {
@@ -572,6 +584,9 @@ fn run() -> Result<RunOutcome> {
         }
         Command::Ssh(command) => run_ssh(&store, command, cli.json),
         Command::Exec(command) => run_exec(&store, command, cli.json),
+        Command::Desktop(command) => {
+            desktop::run(&store, command, cli.json).map(|_| RunOutcome::Success)
+        }
         Command::Scp(command) => {
             run_scp(&store, command, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
@@ -600,8 +615,31 @@ fn run() -> Result<RunOutcome> {
         Command::Delete { id, yes, wait } => {
             run_delete(&store, &id, yes, wait, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
-        Command::Daemon => run_pboxd(store.path()),
+        Command::Daemon => inventory::run_daemon(store.path()),
     }
+}
+
+fn run_update() -> Result<()> {
+    let binstall_available = ProcessCommand::new("cargo")
+        .args(["binstall", "--version"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    let args = if binstall_available {
+        vec!["binstall", "pbox", "--force"]
+    } else {
+        vec!["install", "pbox", "--locked", "--force"]
+    };
+    let command = format!("cargo {}", args.join(" "));
+    ui::stderr().command_stderr(&command);
+    let status = ProcessCommand::new("cargo")
+        .args(&args)
+        .status()
+        .with_context(|| format!("run {command}"))?;
+    if !status.success() {
+        bail!("{command} failed");
+    }
+    ui::stderr().success("pbox updated");
+    Ok(())
 }
 
 fn run_config(command: ConfigSubcommand, store: &ConfigStore, json: bool) -> Result<()> {
@@ -1696,11 +1734,16 @@ fn run_recipe(
                 } else {
                     None
                 })?;
-            let selected = catalog
-                .recipes
+            let selected: Vec<&recipes::Recipe> = recipe
                 .iter()
-                .find(|candidate| candidate.id == recipe)
-                .ok_or_else(|| anyhow!("recipe not found: {recipe}"))?;
+                .map(|recipe| {
+                    catalog
+                        .recipes
+                        .iter()
+                        .find(|candidate| candidate.id == *recipe)
+                        .ok_or_else(|| anyhow!("recipe not found: {recipe}"))
+                })
+                .collect::<Result<_>>()?;
             let client = client_from_config(&config)?;
             let record = find_box(&client, &box_id)?;
             let box_id = record.id.to_string();
@@ -1714,7 +1757,7 @@ fn run_recipe(
             }
             let binary = std::env::current_exe().context("locate pbox executable")?;
             let planned_run = AnsibleRun {
-                recipe: selected.id.clone(),
+                recipe: recipe.join(", "),
                 box_id: box_id.clone(),
                 repository: catalog.repository.clone(),
                 revision: catalog.revision.clone(),
@@ -1726,19 +1769,24 @@ fn run_recipe(
                         &client,
                         &record,
                         &planned_run,
-                        &selected.metadata.capabilities,
+                        &selected
+                            .iter()
+                            .flat_map(|recipe| recipe.metadata.capabilities.iter().cloned())
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect::<Vec<_>>(),
                         error,
                         None,
                         false,
                     );
                 }
             };
-            let applied = match apply_recipe(
+            let applied = match ansible::apply_recipes(
                 store.path(),
                 &binary,
                 repository.cache_dir(),
                 &catalog,
-                selected,
+                &selected,
                 &box_id,
                 json,
             ) {
@@ -1748,31 +1796,68 @@ fn run_recipe(
                         &client,
                         &record,
                         &planned_run,
-                        &selected.metadata.capabilities,
+                        &selected
+                            .iter()
+                            .flat_map(|recipe| recipe.metadata.capabilities.iter().cloned())
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect::<Vec<_>>(),
                         error,
                         snapshot.as_ref(),
                         config.recipes.rollback_on_failure,
                     );
                 }
             };
-            let ansible::RecipeApplyResult { run, cleanup_error } = applied;
-            finish_recipe_success(
-                &client,
-                &record,
-                &run,
-                &selected.metadata.capabilities,
-                snapshot.as_ref(),
-                cleanup_error,
-            )?;
+            let ansible::RecipeApplyResult {
+                run,
+                mut cleanup_error,
+            } = applied;
+            let mut runs = Vec::with_capacity(selected.len());
+            for (index, recipe) in selected.iter().enumerate() {
+                let recipe_run = AnsibleRun {
+                    recipe: recipe.id.clone(),
+                    box_id: run.box_id.clone(),
+                    repository: run.repository.clone(),
+                    revision: run.revision.clone(),
+                };
+                finish_recipe_success(
+                    &client,
+                    &record,
+                    &recipe_run,
+                    &recipe.metadata.capabilities,
+                    (index + 1 == selected.len())
+                        .then_some(snapshot.as_ref())
+                        .flatten(),
+                    if index + 1 == selected.len() {
+                        cleanup_error.take()
+                    } else {
+                        None
+                    },
+                )?;
+                runs.push(recipe_run);
+            }
             if json {
-                ui::json_text(&(serde_json::to_string_pretty(&run)?));
+                if runs.len() == 1 {
+                    ui::json_text(&(serde_json::to_string_pretty(&runs[0])?));
+                } else {
+                    ui::json_text(&(serde_json::to_string_pretty(&runs)?));
+                }
             } else {
-                ui::stdout().success(&format!(
-                    "applied {} to {} @ {}",
-                    safe_terminal_text(&run.recipe),
-                    safe_terminal_text(&run.box_id),
-                    safe_terminal_text(&run.revision)
-                ));
+                if runs.len() == 1 {
+                    ui::stdout().success(&format!(
+                        "applied {} to {} @ {}",
+                        safe_terminal_text(&runs[0].recipe),
+                        safe_terminal_text(&run.box_id),
+                        safe_terminal_text(&run.revision)
+                    ));
+                } else {
+                    ui::stdout().success(&format!(
+                        "applied {} recipes to {} @ {}",
+                        runs.len(),
+                        safe_terminal_text(&run.box_id),
+                        safe_terminal_text(&run.revision)
+                    ));
+                }
             }
         }
     }
@@ -1831,6 +1916,21 @@ fn create_recipe_snapshot(
         }
     };
     if let Err(error) = wait_for_task(client, &record.node, task) {
+        if error
+            .downcast_ref::<PveTaskFailure>()
+            .is_some_and(|failure| {
+                failure.exit_status.trim().trim_start_matches("ERROR: ")
+                    == "snapshot feature is not available"
+            })
+        {
+            if config.recipes.snapshot_before_apply == "auto" {
+                ui::stderr().warning("Snapshots are unavailable on this storage; applying the recipe without a snapshot.");
+                return Ok(None);
+            }
+            return Err(
+                error.context("A snapshot is required by recipes.snapshot-before-apply=always")
+            );
+        }
         return Err(cleanup_failed_recipe_snapshot(
             client,
             record,
@@ -2217,7 +2317,7 @@ fn run_exec(store: &ConfigStore, command: ExecCommand, json: bool) -> Result<Run
         .map(|entry| parse_env_entry(entry))
         .collect::<Result<Vec<_>>>()?;
 
-    let cwd = command.cwd;
+    let mut cwd = command.cwd;
     let user = command.user;
     let argv = command.argv;
     let ca_pem = materials.ca.certificate_pem.clone();
@@ -2231,10 +2331,13 @@ fn run_exec(store: &ConfigStore, command: ExecCommand, json: bool) -> Result<Run
             relay::connect_agent(&config, &endpoint, &box_id, &ca_pem, &client_identity)
                 .await
                 .context("connect to pbox-agent")?;
-        client
+        let info = client
             .info()
             .await
             .context("validate pbox-agent identity")?;
+        if cwd.is_empty() && !info.capabilities.iter().any(|c| c == "workspace") {
+            cwd = "/home/pbox".to_owned();
+        }
         client
             .exec(argv, cwd, env, user)
             .await
@@ -2262,7 +2365,7 @@ fn run_exec(store: &ConfigStore, command: ExecCommand, json: bool) -> Result<Run
         Ok(RunOutcome::Exit(exit_code))
     }
 }
-fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOutcome> {
+fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<RunOutcome> {
     if json {
         bail!("pbox ssh does not support --json");
     }
@@ -2276,8 +2379,12 @@ fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOu
         .and_then(|record| record.name)
         .unwrap_or_else(|| box_id.clone());
     let materials = agent_materials(&config, &box_id)?;
-    let env = ssh_environment(&command.env, std::env::var("COLORTERM").ok())?;
-    let argv = ssh_command_argv(&command.argv);
+    let env = ssh_environment(
+        &command.env,
+        std::env::var("TERM").ok(),
+        std::env::var("COLORTERM").ok(),
+    )?;
+    let mut argv = ssh_command_argv(&command.argv);
     let ca_pem = materials.ca.certificate_pem.clone();
     let client_identity = materials.client;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2285,7 +2392,7 @@ fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOu
         .build()
         .context("create async runtime for pbox-agent shell")?;
     let style = ui::stderr();
-    let connection = runtime.block_on(async move {
+    let connection = runtime.block_on(async {
         let connect = async {
             let mut client =
                 relay::connect_agent(&config, &endpoint, &box_id, &ca_pem, &client_identity)
@@ -2318,7 +2425,67 @@ fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOu
         }
     });
     style.clear_progress_line();
-    let (mut client, info) = connection?;
+    let (mut client, mut info) = connection?;
+    if let Some(agent_binary) = resolve_agent_binary(&config).ok()
+        && agent_binary.is_file()
+    {
+        let expected_digest = file_digest(&agent_binary)?;
+        if info.agent_digest != expected_digest {
+            ui::stderr().progress("Updating pbox-agent");
+            let binary = fs::read(&agent_binary)
+                .with_context(|| format!("read pbox-agent binary {}", agent_binary.display()))?;
+            runtime.block_on(async {
+                client
+                    .put_file("/tmp/pbox-agent-update", binary, 0o755, true)
+                    .await
+                    .context("upload pbox-agent update")?;
+                let result = client
+                    .exec(
+                        vec![
+                            "/bin/sh".to_owned(),
+                            "-c".to_owned(),
+                            "install -m 0755 /tmp/pbox-agent-update /usr/local/bin/pbox-agent && (systemctl restart pbox-agent.service >/dev/null 2>&1 &)".to_owned(),
+                        ],
+                        "/",
+                        [],
+                        "root",
+                    )
+                    .await;
+                match result {
+                    Ok(result) if exec_exit_code(&result) == 0 => Ok(()),
+                    Ok(result) => bail!("pbox-agent update failed with exit code {}", exec_exit_code(&result)),
+                    Err(error) => {
+                        let message = error.to_string();
+                        if message.contains("connection closed") || message.contains("UnexpectedEof") {
+                            Ok(())
+                        } else {
+                            Err(error).context("restart pbox-agent after update")
+                        }
+                    }
+                }
+            })?;
+            drop(client);
+            std::thread::sleep(Duration::from_millis(800));
+            let (reconnected, refreshed) = runtime.block_on(async {
+                let mut client =
+                    relay::connect_agent(&config, &endpoint, &box_id, &ca_pem, &client_identity)
+                        .await
+                        .context("reconnect to updated pbox-agent")?;
+                let info = client.info().await.context("validate updated pbox-agent")?;
+                Ok::<_, anyhow::Error>((client, info))
+            })?;
+            client = reconnected;
+            info = refreshed;
+            ui::stderr().clear_progress_line();
+        }
+    }
+    let workspace = info.capabilities.iter().any(|c| c == "workspace");
+    if !workspace && command.cwd.is_empty() {
+        command.cwd = "/home/pbox".to_owned();
+    }
+    if workspace && command.argv.is_empty() {
+        argv = vec!["pbox:default".to_owned()];
+    }
     if !info
         .capabilities
         .iter()
@@ -2327,8 +2494,15 @@ fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOu
         bail!("pbox-agent does not advertise PTY support; upgrade the guest agent");
     }
     if command.argv.is_empty() {
-        let access = runtime.block_on(guest::check_client(&mut client, &command.user));
-        ui::user_access(&info.box_id, &command.user, access);
+        if !workspace {
+            let user = if command.user.is_empty() {
+                "pbox"
+            } else {
+                &command.user
+            };
+            let access = runtime.block_on(guest::check_client(&mut client, user));
+            ui::user_access(&info.box_id, user, access);
+        }
         ui::stderr().progress(&format!(
             "Connected to {}. Type exit to disconnect.",
             info.box_id
@@ -2346,6 +2520,9 @@ fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOu
         (terminal.as_ref(), title.as_ref()),
         signals,
     ));
+    if result.is_err() {
+        ui::reset_terminal_display();
+    }
     drop(terminal);
     drop(title);
     let result = result?;
@@ -2398,6 +2575,7 @@ fn validate_exec_arguments(command: &ExecCommand) -> Result<()> {
 }
 fn ssh_environment(
     entries: &[String],
+    term: Option<String>,
     color_term: Option<String>,
 ) -> Result<Vec<(String, String)>> {
     let mut env = entries
@@ -2405,7 +2583,10 @@ fn ssh_environment(
         .map(|entry| parse_env_entry(entry))
         .collect::<Result<Vec<_>>>()?;
     if !env.iter().any(|(key, _)| key == "TERM") {
-        env.push(("TERM".to_owned(), "xterm-256color".to_owned()));
+        env.push((
+            "TERM".to_owned(),
+            term.unwrap_or_else(|| "xterm-256color".to_owned()),
+        ));
     }
     if let Some(color_term) =
         color_term.filter(|value| matches!(value.as_str(), "truecolor" | "24bit"))
@@ -2541,20 +2722,35 @@ async fn run_ssh_session(
     user: String,
     title: Option<&str>,
 ) -> Result<ExecResult> {
+    let (terminal_rows, terminal_cols) = terminal_size();
     let mut session = client
-        .exec_pty_session(argv, cwd, env, user)
+        .exec_pty_session_with_size(argv, cwd, env, user, terminal_rows, terminal_cols)
         .await
         .context("start pbox-agent PTY session")?;
     let input_sender = session.input.clone();
     let _input_thread = thread::spawn(move || pump_terminal_input(input_sender));
+    #[cfg(unix)]
+    let mut window_change =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+            .context("register SIGWINCH handler")?;
     let mut result = ExecResult::default();
     let mut titles = ui::TitlePrefix::new(title);
-    while let Some(event) = session
-        .output
-        .message()
-        .await
-        .context("read pbox-agent PTY output")?
-    {
+    loop {
+        #[cfg(unix)]
+        let event = tokio::select! {
+            event = session.output.message() => event,
+            _ = window_change.recv() => {
+                let (rows, cols) = terminal_size();
+                session.input.send(pbox_agent_client::ExecInput::Resize { rows, cols }).await
+                    .map_err(|_| anyhow!("pbox-agent PTY input closed while resizing"))?;
+                continue;
+            }
+        };
+        #[cfg(not(unix))]
+        let event = session.output.message().await;
+        let Some(event) = event.context("read pbox-agent PTY output")? else {
+            break;
+        };
         match event.event {
             Some(exec_event::Event::Stdout(data)) => {
                 write_pty_output(titles.push(&data), false)
@@ -2586,6 +2782,29 @@ async fn run_ssh_session(
         Err(_) => bail!("pbox-agent PTY stream did not close after exit"),
     }
     Ok(result)
+}
+
+#[cfg(unix)]
+fn terminal_size() -> (u32, u32) {
+    let mut size = nix::libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // The local terminal may not report dimensions when stdin is redirected.
+    // Codex and other TUIs still need a usable PTY size in that case.
+    let result =
+        unsafe { nix::libc::ioctl(nix::libc::STDOUT_FILENO, nix::libc::TIOCGWINSZ, &mut size) };
+    if result == 0 && size.ws_row > 0 && size.ws_col > 0 {
+        return (size.ws_row.into(), size.ws_col.into());
+    }
+    (24, 80)
+}
+
+#[cfg(not(unix))]
+fn terminal_size() -> (u32, u32) {
+    (24, 80)
 }
 
 async fn write_pty_output(data: Vec<u8>, stderr: bool) -> Result<()> {
@@ -3362,6 +3581,8 @@ fn create_lxc_with_retry(
             encode_metadata(&metadata).context("encode pbox metadata")?
         );
         let request = LxcCreateRequest {
+            entrypoint: (resolved.ostype.as_deref() == Some("unmanaged"))
+                .then(|| "/usr/local/bin/pbox-agent --workspace-init".to_owned()),
             ostype: resolved.ostype.clone(),
             ostemplate: Some(resolved.ostemplate.clone()),
             hostname: Some(hostname.to_owned()),
@@ -4069,6 +4290,7 @@ fn run_delete(
     }
     if !wait {
         let task = queue_delete(&client, &record)?;
+        inventory::mark_deleting(store.path(), &record, &task)?;
         if json {
             ui::json_text(&serde_json::to_string_pretty(&serde_json::json!({
                 "id": record.id, "vmid": record.vmid, "node": record.node,
@@ -4417,6 +4639,20 @@ fn wait_for_task(client: &impl PveApi, node: &str, task: PveTaskResponse) -> Res
 const TASK_LOG_LIMIT: u64 = 40;
 const TASK_LOG_MAX_CHARS: usize = 8 * 1024;
 
+#[derive(Debug)]
+struct PveTaskFailure {
+    exit_status: String,
+    detail: String,
+}
+
+impl std::fmt::Display for PveTaskFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for PveTaskFailure {}
+
 fn task_error_with_log(
     client: &impl PveApi,
     node: &str,
@@ -4499,7 +4735,7 @@ fn wait_for_task_with_progress(
             if status.is_successful() {
                 break Ok(());
             }
-            break Err(task_error_with_log(
+            let detail = task_error_with_log(
                 client,
                 node,
                 &task.upid,
@@ -4511,7 +4747,13 @@ fn wait_for_task_with_progress(
                         .as_deref()
                         .unwrap_or("missing exit status")
                 ),
-            ));
+            )
+            .to_string();
+            break Err(PveTaskFailure {
+                exit_status: status.exitstatus.unwrap_or_default(),
+                detail,
+            }
+            .into());
         }
         if started.elapsed() >= PVE_TASK_TIMEOUT {
             break Err(task_error_with_log(
@@ -4533,138 +4775,20 @@ fn wait_for_task_with_progress(
 }
 
 fn run_list(store: &ConfigStore, json: bool, color: ColorChoice) -> Result<()> {
-    let client = client_from_store(store)?;
-    let config = load_config(store)?;
-    let mut records = discover_boxes(&client)?;
-    if let Some(statuses) = request_pboxd_status() {
-        for record in &mut records {
-            if let Some(status) = statuses.get(&record.id.to_string()) {
-                record.state.clone_from(&status.state);
-                record.ping.clone_from(&status.ping);
-            }
-        }
-    } else {
-        probe_box_agents(&config, &mut records);
+    let snapshot = inventory::read(store.path())?
+        .context("Inventory is loading in the background. Run `pbox list` again shortly.")?;
+    if !json && (snapshot.refresh_failed || snapshot.age() > Duration::from_secs(10)) {
+        ui::stderr().hint(&format!(
+            "Showing cached inventory ({}s old); pboxd is refreshing it in the background.",
+            snapshot.age().as_secs()
+        ));
     }
     if json {
-        ui::json_text(&(serde_json::to_string_pretty(&records)?));
+        ui::json_text(&serde_json::to_string_pretty(&snapshot.records)?);
     } else {
-        let colour = color_enabled(color, json);
-        print_box_records(&records, colour);
+        print_box_records(&snapshot.records, color_enabled(color, json));
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn pboxd_socket() -> Option<PathBuf> {
-    Some(dirs::data_local_dir()?.join("pbox").join("pboxd.sock"))
-}
-
-#[cfg(not(unix))]
-fn pboxd_socket() -> Option<PathBuf> {
-    None
-}
-
-fn ensure_pboxd(config_path: &Path) {
-    #[cfg(unix)]
-    {
-        let Some(socket) = pboxd_socket() else { return };
-        if UnixStream::connect(&socket).is_ok() {
-            return;
-        }
-        if let Some(parent) = socket.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = std::process::Command::new(
-            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pbox")),
-        )
-        .arg("daemon")
-        .arg("--config")
-        .arg(config_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    }
-}
-
-fn request_pboxd_status() -> Option<std::collections::BTreeMap<String, DaemonStatus>> {
-    #[cfg(unix)]
-    {
-        let socket = pboxd_socket()?;
-        let mut stream = UnixStream::connect(socket).ok()?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(12)))
-            .ok()?;
-        stream.write_all(b"status\n").ok()?;
-        stream.shutdown(std::net::Shutdown::Write).ok()?;
-        let mut response = String::new();
-        stream.read_to_string(&mut response).ok()?;
-        serde_json::from_str(&response).ok()
-    }
-    #[cfg(not(unix))]
-    {
-        None
-    }
-}
-
-fn run_pboxd(store_path: &Path) -> Result<RunOutcome> {
-    #[cfg(unix)]
-    {
-        let socket = pboxd_socket().context("resolve pboxd socket")?;
-        if let Some(parent) = socket.parent() {
-            fs::create_dir_all(parent).context("create pboxd state directory")?;
-        }
-        let _ = fs::remove_file(&socket);
-        let listener = UnixListener::bind(&socket).context("bind pboxd socket")?;
-        let _ = fs::set_permissions(&socket, fs::Permissions::from_mode(0o600));
-        let mut cached_status: Option<(Instant, String)> = None;
-        for stream in listener.incoming() {
-            let mut stream = match stream {
-                Ok(stream) => stream,
-                Err(_) => continue,
-            };
-            let mut request = String::new();
-            if stream.read_to_string(&mut request).is_err() || request.trim() != "status" {
-                continue;
-            }
-            if let Some((created, response)) = &cached_status
-                && created.elapsed() < Duration::from_secs(5)
-            {
-                let _ = stream.write_all(response.as_bytes());
-                continue;
-            }
-            let result = (|| -> Result<_> {
-                let store = ConfigStore::new(store_path);
-                let config = load_config(&store)?;
-                let client = client_from_config(&config)?;
-                let mut records = discover_boxes(&client)?;
-                probe_box_agents(&config, &mut records);
-                Ok(records
-                    .into_iter()
-                    .map(|record| {
-                        (
-                            record.id.to_string(),
-                            DaemonStatus {
-                                state: record.state,
-                                ping: record.ping,
-                            },
-                        )
-                    })
-                    .collect::<std::collections::BTreeMap<_, _>>())
-            })();
-            let response = serde_json::to_string(&result.unwrap_or_default())
-                .unwrap_or_else(|_| "{}".to_owned());
-            cached_status = Some((Instant::now(), response.clone()));
-            let _ = stream.write_all(response.as_bytes());
-        }
-        unreachable!("pboxd socket loop ended")
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = store_path;
-        bail!("pboxd is only supported on Unix hosts")
-    }
 }
 
 fn probe_box_agents(config: &Config, records: &mut [BoxRecord]) {
@@ -4902,6 +5026,11 @@ fn resolve_agent_binary(config: &Config) -> Result<PathBuf> {
     ))
 }
 
+fn file_digest(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
 const LXC_IP_TIMEOUT: Duration = Duration::from_secs(60);
 const LXC_IP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -4967,11 +5096,20 @@ fn discover_lxc_addresses(
     ))
 }
 
+fn lifecycle_state<'a>(state: &'a str, lock: Option<&str>, deleting: bool) -> &'a str {
+    if deleting || lock == Some("destroyed") {
+        "deleting"
+    } else {
+        state
+    }
+}
+
 fn discover_boxes(client: &impl PveApi) -> Result<Vec<BoxRecord>> {
     let resources = client
         .list_cluster_resources()
         .context("list PVE resources")?;
     let mut records = Vec::new();
+    let mut deleting = std::collections::BTreeMap::new();
     for resource in resources
         .into_iter()
         .filter(|resource| resource.resource_type == "lxc")
@@ -4997,7 +5135,17 @@ fn discover_boxes(client: &impl PveApi) -> Result<Vec<BoxRecord>> {
         {
             continue;
         }
-        let state = resource.status.unwrap_or_else(|| "unknown".to_owned());
+        let tasks = deleting
+            .entry(node.to_owned())
+            .or_insert_with(|| client.active_delete_tasks(node).unwrap_or_default());
+        let state = lifecycle_state(
+            resource.status.as_deref().unwrap_or("unknown"),
+            config.extra.get("lock").and_then(|v| v.as_str()),
+            tasks
+                .iter()
+                .any(|task| task.upid.split(':').nth(6) == Some(vmid.to_string().as_str())),
+        )
+        .to_owned();
         let (ip, ipv6) = if state == "running" {
             discover_lxc_addresses(client, node, vmid).with_context(|| {
                 format!(
@@ -5010,6 +5158,7 @@ fn discover_boxes(client: &impl PveApi) -> Result<Vec<BoxRecord>> {
         };
         let name = config.hostname.or(resource.name);
         records.push(BoxRecord {
+            image: metadata.image,
             id: metadata.id,
             vmid,
             state,
@@ -5121,6 +5270,7 @@ mod tests {
         oci_tags: RefCell<Vec<String>>,
         task_log: RefCell<Vec<PveTaskLog>>,
         fail_next_task: RefCell<bool>,
+        next_task_exit: RefCell<Option<String>>,
         fail_create: RefCell<bool>,
         fail_updates: RefCell<bool>,
     }
@@ -5168,6 +5318,7 @@ mod tests {
                 task_log: RefCell::new(Vec::new()),
                 fail_create: RefCell::new(false),
                 fail_next_task: RefCell::new(false),
+                next_task_exit: RefCell::new(None),
                 fail_updates: RefCell::new(false),
             }
         }
@@ -5295,11 +5446,13 @@ mod tests {
             let failed = self.fail_next_task.replace(false);
             Ok(PveTaskStatus {
                 status: "stopped".to_owned(),
-                exitstatus: Some(if failed {
-                    "ERROR: test".to_owned()
-                } else {
-                    "OK".to_owned()
-                }),
+                exitstatus: Some(self.next_task_exit.borrow_mut().take().unwrap_or_else(|| {
+                    if failed {
+                        "ERROR: test".to_owned()
+                    } else {
+                        "OK".to_owned()
+                    }
+                })),
                 upid: Some(upid.to_owned()),
                 node: None,
                 pid: None,
@@ -5443,6 +5596,20 @@ mod tests {
     }
 
     #[test]
+    fn deletion_takes_precedence_over_runtime_and_agent_state() {
+        assert_eq!(super::lifecycle_state("running", None, true), "deleting");
+        assert_eq!(
+            super::lifecycle_state("stopped", Some("destroyed"), false),
+            "deleting"
+        );
+        assert_eq!(super::lifecycle_state("stopped", None, false), "stopped");
+        assert_eq!(
+            super::lifecycle_state("running", Some("backup"), false),
+            "running"
+        );
+    }
+
+    #[test]
     fn immediate_restart_uses_node_state_even_when_cluster_cache_says_running() {
         let record = test_record();
         let fake = FakePve::new(&test_metadata(&record), "test");
@@ -5560,6 +5727,7 @@ mod tests {
 
     fn test_record() -> BoxRecord {
         BoxRecord {
+            image: None,
             id: PboxId::parse("pbx_t3yzd9y3").unwrap(),
             vmid: 9007,
             state: "running".to_owned(),
@@ -6289,6 +6457,39 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_snapshot_task_respects_policy_without_deleting_absent_snapshot() {
+        for policy in ["auto", "always"] {
+            let record = test_record();
+            let fake = FakePve::new(&test_metadata(&record), "note");
+            *fake.next_task_exit.borrow_mut() =
+                Some("snapshot feature is not available".to_owned());
+            let mut config = Config::default();
+            config.recipes.snapshot_before_apply = policy.to_owned();
+            let run = AnsibleRun {
+                recipe: "desktop/xfce".to_owned(),
+                box_id: record.id.to_string(),
+                repository: "test".to_owned(),
+                revision: "test".to_owned(),
+            };
+            let result = create_recipe_snapshot(&fake, &record, &config, &run);
+            if policy == "auto" {
+                assert!(result.unwrap().is_none());
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("snapshot is required")
+                );
+            }
+            let events = fake.events.borrow();
+            assert_eq!(events.len(), 2);
+            assert!(events[0].starts_with("create:"));
+            assert_eq!(events[1], "wait:snapshot-create");
+        }
+    }
+
+    #[test]
     fn successful_provenance_preserves_user_text_and_records_capabilities() {
         let record = test_record();
         let metadata = test_metadata(&record);
@@ -6570,11 +6771,17 @@ mod tests {
     }
     #[test]
     fn ssh_advertises_a_portable_terminal_and_preserves_overrides() {
-        let env = super::ssh_environment(&[], Some("truecolor".to_owned())).unwrap();
-        assert!(env.contains(&("TERM".to_owned(), "xterm-256color".to_owned())));
+        let env = super::ssh_environment(
+            &[],
+            Some("xterm-ghostty".to_owned()),
+            Some("truecolor".to_owned()),
+        )
+        .unwrap();
+        assert!(env.contains(&("TERM".to_owned(), "xterm-ghostty".to_owned())));
         assert!(env.contains(&("COLORTERM".to_owned(), "truecolor".to_owned())));
         let env = super::ssh_environment(
             &["TERM=vt100".to_owned(), "COLORTERM=custom".to_owned()],
+            Some("xterm-ghostty".to_owned()),
             Some("truecolor".to_owned()),
         )
         .unwrap();
@@ -6585,7 +6792,12 @@ mod tests {
                 ("COLORTERM".to_owned(), "custom".to_owned())
             ]
         );
-        let env = super::ssh_environment(&[], Some("unknown".to_owned())).unwrap();
+        let env = super::ssh_environment(
+            &[],
+            Some("xterm-ghostty".to_owned()),
+            Some("unknown".to_owned()),
+        )
+        .unwrap();
         assert!(!env.iter().any(|(key, _)| key == "COLORTERM"));
     }
 

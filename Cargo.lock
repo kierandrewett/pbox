@@ -1210,6 +1210,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "pbox"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "clap_complete",
+ "dirs",
+ "nix",
+ "pbox-agent-client",
+ "pbox-core",
+ "pbox-crypto",
+ "pbox-relay",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "pbox-agent"
 version = "0.1.0"
 dependencies = [
@@ -1248,28 +1270,6 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tonic",
-]
-
-[[package]]
-name = "pbox-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "clap",
- "clap_complete",
- "dirs",
- "nix",
- "pbox-agent-client",
- "pbox-core",
- "pbox-crypto",
- "pbox-relay",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "time",
- "tokio",
 ]
 
 [[package]]

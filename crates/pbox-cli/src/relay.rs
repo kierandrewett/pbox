@@ -7,6 +7,48 @@ use pbox_relay::RelayAccess;
 
 pub const ENDPOINT: &str = "https://pbox-relay.invalid:443";
 
+pub(super) fn workspace_network(net: &str) -> Result<String> {
+    let fields: std::collections::BTreeMap<_, _> =
+        net.split(',').filter_map(|s| s.split_once('=')).collect();
+    let interface = fields.get("name").copied().unwrap_or("eth0");
+    anyhow::ensure!(
+        interface
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')),
+        "invalid guest interface name"
+    );
+    let mut result = format!(
+        "hostname\noption domain_name_servers, domain_name, domain_search\noption classless_static_routes, static_routes, interface_mtu\nnohook hostname\nnoipv4ll\nallowinterfaces {interface}\ninterface {interface}\n"
+    );
+    for (key, directive) in [("ip", "ip_address"), ("ip6", "ip6_address")] {
+        if let Some(value) = fields.get(key) {
+            if matches!(*value, "dhcp" | "auto") {
+                continue;
+            }
+            if *value == "manual" {
+                result.push_str(if key == "ip" { "noipv4\n" } else { "noipv6\n" });
+                continue;
+            }
+            anyhow::ensure!(
+                value
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '.' | '/')),
+                "invalid static guest address"
+            );
+            result.push_str(&format!("static {directive}={value}\n"));
+        }
+    }
+    if let Some(gateway) = fields.get("gw") {
+        gateway.parse::<std::net::Ipv4Addr>()?;
+        result.push_str(&format!("static routers={gateway}\n"));
+    }
+    anyhow::ensure!(
+        !fields.contains_key("gw6"),
+        "workspace static IPv6 gateway support is not yet available; use DHCPv6/SLAAC"
+    );
+    Ok(result)
+}
+
 pub fn access(config: &Config, box_id: &str, role: &str) -> Result<RelayAccess> {
     let url = config
         .relay
@@ -105,6 +147,25 @@ pub(crate) fn write_payload(directory: &Path, config: &Config, box_id: &str) -> 
         "--listen {listen}:{} --box-id {box_id} --certificate /etc/pbox/server.pem --private-key /etc/pbox/server-key.pem --client-ca /etc/pbox/client-ca.pem{relay_arg}",
         config.agent.port
     );
+    let mut argv = vec![
+        "--listen".to_owned(),
+        format!("{listen}:{}", config.agent.port),
+        "--box-id".to_owned(),
+        box_id.to_owned(),
+        "--certificate".to_owned(),
+        "/etc/pbox/server.pem".to_owned(),
+        "--private-key".to_owned(),
+        "/etc/pbox/server-key.pem".to_owned(),
+        "--client-ca".to_owned(),
+        "/etc/pbox/client-ca.pem".to_owned(),
+    ];
+    if config.relay.url.is_some() {
+        argv.extend([
+            "--relay-config".to_owned(),
+            "/etc/pbox/relay.json".to_owned(),
+        ]);
+    }
+    fs::write(etc.join("agent-args.json"), serde_json::to_vec(&argv)?)?;
     // Start immediately; the agent retries outbound connections while DHCP becomes ready.
     fs::write(
         unit,
@@ -212,6 +273,10 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
     let result: Result<()> = (|| {
         let payload = key.operation_directory().join("payload");
         write_payload(&payload, config, &box_id)?;
+        fs::write(
+            payload.join("etc/pbox/dhcpcd.conf"),
+            workspace_network(&resolved.net0)?,
+        )?;
         let image = super::images::oci_reference_for_image(
             command.image.as_deref().unwrap_or(&config.images.default),
         );
@@ -257,7 +322,7 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
         super::progress::substep("Waiting for the outbound agent");
         wait_ready(config, &box_id)?;
         super::progress::substep("Checking guest access");
-        let access = if !json {
+        let access = if !json && resolved.ostype.as_deref() != Some("unmanaged") {
             Some(super::guest::check(config, &box_id, ENDPOINT))
         } else {
             None
@@ -428,6 +493,18 @@ mod tests {
     use super::*;
     use pbox_core::Secret;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn workspace_dhcp_requests_dns_and_static_networks_are_explicit() {
+        let dhcp = workspace_network("name=eth0,bridge=vmbr0,ip=dhcp,ip6=auto").unwrap();
+        assert!(dhcp.contains("option domain_name_servers, domain_name, domain_search"));
+        assert!(!dhcp.contains("noipv6"));
+        let fixed = workspace_network("name=eth0,ip=192.0.2.3/24,gw=192.0.2.1,ip6=manual").unwrap();
+        assert!(fixed.contains("static ip_address=192.0.2.3/24"));
+        assert!(fixed.contains("static routers=192.0.2.1"));
+        assert!(fixed.contains("noipv6"));
+        assert!(workspace_network("name=eth0\nscript=bad").is_err());
+    }
 
     #[test]
     fn payload_contains_only_scoped_guest_credentials_and_restricts_private_files() {

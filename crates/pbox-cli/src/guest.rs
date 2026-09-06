@@ -16,6 +16,7 @@ fi
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UserAccess {
+    ImageDefined,
     Passwordless,
     Restricted,
     Unknown,
@@ -72,6 +73,11 @@ pub(crate) fn check(config: &Config, box_id: &str, endpoint: &str) -> UserAccess
         let Ok(Ok(mut client)) = connected else {
             return UserAccess::Unknown;
         };
+        if matches!(tokio::time::timeout(Duration::from_secs(3), client.info()).await,
+            Ok(Ok(info)) if info.capabilities.iter().any(|c| c == "workspace"))
+        {
+            return UserAccess::ImageDefined;
+        }
         check_client(&mut client, "pbox").await
     })
 }

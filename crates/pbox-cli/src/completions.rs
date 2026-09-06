@@ -251,6 +251,7 @@ mod tests {
     fn exact_names_resolve_and_ambiguous_names_never_select_a_box() {
         fn record(id: &str, name: &str) -> super::super::BoxRecord {
             super::super::BoxRecord {
+                image: None,
                 id: id.parse().unwrap(),
                 vmid: 9000,
                 state: "running".into(),

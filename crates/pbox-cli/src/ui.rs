@@ -512,6 +512,24 @@ pub(crate) fn safe_terminal_text(value: &str) -> String {
         .collect()
 }
 
+pub(crate) fn concise_error(error: &anyhow::Error) -> String {
+    let message = format!("{error:#}");
+    if message.contains("peer closed connection without sending TLS close_notify") {
+        return "pbox-agent connection closed unexpectedly; retry the command".to_owned();
+    }
+    safe_terminal_text(&message)
+}
+
+pub(crate) fn reset_terminal_display() {
+    // TUIs normally emit these sequences while exiting. Send them ourselves
+    // when the remote session disappears so the local shell remains usable.
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(
+        b"\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1049l\x1b[H\x1b[2K",
+    );
+    let _ = stdout.flush();
+}
+
 pub(crate) fn print_recipe_catalog(
     catalog: &RecipeCatalog,
     json: bool,
@@ -1297,6 +1315,17 @@ mod design_tests {
         let rendered = style.prompt_text("Name\x1b[2J", Some("test\nnext"));
         assert!(!rendered.contains("\x1b[2J"));
         assert!(!rendered.contains('\n'));
+    }
+
+    #[test]
+    fn agent_disconnect_errors_are_actionable_and_compact() {
+        let error = anyhow::anyhow!(
+            "read pbox-agent PTY output: peer closed connection without sending TLS close_notify"
+        );
+        assert_eq!(
+            concise_error(&error),
+            "pbox-agent connection closed unexpectedly; retry the command"
+        );
     }
 }
 

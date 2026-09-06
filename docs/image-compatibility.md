@@ -1,128 +1,114 @@
-# OCI preparation and local image tests
+# OCI workspaces and image tests
 
-Run `just test-images` to test the image matrix with local Docker. This builds
-pbox and the agent, exports the **production** preparation scripts and payload
-with disposable credentials, and tests each image. Python 3, Rust and a running
-local Linux Docker engine are required. No PVE or relay configuration is used.
+New relay-backed OCI boxes start `pbox-agent --workspace-init` as LXC PID 1.
+PVE's supported [`entrypoint` parameter](https://github.com/proxmox/pve-container/blob/master/src/PVE/LXC/Config.pm)
+selects this bootstrap, with `ostype=unmanaged`. If the image contains systemd,
+the agent writes its networking and agent units, disables interactive first-boot
+setup and competing network managers, then uses `exec()` to replace itself with
+systemd as PID 1. There is no intermediate reboot. Configuration is repeatable;
+individual files are replaced atomically and handoff occurs only after setup
+succeeds. Systemd starts the agent as a normal service, so `systemctl`, journald
+and ordinary systemd services work. pbox waits for that agent before connecting.
+
+Images without systemd, including minimal Alpine, retain the lightweight
+supervisor. pbox does not pretend to implement systemd's API on those images.
+The PVE installation must support the entrypoint API parameter. No host Docker
+or host shell integration is needed.
+
+The supervisor reaps child processes, restarts the agent and DHCP client, and
+stops its children when PVE shuts down the container. It brings up loopback and
+uses dhcpcd without udev or systemd-resolved. DHCPv4, DHCPv6 and SLAAC are enabled;
+available global addresses remain visible in pbox. Static IPv4 is supported.
+An explicit static IPv6 gateway is currently rejected with an actionable error.
+Networks must provide working DNS and a route to the configured relay.
+
+OCI `ENV` and `WORKDIR` become the defaults for `pbox exec` and `pbox ssh`.
+Images with no `USER`, or root as `USER`, open as `pbox` with `/home/pbox` and
+passwordless sudo. A non-root image `USER` is retained. The default `/` working
+directory becomes `/home/pbox` for the generated account; `--user root` explicitly
+opens a root session.
+Explicit command options override them. A bare shell `CMD`, such as CachyOS's
+`/usr/bin/bash`, is opened on SSH connection. Other `ENTRYPOINT` + `CMD` values
+run once as a background application; its exit stops the container. SSH opens
+the image user's shell independently. Images must supply the shell and any
+application tools they need. The image application still runs under its configured OCI user.
+
+Preparation installs dhcpcd and sudo if missing, using apt-get, dnf, pacman, apk or
+zypper, retaining image repositories and signature verification. Arch/CachyOS
+uses a full pacman upgrade. The agent must execute in the image before packages
+are installed. The standard `just build` produces a static musl guest agent for Alpine and
+glibc distributions. It requires the Rust musl target and a musl C compiler;
+for example, set `CC_x86_64_unknown_linux_musl=musl-gcc`. The CLI stays native.
+Custom agent builds configured through `agent.binary` must still match the
+guest architecture and libc. Package manager support alone is not a
+promise that every image works.
+
+## Local tests
 
 ```sh
-just test-images
-just test-images --images arch,cachyos --jobs 2
-just test-images --images debian --skip-build
+just test-images --workspace --images debian,fedora,cachyos,alpine
+just test-images --workspace --images cachyos --skip-build
 ```
 
-The suite uses ordinary Docker containers and Docker's default isolation. It does
-not use privileged mode, host devices, host networking, host PID namespaces,
-host mounts or a Docker socket mount. It runs the agent directly; **it does not
-boot systemd as PID 1**. Privileged systemd guests are unsuitable for running these
-tests on a desktop host.
+The suite exports production preparation and disposable credentials, then uses
+ordinary Docker containers to check authenticated agent RPC, image metadata and
+restart/reconnection. It never uses privileged mode, host namespaces, host
+mounts, devices or systemd boot. Local Docker tests do not prove LXC boot or relay
+networking; those require live PVE verification.
 
-The matrix is in `tests/images/matrix.json`. Each positive case checks:
-
-- Actual package preparation and the detected PVE OS type.
-- Agent binary execution and xterm-256color terminfo.
-- Offline systemd preset application, including vendor first-boot policy.
-- Authenticated agent RPC as the generated pbox user and passwordless sudo.
-- Agent container restart and reconnection.
-- Clear rejection of a broken agent binary and a masked agent service.
-- Rejection of an unmasked interactive first-boot wizard before upload.
-- Preservation of an existing pbox user's sudo policy.
-
-Alpine is an expected rejection: the current guest integration uses glibc and
-systemd, whereas Alpine uses musl and OpenRC. Package manager failures, unsupported
-images and incompatible agent binaries stop preparation before any PVE upload.
-
-## Cleanup and evidence
-
-Containers and committed images have a unique run label. A base image already
-present locally is reused and retained. Images pulled by the suite are removed
-at the end, after its containers and derived images. There is no global prune.
-Ownership is checked before deletion, including the ID of a newly pulled image;
-changed tags are retained and reported. Ctrl-C and SIGTERM enter cleanup.
-
-Logs and `results.json` are retained under `test-results/images/`, or `--output`.
-The resource journal is written before container creation. After a hard kill or
-host interruption, recover cleanup with:
+Containers and derived images carry a unique run label. Existing base images
+are retained; newly pulled images are removed if their IDs still match. Cleanup
+runs on completion, Ctrl-C and SIGTERM, without a global prune. Logs and image IDs
+remain in `test-results/images/` (or `--output`). After a hard interruption:
 
 ```sh
 python3 scripts/test-images.py --cleanup-only test-results/images/resources-RUN_ID.json
 ```
 
-A successful Docker run proves preparation and agent compatibility with those
-specific image IDs and the tested agent build. It does **not** prove LXC boot,
-PVE's generated network configuration, DHCP, IPv6 routing or relay reachability.
-Those require a separate PVE integration test. The prepared systemd guest masks
-`systemd-firstboot.service`, whose interactive
-locale/timezone/password prompts otherwise block `sysinit.target` and the agent
-on fresh images such as CachyOS. Machine ID generation and presets remain active;
-existing locale, timezone and account settings are preserved.
-Rolling tags can change; the report records the tested image ID.
-The agent's minimum glibc version depends on
-its build toolchain; older distro releases may require a compatible agent build
-via `agent.binary` even when their package manager is supported.
+Without `--workspace`, the suite tests the older distro-init preparation path,
+including offline service presets and passwordless sudo. Existing boxes and
+legacy templates continue to use that path. Its earlier full eight-image matrix
+passed on 6 September 2026, including expected Alpine rejection.
 
-Live verification on 6 September 2026: a CachyOS guest blocked on
-`systemd-firstboot --prompt-locale --prompt-keymap-auto --prompt-timezone
---prompt-root-password` with the agent queued behind `sysinit.target`. Masking
-and stopping that wizard released the existing guest immediately. A new guest
-prepared with the mask completed `pbox new`, authenticated exec, passwordless
-sudo, DNS lookup, PTY SSH, and stop/start/reconnection. The temporary PVE guest
-and local Docker regression resources were deleted after verification. The fix
-is embedded in the guest image; it adds no host-shell requirement to pbox.
+## Why CachyOS previously stalled
 
-## Distribution choices and research
+The official [CachyOS Dockerfile](https://github.com/CachyOS/docker/blob/master/Dockerfile)
+builds an Arch-based shell image, with Bash as its command. Booting that rootfs
+through systemd invoked an interactive `systemd-firstboot` wizard and held the
+agent behind `sysinit.target`. The previous runtime masks that wizard. The bootstrap now masks that prompt before handing over to systemd; images
+without systemd use the lightweight supervisor. Shell sessions still go through
+the authenticated agent.
 
-Research checked 6 September 2026. Detection reads `/etc/os-release`, falling
-back to `/usr/lib/os-release`, matches `ID` first and then `ID_LIKE`. Metadata is
-parsed as data and never sourced or evaluated. This follows the
-[systemd os-release contract](https://www.freedesktop.org/software/systemd/man/latest/os-release.html).
+## Initial workspace verification with the glibc build, 6 September 2026
 
-| Family | Preparation | Networking prerequisite | PVE type |
-| --- | --- | --- | --- |
-| Debian | apt-get | ifupdown and ISC DHCP client | debian |
-| Ubuntu | apt-get | systemd networkd | ubuntu |
-| Fedora | dnf | systemd-networkd | fedora |
-| Rocky / Alma / RHEL | dnf, microdnf or yum | NetworkManager | centos |
-| Arch / CachyOS | pacman full upgrade | systemd networkd | archlinux |
-| openSUSE | zypper | wicked | opensuse |
+Debian 13, Fedora 44 and CachyOS passed production preparation, authenticated
+RPC, restart/reconnection and numeric user/group, environment and working-directory
+checks in local Docker. Alpine rejected the glibc agent before package installation.
+A separate CachyOS test verified non-root `LD_LIBRARY_PATH` preservation.
+All runs completed ownership-checked cleanup.
 
-The implementation preserves configured repositories and signature checking.
-Arch uses `pacman -Syu`, avoiding partial upgrades; see the
-[official pacman manual](https://man.archlinux.org/man/pacman.8).
-CachyOS supplies its own repositories and keyring in its
-[official Dockerfile](https://github.com/CachyOS/docker/blob/master/Dockerfile).
-Missing or stale image repository keys are errors, not a reason to disable trust.
+Live PVE verification covered a fresh CachyOS creation without manual repair,
+Bash PTY with xterm-256color, image root user, DNS, agent crash/restart, full
+stop/start, and independent snapshot save/restore. The clone connected under
+its own ID and IPv4 address. Temporary guests and the snapshot were removed.
+This network had no IPv6 router, so routed IPv6 connectivity was not verified.
 
-PVE's [OS detection](https://github.com/proxmox/pve-container/blob/master/src/PVE/LXC/Setup.pm)
-uses supported distribution plugins and a fixed alias table, rather than general
-ID_LIKE matching. pbox supplies the detected family through the standard `ostype`
-create parameter; it does not rewrite os-release. PVE remains responsible for
-writing guest networking. Requirements come from its
-[Debian](https://github.com/proxmox/pve-container/blob/master/src/PVE/LXC/Setup/Debian.pm),
-[Ubuntu](https://github.com/proxmox/pve-container/blob/master/src/PVE/LXC/Setup/Ubuntu.pm),
-[Fedora](https://github.com/proxmox/pve-container/blob/master/src/PVE/LXC/Setup/Fedora.pm),
-[CentOS](https://github.com/proxmox/pve-container/blob/master/src/PVE/LXC/Setup/CentOS.pm),
-[Arch](https://github.com/proxmox/pve-container/blob/master/src/PVE/LXC/Setup/ArchLinux.pm)
-and [SUSE](https://github.com/proxmox/pve-container/blob/master/src/PVE/LXC/Setup/SUSE.pm)
-implementations. In particular, a standalone dhclient executable is not required
-for networkd or NetworkManager.
+## Alpine and development-account verification, 6 September 2026
 
-Package families are not a promise that every release or minimal image works.
-Repository contents, PVE version support, agent ABI and actual preflight results
-all matter. The matrix defines the concrete releases tested locally.
+The static musl agent passed the Docker matrix on Alpine 3.24.1, Debian 13 and
+CachyOS. Root-default images opened as pbox in /home/pbox with passwordless sudo;
+numeric non-root image users and environment overrides still passed. The musl
+build handles libc's ioctl argument type and the supervisor supplies a complete
+system PATH so Alpine's /sbin/dhcpcd starts under PVE's minimal environment.
 
-## Verified matrix
+A fresh Alpine LXC completed provisioning, relay connection, DNS, interactive
+BusyBox shell with xterm-256color, home-directory writes, passwordless sudo and
+stop/start persistence. The disposable guest and Docker resources were removed.
 
-Local Docker run on 6 September 2026: all eight cases passed; cleanup reported no
-errors. The agent ran directly in ordinary containers, with offline systemd checks.
+## PID 1 handoff verification
 
-| Image | Result |
-| --- | --- |
-| `docker.io/library/debian:13` | Preparation, agent RPC, restart and guardrails passed |
-| `docker.io/library/ubuntu:24.04` | Preparation, agent RPC, restart and guardrails passed |
-| `docker.io/library/fedora:44` | Preparation, agent RPC, restart and guardrails passed |
-| `docker.io/library/archlinux:base` | Preparation, agent RPC, restart and guardrails passed |
-| `docker.io/cachyos/cachyos:latest` | Preparation, agent RPC, restart and guardrails passed |
-| `docker.io/rockylinux/rockylinux:10` | Preparation, agent RPC, restart and guardrails passed |
-| `docker.io/opensuse/tumbleweed:latest` | Preparation, agent RPC, restart and guardrails passed |
-| `docker.io/library/alpine:latest` | Expected rejection passed |
+A fresh CachyOS guest booted through the agent into real systemd. Both
+`pbox-agent.service` and `pbox-network.service` were active; `systemd-run --wait`
+executed a transient service successfully. The pbox user, home and passwordless
+sudo survived a stop/start cycle. Systemd configuration is tested offline in a
+temporary directory; local Docker tests never boot systemd on the desktop host.

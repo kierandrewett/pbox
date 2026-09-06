@@ -21,6 +21,7 @@ message InfoResponse {
   string os_version = 5;
   string architecture = 6;
   repeated string capabilities = 7;
+  string agent_digest = 8;
 }
 
 message PingRequest {
@@ -41,6 +42,9 @@ message ExecRequest {
   bool allocate_pty = 6;
   bytes stdin = 7;
   bool stdin_eof = 8;
+  uint32 terminal_rows = 9;
+  uint32 terminal_cols = 10;
+  // Non-zero values on later stream messages resize the active PTY.
 }
 
 message ExecEvent {

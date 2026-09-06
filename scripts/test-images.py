@@ -60,10 +60,11 @@ class Suite:
     def prepare_fixture(self):
         log = self.output / "build.log"
         if not self.args.skip_build:
-            self.command(["cargo", "build", "--release", "-p", "pbox-cli", "-p", "pbox-agent"], log=log, timeout=1800)
+            self.command(["just", "build"] if self.args.workspace else ["cargo", "build", "--release", "-p", "pbox", "-p", "pbox-agent"], log=log, timeout=1800)
         env = dict(self.env, PBOX_TEST_FIXTURE=str(self.fixture),
+                   PBOX_TEST_WORKSPACE="1" if self.args.workspace else "",
                    PBOX_TEST_AGENT=str((ROOT / "target/release/pbox-agent").resolve()))
-        self.command(["cargo", "test", "-p", "pbox-cli", "export_docker_image_fixture", "--", "--ignored", "--exact", "images::tests::export_docker_image_fixture"], log=log, env=env)
+        self.command(["cargo", "test", "-p", "pbox", "export_docker_image_fixture", "--", "--ignored", "--exact", "images::tests::export_docker_image_fixture"], log=log, env=env)
         if not (self.fixture / "prepare.sh").exists():
             raise RuntimeError("production fixture exporter did not run")
 
@@ -95,7 +96,8 @@ class Suite:
         last = ""
         while time.monotonic() < deadline:
             try:
-                result = self.rpc(endpoint, "test $(whoami) = pbox; sudo -n true; infocmp xterm-256color >/dev/null; printf agent-ready", log)
+                probe = "test $(whoami) = pbox; test $PWD = /home/pbox; sudo -n true; printf agent-ready" if self.args.workspace else "test $(whoami) = pbox; sudo -n true; infocmp xterm-256color >/dev/null; printf agent-ready"
+                result = self.rpc(endpoint, probe, log)
                 last = result.stdout
                 if result.returncode == 0 and "agent-ready" in result.stdout:
                     return
@@ -145,6 +147,10 @@ class Suite:
             self.docker("create", "--name", prep, "--label", f"{LABEL}={self.run_id}", "--user", "0", "--workdir", "/",
                         "--entrypoint", "/bin/sh", row["image"], "-c", (self.fixture / "prepare.sh").read_text(), log=log)
             self.docker("cp", str(self.fixture / "payload") + "/.", f"{prep}:/", log=log)
+            if self.args.workspace:
+                metadata = self.fixture / f"{name}-image.json"
+                metadata.write_text(self.docker("image", "inspect", "--format", "{{json .Config}}", row["image"]).stdout)
+                self.docker("cp", metadata, f"{prep}:/etc/pbox/image.json")
             prepared = self.docker("start", "--attach", prep, log=log, check=False)
             exit_code = self.docker("inspect", "--format", "{{.State.ExitCode}}", prep).stdout.strip()
             if "reject" in row:
@@ -156,7 +162,7 @@ class Suite:
                 raise RuntimeError(f"preparation failed: {prepared.stdout[-3000:]}")
             manifest = self.fixture / f"{name}-ostype"
             self.docker("cp", f"{prep}:/etc/pbox-image-ostype", manifest)
-            if manifest.read_text().strip() != row["ostype"]:
+            if manifest.read_text().strip() != ("unmanaged" if self.args.workspace else row["ostype"]):
                 raise RuntimeError("wrong PVE OS type")
             # Test first-boot preset policy offline; never boot systemd on this host.
             empty = self.fixture / f"{name}-machine-id"
@@ -176,12 +182,25 @@ class Suite:
             address = self.docker("port", boot, "7443/tcp").stdout.strip()
             endpoint = "https://" + address
             self.wait_agent(endpoint, log)
-            self.docker("exec", boot, "systemctl", "--root=/", "preset-all", log=log)
-            self.docker("exec", boot, "systemctl", "--root=/", "is-enabled", "pbox-agent.service", log=log)
+            if not self.args.workspace:
+                self.docker("exec", boot, "systemctl", "--root=/", "preset-all", log=log)
+                self.docker("exec", boot, "systemctl", "--root=/", "is-enabled", "pbox-agent.service", log=log)
             self.docker("restart", "--time", "5", boot, log=log)
             # Docker may allocate a new host port on restart.
             endpoint = "https://" + self.docker("port", boot, "7443/tcp").stdout.strip()
             self.wait_agent(endpoint, log)
+            if self.args.workspace:
+                custom = json.loads(metadata.read_text())
+                custom.update(User="34567:34567", WorkingDir="/tmp")
+                custom["Env"] = custom.get("Env", []) + ["PBOX_IMAGE_TEST=preserved", "LD_LIBRARY_PATH=/opt/image-libs"]
+                variant = self.fixture / f"{name}-custom.json"
+                variant.write_text(json.dumps(custom))
+                self.docker("cp", variant, f"{boot}:/etc/pbox/image.json")
+                check = self.rpc(endpoint, 'test "$(id -u)" = 34567; test "$(id -g)" = 34567; test "$PWD" = /tmp; test "$PBOX_IMAGE_TEST" = preserved; test "$LD_LIBRARY_PATH" = /opt/image-libs; printf metadata-ok', log)
+                if check.returncode != 0 or "metadata-ok" not in check.stdout:
+                    raise RuntimeError("image user/environment/workdir not preserved: " + check.stdout)
+                result.update(status="passed", checks=["production workspace preparation", "numeric image user and group", "image environment and working directory", "authenticated RPC without sudo", "restart and reconnect"])
+                return result
             self.guardrails(boot, log)
             result.update(status="passed", checks=["broken agent rejection", "masked service rejection", "existing user policy preserved", "production preparation", "PVE OS type", "offline first-boot preset policy", "authenticated agent RPC", "pbox user", "passwordless sudo", "xterm-256color", "restart and reconnect"])
         except Exception as error:
@@ -232,6 +251,7 @@ def main():
     parser.add_argument("--cleanup-only", type=Path, help="Recover cleanup from a resources JSON file after a hard interruption")
     parser.add_argument("--images", help="Comma-separated matrix names; default: all")
     parser.add_argument("--jobs", type=int, default=2)
+    parser.add_argument("--workspace", action="store_true", help="Test the lightweight OCI workspace runtime")
     parser.add_argument("--boot-timeout", type=int, default=90)
     parser.add_argument("--skip-build", action="store_true", help="Use existing release binaries (fixture exporter still compiles)")
     parser.add_argument("--output", default="test-results/images")
@@ -244,6 +264,11 @@ def main():
         if selected - {row["name"] for row in rows}:
             parser.error("unknown image name")
         rows = [row for row in rows if row["name"] in selected]
+    if args.workspace:
+        for row in rows:
+            if row["name"] == "alpine":
+                row.pop("reject", None)
+                row["ostype"] = "unmanaged"
     suite = Suite(args)
     if args.cleanup_only:
         import shutil

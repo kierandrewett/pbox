@@ -142,6 +142,10 @@ pub trait PveApi {
             "container templates are unavailable".into(),
         ))
     }
+    fn active_delete_tasks(&self, node: &str) -> Result<Vec<PveTaskResponse>, PveError> {
+        let _ = node;
+        Ok(Vec::new())
+    }
     fn template_tasks(&self, node: &str, vmid: u64) -> Result<Vec<PveTaskResponse>, PveError> {
         let _ = (node, vmid);
         Err(PveError::Unsupported(
@@ -515,6 +519,12 @@ impl PveApi for PveClient {
         let _: serde_json::Value = decode_response(response)?;
         Ok(())
     }
+    fn active_delete_tasks(&self, node: &str) -> Result<Vec<PveTaskResponse>, PveError> {
+        validate_path_segment(node, "node")?;
+        self.get(&format!(
+            "/nodes/{node}/tasks?source=active&typefilter=vzdestroy&limit=500"
+        ))
+    }
     fn template_tasks(&self, node: &str, vmid: u64) -> Result<Vec<PveTaskResponse>, PveError> {
         validate_path_segment(node, "node")?;
         self.get(&format!(
@@ -805,6 +815,8 @@ pub struct LxcCloneRequest {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct LxcCreateRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ostype: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

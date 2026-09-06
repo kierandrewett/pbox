@@ -1,3 +1,4 @@
+mod workspace;
 use anyhow::{Context, Result};
 use clap::Parser;
 use ipnet::IpNet;
@@ -16,6 +17,7 @@ use sha2::{Digest, Sha256};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
+use std::os::fd::RawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -262,12 +264,20 @@ impl Agent for AgentService {
             os_id: std::env::consts::OS.to_owned(),
             os_version: String::new(),
             architecture: std::env::consts::ARCH.to_owned(),
+            agent_digest: agent_digest(),
             capabilities: vec![
                 "exec".to_owned(),
                 "pty".to_owned(),
                 "files".to_owned(),
                 "forward".to_owned(),
-            ],
+            ]
+            .into_iter()
+            .chain(
+                Path::new("/etc/pbox/image.json")
+                    .exists()
+                    .then(|| "workspace".to_owned()),
+            )
+            .collect(),
         }))
     }
 
@@ -297,6 +307,7 @@ impl Agent for AgentService {
             .await
             .map_err(|_| Status::deadline_exceeded("exec handshake timed out"))??
             .ok_or_else(|| Status::invalid_argument("exec stream is empty"))?;
+        let first = workspace::resolve_request(first)?;
         validate_exec_request(&first)?;
         drop(handshake_permit);
         let permit = self
@@ -561,6 +572,13 @@ impl Agent for AgentService {
     }
 }
 
+fn agent_digest() -> String {
+    std::fs::read("/proc/self/exe")
+        .ok()
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+        .unwrap_or_default()
+}
+
 fn validate_exec_request(request: &ExecRequest) -> Result<(), Status> {
     if request.protocol_version != PROTOCOL {
         return Err(Status::failed_precondition(
@@ -573,7 +591,13 @@ fn validate_exec_request(request: &ExecRequest) -> Result<(), Status> {
         ));
     }
     for (name, value) in &request.env {
-        validate_environment_entry(name, value, request.user.as_str() == "root")?;
+        // Workspace commands drop credentials before exec and do not pass through
+        // setuid sudo. Preserve image loader settings (for example CUDA paths).
+        validate_environment_entry(
+            name,
+            value,
+            request.user.as_str() == "root" || Path::new("/etc/pbox/image.json").exists(),
+        )?;
     }
     Ok(())
 }
@@ -628,7 +652,15 @@ async fn run_piped_command(
     sender: mpsc::Sender<Result<ExecEvent, Status>>,
 ) {
     let deadline = tokio::time::Instant::now() + EXEC_COMMAND_TIMEOUT;
-    let mut command = command_for_request(&request);
+    let mut command = match prepare_command(&request) {
+        Ok(command) => command,
+        Err(error) => {
+            let _ = sender
+                .send(Err(Status::invalid_argument(error.to_string())))
+                .await;
+            return;
+        }
+    };
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -652,6 +684,7 @@ async fn run_piped_command(
         false,
         request.stdin,
         request.stdin_eof,
+        None,
     ));
     let output_failure = Arc::new(Notify::new());
     let stdout_task = tokio::spawn(send_output(
@@ -696,7 +729,17 @@ async fn run_pty_command(
     sender: mpsc::Sender<Result<ExecEvent, Status>>,
 ) {
     let deadline = tokio::time::Instant::now() + EXEC_COMMAND_TIMEOUT;
-    let pty = match nix::pty::openpty(None, None) {
+    let winsize = if request.terminal_rows > 0 && request.terminal_cols > 0 {
+        Some(nix::pty::Winsize {
+            ws_row: request.terminal_rows.min(u16::MAX as u32) as u16,
+            ws_col: request.terminal_cols.min(u16::MAX as u32) as u16,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        })
+    } else {
+        None
+    };
+    let pty = match nix::pty::openpty(winsize.as_ref(), None) {
         Ok(pty) => pty,
         Err(error) => {
             let _ = sender
@@ -721,7 +764,15 @@ async fn run_pty_command(
             return;
         }
     };
-    let mut command = command_for_request(&request);
+    let mut command = match prepare_command(&request) {
+        Ok(command) => command,
+        Err(error) => {
+            let _ = sender
+                .send(Err(Status::invalid_argument(error.to_string())))
+                .await;
+            return;
+        }
+    };
     command
         .stdin(Stdio::from(slave))
         .stdout(Stdio::from(slave_stdout))
@@ -738,6 +789,7 @@ async fn run_pty_command(
         });
     }
     let master = std::fs::File::from(pty.master);
+    let master_fd = master.as_raw_fd();
     let master_reader = match master.try_clone() {
         Ok(file) => tokio::fs::File::from_std(file),
         Err(error) => {
@@ -761,6 +813,7 @@ async fn run_pty_command(
         true,
         request.stdin,
         request.stdin_eof,
+        Some(master_fd),
     ));
     let output_failure = Arc::new(Notify::new());
     let output_task = tokio::spawn(send_output(
@@ -791,6 +844,12 @@ async fn run_pty_command(
     }
 }
 
+fn prepare_command(request: &ExecRequest) -> Result<Command> {
+    if Path::new("/etc/pbox/image.json").exists() {
+        return Ok(workspace::command(request)?.into());
+    }
+    Ok(command_for_request(request))
+}
 fn command_for_request(request: &ExecRequest) -> Command {
     let mut environment = request.env.clone();
     if request.allocate_pty {
@@ -877,6 +936,7 @@ async fn forward_stdin<W>(
     pty: bool,
     initial_data: Vec<u8>,
     initial_eof: bool,
+    resize_fd: Option<RawFd>,
 ) -> Result<(), Status>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -900,6 +960,12 @@ where
                 "unsupported agent protocol version",
             ));
         }
+        if request.terminal_rows > 0
+            && request.terminal_cols > 0
+            && let Some(fd) = resize_fd
+        {
+            resize_pty(fd, request.terminal_rows, request.terminal_cols)?;
+        }
         if !request.stdin.is_empty() {
             write_stdin(&mut writer, &request.stdin, pty).await?;
         }
@@ -909,6 +975,20 @@ where
         }
     }
     finish_stdin(&mut writer, pty).await?;
+    Ok(())
+}
+
+fn resize_pty(fd: RawFd, rows: u32, cols: u32) -> Result<(), Status> {
+    let size = nix::libc::winsize {
+        ws_row: rows.min(u16::MAX as u32) as u16,
+        ws_col: cols.min(u16::MAX as u32) as u16,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let result = unsafe { nix::libc::ioctl(fd, nix::libc::TIOCSWINSZ, &size) };
+    if result == -1 {
+        return Err(internal_io(std::io::Error::last_os_error()));
+    }
     Ok(())
 }
 
@@ -1449,8 +1529,23 @@ fn build_server_tls_config(
     Ok(Arc::new(config))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--workspace-init") {
+        return workspace::supervise();
+    }
+    if std::env::args().nth(1).as_deref() == Some("--workspace-service") {
+        return workspace::service(false);
+    }
+    if std::env::args().nth(1).as_deref() == Some("--workspace-application") {
+        return workspace::service(true);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(serve())
+}
+
+async fn serve() -> Result<()> {
     let args = Args::parse();
     if args.max_exec == 0 {
         anyhow::bail!("max-exec must be greater than zero");
@@ -1501,7 +1596,7 @@ async fn main() -> Result<()> {
             serde_json::from_slice(&tokio::fs::read(path).await?)
                 .context("parse relay configuration")?;
         let route = if args.snapshot_bootstrap {
-            let hostname = tokio::fs::read_to_string("/etc/hostname").await?;
+            let hostname = workspace::hostname();
             let suffix = hostname
                 .trim()
                 .strip_prefix("pbox-")

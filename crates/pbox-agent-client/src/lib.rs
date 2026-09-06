@@ -65,6 +65,7 @@ pub struct ExecResult {
 #[derive(Debug)]
 pub enum ExecInput {
     Data(Vec<u8>),
+    Resize { rows: u32, cols: u32 },
     Eof,
 }
 
@@ -169,6 +170,7 @@ impl Service<Uri> for AgentTlsConnector {
     }
 }
 
+#[derive(Clone)]
 pub struct AgentClient {
     inner: GeneratedAgentClient<Channel>,
     expected_box_id: String,
@@ -286,6 +288,19 @@ impl AgentClient {
         env: impl IntoIterator<Item = (String, String)>,
         user: impl Into<String>,
     ) -> Result<ExecPtySession, AgentClientError> {
+        self.exec_pty_session_with_size(argv, cwd, env, user, 0, 0)
+            .await
+    }
+
+    pub async fn exec_pty_session_with_size(
+        &mut self,
+        argv: Vec<String>,
+        cwd: impl Into<String>,
+        env: impl IntoIterator<Item = (String, String)>,
+        user: impl Into<String>,
+        terminal_rows: u32,
+        terminal_cols: u32,
+    ) -> Result<ExecPtySession, AgentClientError> {
         let (request_sender, request_receiver) = mpsc::channel(32);
         request_sender
             .send(ExecRequest {
@@ -296,6 +311,8 @@ impl AgentClient {
                 user: user.into(),
                 allocate_pty: true,
                 stdin_eof: false,
+                terminal_rows,
+                terminal_cols,
                 ..Default::default()
             })
             .await
@@ -317,15 +334,18 @@ impl AgentClient {
                         let Some(input) = input else {
                             break;
                         };
-                        let (stdin, stdin_eof) = match input {
-                            ExecInput::Data(data) => (data, false),
-                            ExecInput::Eof => (Vec::new(), true),
+                        let (stdin, stdin_eof, terminal_rows, terminal_cols) = match input {
+                            ExecInput::Data(data) => (data, false, 0, 0),
+                            ExecInput::Resize { rows, cols } => (Vec::new(), false, rows, cols),
+                            ExecInput::Eof => (Vec::new(), true, 0, 0),
                         };
                         if request_sender
                             .send(ExecRequest {
                                 protocol_version: PROTOCOL_VERSION,
                                 stdin,
                                 stdin_eof,
+                                terminal_rows,
+                                terminal_cols,
                                 ..Default::default()
                             })
                             .await
@@ -386,6 +406,8 @@ impl AgentClient {
             allocate_pty,
             stdin,
             stdin_eof: true,
+            terminal_rows: 0,
+            terminal_cols: 0,
         };
         let stream = self.exec_stream(tokio_stream::iter([request])).await?;
         tokio::time::timeout(AGENT_RPC_TIMEOUT, collect_exec_stream(stream))

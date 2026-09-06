@@ -500,7 +500,7 @@ fn restore_source(
     }
     result
 }
-const SOURCE_CLEANUP: &str = "set -eu\nrm -f /etc/systemd/system/pbox-agent.service.d/90-snapshot.conf /etc/systemd/system/multi-user.target.wants/pbox-snapshot.service /etc/systemd/system/pbox-snapshot.service\nrm -rf /etc/pbox-snapshot\nsystemctl daemon-reload\n";
+const SOURCE_CLEANUP: &str = "set -eu\nrm -f /etc/systemd/system/pbox-agent.service.d/90-snapshot.conf /etc/systemd/system/multi-user.target.wants/pbox-snapshot.service /etc/systemd/system/pbox-snapshot.service\nrm -rf /etc/pbox-snapshot\nif [ -d /run/systemd/system ]; then systemctl daemon-reload; fi\n";
 
 async fn prepare_source(
     config: &Config,
@@ -559,6 +559,41 @@ async fn prepare_source(
     };
     agent
         .put_file(
+            format!("{STAGE}/source-host"),
+            host.as_bytes().to_vec(),
+            0o600,
+            true,
+        )
+        .await?;
+    let mut args = vec![
+        "--listen".to_owned(),
+        format!("0.0.0.0:{}", config.agent.port),
+        "--box-id".to_owned(),
+        saved.bootstrap_id.clone(),
+        "--certificate".to_owned(),
+        format!("{STAGE}/server.pem"),
+        "--private-key".to_owned(),
+        format!("{STAGE}/server-key.pem"),
+        "--client-ca".to_owned(),
+        format!("{STAGE}/client-ca.pem"),
+    ];
+    if config.relay.url.is_some() {
+        args.extend([
+            "--relay-config".to_owned(),
+            format!("{STAGE}/relay.json"),
+            "--snapshot-bootstrap".to_owned(),
+        ]);
+    }
+    agent
+        .put_file(
+            format!("{STAGE}/agent-args.json"),
+            serde_json::to_vec(&args)?,
+            0o600,
+            true,
+        )
+        .await?;
+    agent
+        .put_file(
             format!("{STAGE}/sanitize"),
             SANITIZE.as_bytes().to_vec(),
             0o700,
@@ -587,7 +622,7 @@ async fn prepare_source(
         .await?;
     root(
         agent,
-        "set -eu; systemctl daemon-reload; systemctl enable pbox-snapshot.service",
+        "set -eu; if [ ! -f /etc/pbox/image.json ]; then systemctl daemon-reload; systemctl enable pbox-snapshot.service; fi",
     )
     .await
 }
@@ -599,8 +634,13 @@ if [ ! -f /etc/pbox-snapshot/sanitized ]; then
     chmod "$(cat /etc/pbox-snapshot/root-mode)" /
     rm -f /etc/pbox/server.pem /etc/pbox/server-key.pem /etc/pbox/client-ca.pem /etc/pbox/relay.json
     rm -f /etc/machine-id /var/lib/dbus/machine-id /etc/ssh/ssh_host_*
-    systemd-machine-id-setup
-    ssh-keygen -A
+    rm -f /var/lib/dhcpcd/duid /var/lib/dhcpcd/secret /var/lib/dhcpcd/*.lease /var/lib/dhcpcd/*.lease6
+    # A clone first connects using its new MAC and DHCP, never the source IP.
+    if [ -f /etc/pbox/image.json ]; then
+        sed -i '/^static /d' /etc/pbox/dhcpcd.conf
+    fi
+    if command -v systemd-machine-id-setup >/dev/null; then systemd-machine-id-setup; fi
+    if command -v ssh-keygen >/dev/null; then ssh-keygen -A; fi
     touch /etc/pbox-snapshot/sanitized
 fi
 "#;
@@ -778,8 +818,11 @@ fn finalize(
         let payload=workspace.operation_directory().join("payload");
         let result:Result<()> = async {
             relay::write_payload(&payload,config,id)?;
+            if let Some(net) = &pending.configuration.net0 {
+                std::fs::write(payload.join("etc/pbox/dhcpcd.conf"),relay::workspace_network(net)?)?;
+            }
             upload_directory(&mut agent,&payload,&payload).await?;
-            root(&mut agent,&format!("{SOURCE_CLEANUP}systemctl enable pbox-agent.service\n")).await?;
+            root(&mut agent,&format!("{SOURCE_CLEANUP}if [ ! -f /etc/pbox/image.json ]; then systemctl enable pbox-agent.service; fi\n")).await?;
             Ok(())
         }.await;
         workspace.cleanup()?;
@@ -837,9 +880,21 @@ fn finalize(
         if !pending.stopped {
             let access = rt.block_on(async {
                 let mut agent = wait_box(config, id).await?;
-                Ok::<_, anyhow::Error>(guest::check_client(&mut agent, "pbox").await)
+                if agent
+                    .info()
+                    .await?
+                    .capabilities
+                    .iter()
+                    .any(|c| c == "workspace")
+                {
+                    Ok::<_, anyhow::Error>(None)
+                } else {
+                    Ok(Some(guest::check_client(&mut agent, "pbox").await))
+                }
             })?;
-            ui::user_access(id, "pbox", access);
+            if let Some(access) = access {
+                ui::user_access(id, "pbox", access);
+            }
         }
         ui::stdout().success(&format!(
             "Created {id} from snapshot {}",

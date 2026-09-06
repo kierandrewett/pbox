@@ -44,18 +44,24 @@ struct AnsibleInvocation<'a> {
     box_id: &'a str,
 }
 
-pub fn apply_recipe(
+pub fn apply_recipes(
     config_path: &Path,
     pbox_binary: &Path,
     repository_root: &Path,
     catalog: &RecipeCatalog,
-    recipe: &Recipe,
+    recipes: &[&Recipe],
     box_id: &str,
     json: bool,
 ) -> Result<RecipeApplyResult> {
     validate_box_id(box_id)?;
+    anyhow::ensure!(!recipes.is_empty(), "at least one recipe is required");
+    let recipe_label = recipes
+        .iter()
+        .map(|recipe| recipe.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     if !json {
-        crate::ui::recipe_heading(&recipe.id, box_id);
+        crate::ui::recipe_heading(&recipe_label, box_id);
     }
     if !repository_root.is_dir() {
         bail!(
@@ -63,8 +69,7 @@ pub fn apply_recipe(
             repository_root.display()
         );
     }
-    let source_path = repository_path(repository_root, Path::new(&recipe.path))?;
-    let operation_directory = operation_directory(&recipe.id, box_id)?;
+    let operation_directory = operation_directory(&recipe_label, box_id)?;
     let result = (|| -> Result<()> {
         let plugin_directory = operation_directory.join("connection_plugins");
         fs::create_dir_all(&plugin_directory).with_context(|| {
@@ -103,17 +108,30 @@ pub fn apply_recipe(
         run_ansible(&invocation, &preflight, json)
             .context("ensure the guest has a Python interpreter for Ansible")?;
 
-        let playbook = match recipe.kind {
-            RecipeKind::Playbook => source_path,
-            RecipeKind::Role => {
-                let role_name = role_name(repository_root, &recipe.path)?;
-                let wrapper = operation_directory.join("recipe.yml");
-                write_file(&wrapper, &role_playbook(&role_name), 0o600)?;
-                wrapper
-            }
-        };
-        run_ansible(&invocation, &playbook, json)
-            .with_context(|| format!("apply recipe {} to box {box_id}", recipe.id))?;
+        let combined = operation_directory.join("recipes.yml");
+        let mut combined_playbook = String::new();
+        for (index, recipe) in recipes.iter().enumerate() {
+            let source_path = repository_path(repository_root, Path::new(&recipe.path))?;
+            let playbook = match recipe.kind {
+                RecipeKind::Playbook => source_path,
+                RecipeKind::Role => {
+                    let role_name = role_name(repository_root, &recipe.path)?;
+                    let wrapper = operation_directory.join(format!("recipe-{index}.yml"));
+                    write_file(&wrapper, &role_playbook(&role_name), 0o600)?;
+                    wrapper
+                }
+            };
+            let path = playbook.to_string_lossy().replace('\'', "''");
+            combined_playbook.push_str(&format!("- import_playbook: '{path}'\n"));
+        }
+        write_file(&combined, &combined_playbook, 0o600)?;
+        run_ansible(&invocation, &combined, json).with_context(|| {
+            format!(
+                "apply recipe{} {} to box {box_id}",
+                if recipes.len() == 1 { "" } else { "s" },
+                recipe_label
+            )
+        })?;
         Ok(())
     })();
     let cleanup_result = fs::remove_dir_all(&operation_directory).with_context(|| {
@@ -131,7 +149,7 @@ pub fn apply_recipe(
         }
         Ok(()) => Ok(RecipeApplyResult {
             run: AnsibleRun {
-                recipe: recipe.id.clone(),
+                recipe: recipe_label,
                 box_id: box_id.to_owned(),
                 repository: catalog.repository.clone(),
                 revision: catalog.revision.clone(),
