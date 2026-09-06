@@ -2074,10 +2074,19 @@ mod tests {
         // A fresh connection moves the attachment; it does not start another shell.
         let mut third = agent.terminal_session(request.clone()).await.unwrap();
         until(&mut third, "__state__retained:/").await;
-        let error = tokio::time::timeout(Duration::from_secs(3), second.output.message())
-            .await
-            .unwrap()
-            .unwrap_err();
+        // Already queued output can precede the takeover status (even the CRLF
+        // after the marker may arrive in another transport frame).
+        let error = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match second.output.message().await {
+                    Ok(Some(_)) => continue,
+                    Err(error) => break error,
+                    Ok(None) => panic!("old attachment ended without its cancellation status"),
+                }
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(error.code(), tonic::Code::Cancelled);
         let wrong_user = agent
             .terminal_session(ExecRequest {
