@@ -148,7 +148,7 @@ impl BootstrapKey {
             bail!("bootstrap operation is missing its box identity or staging path");
         }
         validate_stage(&operation.stage)?;
-        if !matches!(
+        let known_phase = matches!(
             operation.phase.as_str(),
             "created"
                 | "container-create-task"
@@ -160,7 +160,9 @@ impl BootstrapKey {
                 | "repairing"
                 | "agent-ready"
                 | "guest-cleaned"
-        ) {
+        ) || (operation.relay
+            && matches!(operation.phase.as_str(), "relay-creating" | "relay-waiting"));
+        if !known_phase {
             bail!("unsupported bootstrap operation phase {}", operation.phase);
         }
         let directory = directory.to_owned();
@@ -648,6 +650,24 @@ fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn interrupted_relay_phases_can_be_loaded_for_repair() {
+        let key = super::BootstrapKey::generate("pbx_r3pair01").unwrap();
+        let mut operation =
+            super::BootstrapOperation::new("pbx_r3pair01", "pve", 7443, key.remote_stage());
+        for phase in ["relay-creating", "relay-waiting"] {
+            operation.phase = phase.to_owned();
+            operation.relay = true;
+            assert!(
+                super::BootstrapKey::from_operation(key.operation_directory(), &operation).is_ok()
+            );
+            operation.relay = false;
+            assert!(
+                super::BootstrapKey::from_operation(key.operation_directory(), &operation).is_err()
+            );
+        }
+        key.cleanup().unwrap();
+    }
     use super::*;
 
     #[test]
