@@ -4577,6 +4577,10 @@ fn spawn_progress_heartbeat(
     style: Option<CliStyle>,
     message: impl Into<String>,
 ) -> Option<ProgressHeartbeat> {
+    // A staged renderer already owns elapsed time and the terminal cursor.
+    if progress::has_details() {
+        return None;
+    }
     let style = style?;
     let stop = Arc::new(AtomicBool::new(false));
     let output_lock = Arc::new(Mutex::new(()));

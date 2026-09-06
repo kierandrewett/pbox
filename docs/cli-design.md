@@ -81,7 +81,7 @@ JSON mode leaves stdout empty on failure and emits unstyled guidance on stderr.
 | `list`, `info`, `id` | Tables, metadata, resource titles |
 | `recipe` | Tables, metadata, success, warnings |
 | `desktop` | Session and VNC endpoint metadata; JSON receipt, then tunnel until disconnect |
-| `snapshot`, `checkpoint` | Tables, success, errors |
+| `snapshot`, `checkpoint` | Tables, success, errors; snapshot capture uses timed stages and live task logs |
 | `completions` | Unchanged generated script |
 | `ssh`, `exec`, `scp`, `forward` | Connection/transfer status and errors; unchanged guest data |
 | All help | Shared Clap palette |
@@ -129,6 +129,26 @@ The daemon refreshes independently and restarts on demand after exiting. Caches
 are scoped to configuration. A missing initial cache reports background loading;
 an old cache is displayed immediately with its age on human stderr. Queued local
 deletions overlay the cached row immediately, before the next PVE refresh.
+
+## Snapshot progress
+
+Snapshot capture shows five numbered stages: prepare the source, stop it, copy
+its disks, finalise the saved environment, and restore the source. The copy
+stage explicitly says the source is stopped. Each completed stage retains its
+elapsed time. Recovery after a failure gets its own stage; a failed copy must
+never receive a success marker when recovery starts.
+
+Snapshot capture and box creation use the same progress renderer. Terminals
+show an elapsed-time spinner, substeps and three recent PVE log lines. Plain
+output retains phase transitions and logs, with a heartbeat every five seconds.
+Verbose output retains full logs without cursor movement. JSON stdout keeps its
+existing schema and normal JSON mode does not emit human progress.
+
+Copy percentages and transfer statistics come from PVE logs when available.
+Some storage backends report totals only when finished; do not invent a
+percentage or ETA. Log parsing and log retrieval failures cannot determine
+whether a PVE task succeeded. The final snapshot result reports the source's
+restored running/stopped state.
 
 ## Recipe progress
 

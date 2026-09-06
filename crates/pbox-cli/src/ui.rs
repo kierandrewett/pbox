@@ -15,6 +15,10 @@ pub(crate) fn recipe_heading(recipe: &str, box_id: &str) {
     stderr().heading(&format!("{recipe} → {box_id}"));
 }
 
+pub(crate) fn snapshot_heading(name: &str, source: &str) {
+    stderr().heading(&format!("Snapshot {name} ← {source}"));
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum RecipeEvent {
     Task(String),
@@ -906,6 +910,7 @@ pub(crate) fn user_access(box_id: &str, user: &str, access: super::guest::UserAc
 /// A bounded live block; completing a phase replaces the block with one summary row.
 pub(crate) struct CreationDisplay {
     style: CliStyle,
+    animated: bool,
     phase: Option<String>,
     started: std::time::Instant,
     active: Option<(String, std::time::Instant)>,
@@ -919,6 +924,7 @@ impl CreationDisplay {
     pub(crate) fn new() -> Self {
         Self {
             style: stderr(),
+            animated: stderr().can_animate() && !super::progress::verbose(),
             phase: None,
             started: std::time::Instant::now(),
             active: None,
@@ -933,16 +939,27 @@ impl CreationDisplay {
         self.finish(true);
         self.phase = Some(phase);
         self.started = std::time::Instant::now();
+        self.last_draw = self.started;
         self.completed.clear();
         self.logs.clear();
         self.active = None;
+        if !self.animated {
+            self.style
+                .progress(self.phase.as_deref().unwrap_or_default());
+        }
     }
     pub(crate) fn substep(&mut self, action: String) {
+        if !self.animated {
+            self.style.hint(&action);
+        }
         self.active = Some((action, std::time::Instant::now()));
         self.logs.clear();
     }
     pub(crate) fn substep_done(&mut self, action: String, elapsed: u64, success: bool) {
         self.active = None;
+        if !self.animated && !success {
+            self.style.error(&action);
+        }
         self.completed.push_back((action, elapsed, success));
         while self.completed.len() > 6 {
             self.completed.pop_front();
@@ -950,6 +967,9 @@ impl CreationDisplay {
     }
     pub(crate) fn log(&mut self, line: String) {
         if !line.trim().is_empty() {
+            if !self.animated {
+                self.style.hint(&line);
+            }
             self.logs.push_back(line);
             while self.logs.len() > 3 {
                 self.logs.pop_front();
@@ -967,6 +987,18 @@ impl CreationDisplay {
         self.drawn = 0;
     }
     pub(crate) fn tick(&mut self) {
+        if !self.animated {
+            if let Some(phase) = &self.phase
+                && self.last_draw.elapsed() >= std::time::Duration::from_secs(5)
+            {
+                self.style.progress(&format!(
+                    "{phase} ({}s elapsed)",
+                    self.started.elapsed().as_secs()
+                ));
+                self.last_draw = std::time::Instant::now();
+            }
+            return;
+        }
         if self.phase.is_none()
             || (self.drawn > 0 && self.last_draw.elapsed() < std::time::Duration::from_millis(120))
         {
@@ -1027,8 +1059,10 @@ impl CreationDisplay {
                     .completed_step(&phase, self.started.elapsed().as_secs());
             } else {
                 self.style.error(&phase);
-                for line in &self.logs {
-                    self.style.hint(line);
+                if self.animated {
+                    for line in &self.logs {
+                        self.style.hint(line);
+                    }
                 }
             }
         }

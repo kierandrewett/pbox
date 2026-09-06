@@ -262,9 +262,14 @@ pub(super) fn clone_full(
             }
             Err(error) => return Err(error.into()),
         };
-        wait_for_task(client, node, task).with_context(|| {
-            format!("clone task failed; inspect PVE VMID {vmid} before retrying")
-        })?;
+        wait_for_task_with_progress(
+            client,
+            node,
+            task,
+            None,
+            &format!("Copying on {node}; PVE may only report final totals"),
+        )
+        .with_context(|| format!("clone task failed; inspect PVE VMID {vmid} before retrying"))?;
         return Ok(vmid);
     }
     bail!("could not allocate a free VMID for the full clone")
@@ -326,6 +331,10 @@ fn create(
     json: bool,
 ) -> Result<()> {
     validate_name(name)?;
+    if !json {
+        ui::snapshot_heading(name, source);
+    }
+    let creation = progress::CreationProgress::start(json, "Checking source");
     anyhow::ensure!(
         !inventory(client)?.iter().any(|s| s.name == name),
         "snapshot name '{name}' already exists"
@@ -367,38 +376,40 @@ fn create(
         saved.image = metadata.image;
     }
     let was_running = client.get_lxc_state(&record.node, record.vmid)? == "running";
+    creation.phase("1/5 Preparing source");
     if !was_running {
-        wait_for_task(
+        wait_for_task_with_progress(
             client,
             &record.node,
             client.start_lxc(&record.node, record.vmid)?,
+            None,
+            "Starting source for preparation",
         )?;
     }
     let rt = runtime()?;
     let mut owned = false;
     let result: Result<()> = (|| {
-        if !json {
-            ui::stderr().progress("Preparing the source for an independent copy...");
-        }
         rt.block_on(async {
+            progress::substep("Waiting for source agent");
             let mut agent = wait_box(config,record.id.as_str()).await?;
+            progress::substep("Preparing the copy's independent identity");
             root(&mut agent,&format!("set -eu; mkdir -m 0700 /etc/pbox-snapshot; printf '%s' {} > /etc/pbox-snapshot/prior-state", if was_running {"running"} else {"stopped"})).await.context("source already has snapshot preparation; wait for the current capture or run `pbox snapshot repair-source BOX`")?;
             owned = true;
             prepare_source(config,&mut agent,&saved,host).await
         })?;
-        if !json {
-            ui::stderr()
-                .progress("Temporarily stopping the source and saving a full copy in PVE...");
-        }
-        wait_for_task(
+        creation.phase("2/5 Stopping source");
+        wait_for_task_with_progress(
             client,
             &record.node,
             client.shutdown_lxc(&record.node, record.vmid)?,
+            None,
+            "Waiting for source shutdown",
         )?;
         anyhow::ensure!(
             client.get_lxc_state(&record.node, record.vmid)? == "stopped",
             "source did not stop; snapshot was not created"
         );
+        creation.phase("3/5 Copying disks (source stopped)");
         saved.vmid = clone_full(
             client,
             config,
@@ -412,6 +423,8 @@ fn create(
             },
             storage,
         )?;
+        creation.phase("4/5 Finalising snapshot");
+        progress::substep("Converting the copy into a reusable snapshot");
         let previous_tasks: BTreeSet<_> = client
             .template_tasks(&saved.node, saved.vmid)?
             .into_iter()
@@ -425,7 +438,13 @@ fn create(
                 .into_iter()
                 .find(|task| !previous_tasks.contains(&task.upid))
             {
-                wait_for_task(client, &saved.node, task)?;
+                wait_for_task_with_progress(
+                    client,
+                    &saved.node,
+                    task,
+                    None,
+                    "Saving reusable snapshot",
+                )?;
                 break;
             }
             anyhow::ensure!(
@@ -443,17 +462,34 @@ fn create(
         );
         Ok(())
     })();
+    if result.is_err() {
+        creation.fail_phase();
+    }
+    if owned || !was_running {
+        creation.phase(if result.is_ok() {
+            "5/5 Restoring source"
+        } else {
+            "Recovering source after failure"
+        });
+    }
     let cleanup = if owned {
         restore_source(config, client, &record, was_running)
     } else if !was_running {
-        wait_for_task(
+        wait_for_task_with_progress(
             client,
             &record.node,
             client.shutdown_lxc(&record.node, record.vmid)?,
+            None,
+            "Restoring source to its stopped state",
         )
     } else {
         Ok(())
     };
+    if cleanup.is_ok() {
+        creation.finish();
+    } else {
+        drop(creation);
+    }
     if let Err(error) = result {
         return Err(match cleanup {
             Ok(()) => error,
@@ -469,6 +505,14 @@ fn create(
         ui::json_text(&serde_json::to_string_pretty(&saved)?);
     } else {
         ui::stdout().success(&format!("Saved snapshot {}", saved.name));
+        ui::stdout().stdout_metadata(
+            "source",
+            &format!(
+                "{} ({})",
+                record.id,
+                if was_running { "running" } else { "stopped" }
+            ),
+        );
         ui::saved_environments(&[saved]);
     }
     Ok(())
@@ -481,21 +525,27 @@ fn restore_source(
     running: bool,
 ) -> Result<()> {
     if client.get_lxc_state(&record.node, record.vmid)? != "running" {
-        wait_for_task(
+        wait_for_task_with_progress(
             client,
             &record.node,
             client.start_lxc(&record.node, record.vmid)?,
+            None,
+            "Starting source",
         )?;
     }
     let result = runtime()?.block_on(async {
+        progress::substep("Waiting for source agent");
         let mut agent = wait_box(config, record.id.as_str()).await?;
+        progress::substep("Removing temporary snapshot preparation");
         root(&mut agent, SOURCE_CLEANUP).await
     });
     if !running {
-        wait_for_task(
+        wait_for_task_with_progress(
             client,
             &record.node,
             client.shutdown_lxc(&record.node, record.vmid)?,
+            None,
+            "Restoring source to its stopped state",
         )?;
     }
     result

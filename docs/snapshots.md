@@ -22,6 +22,11 @@ Save work first: capture stops the source box while making a full disk copy,
 then restores its previous running/stopped state. Running processes and RAM
 are not saved.
 
+Capture shows five timed stages and live PVE task logs. Some storage backends
+report transfer totals only after copying finishes; elapsed time continues to
+update while waiting. Use `--verbose` to retain the logs. Redirected output gets
+a progress line every five seconds, and `--json` keeps the result machine-readable.
+
 The snapshot uses a separate Proxmox VMID and disk space. It contains the box's
 files, including application configuration and credentials stored there.
 Host bind mounts and device passthrough are rejected because they cannot become
