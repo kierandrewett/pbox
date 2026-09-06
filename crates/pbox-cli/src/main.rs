@@ -127,8 +127,9 @@ enum Command {
     /// Resume an interrupted guest-agent bootstrap.
     Repair { id: String },
     /// Resume your shell, or run a command, through pbox-agent.
+    #[command(visible_alias = "attach")]
     Ssh(SshCommand),
-    /// List and close persistent terminal sessions.
+    /// List, inspect and control persistent terminal sessions.
     Session(sessions::SessionCommand),
     /// Execute a non-interactive command through pbox-agent.
     Exec(ExecCommand),
@@ -274,7 +275,7 @@ struct ImagePullOutput {
 }
 #[derive(Debug, Args)]
 struct SshCommand {
-    /// Box ID, unique name, or current when exactly one box exists.
+    /// Box ID or name, optionally followed by :SESSION; current requires one box.
     id: String,
     /// Open or resume a named terminal. The default shell uses main.
     #[arg(long)]
@@ -2428,6 +2429,7 @@ fn run_exec(store: &ConfigStore, command: ExecCommand, json: bool) -> Result<Run
     }
 }
 fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<RunOutcome> {
+    sessions::normalize_ssh_target(&mut command)?;
     let session_name = command
         .session
         .clone()
@@ -2501,10 +2503,12 @@ fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<R
         let expected_digest = file_digest(&agent_binary)?;
         let sessions_active = info.capabilities.iter().any(|c| c == "terminal-sessions")
             && !runtime.block_on(client.list_sessions())?.is_empty();
-        if info.agent_digest != expected_digest && sessions_active {
-            ui::stderr().hint("Agent update deferred while terminal sessions are running.");
+        let update_blocked =
+            sessions_active && !info.capabilities.iter().any(|c| c == "durable-sessions");
+        if info.agent_digest != expected_digest && update_blocked {
+            ui::stderr().hint("Agent update deferred: this guest’s terminals cannot survive updates yet. Close them when ready to update.");
         }
-        if info.agent_digest != expected_digest && !sessions_active {
+        if info.agent_digest != expected_digest && !update_blocked {
             ui::stderr().progress("Updating pbox-agent");
             let binary = fs::read(&agent_binary)
                 .with_context(|| format!("read pbox-agent binary {}", agent_binary.display()))?;
@@ -2518,7 +2522,7 @@ fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<R
                         vec![
                             "/bin/sh".to_owned(),
                             "-c".to_owned(),
-                            "install -m 0755 /tmp/pbox-agent-update /usr/local/bin/pbox-agent && systemctl --no-block restart pbox-agent.service".to_owned(),
+                            include_str!("guest-scripts/update-agent.sh").to_owned(),
                         ],
                         "/",
                         [],
@@ -2527,10 +2531,15 @@ fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<R
                     .await;
                 match result {
                     Ok(result) if exec_exit_code(&result) == 0 => Ok(()),
-                    Ok(result) => bail!("pbox-agent update failed with exit code {}", exec_exit_code(&result)),
+                    Ok(result) => bail!(
+                        "pbox-agent update failed with exit code {}",
+                        exec_exit_code(&result)
+                    ),
                     Err(error) => {
                         let message = error.to_string();
-                        if message.contains("connection closed") || message.contains("UnexpectedEof") {
+                        if message.contains("connection closed")
+                            || message.contains("UnexpectedEof")
+                        {
                             Ok(())
                         } else {
                             Err(error).context("restart pbox-agent after update")
@@ -2602,6 +2611,7 @@ fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<R
     let signals = runtime.block_on(install_terminal_signals())?;
     let terminal = TerminalModeGuard::enter()?;
     let title = ui::TerminalTitleGuard::enter(&box_name);
+    let display = ui::TerminalDisplay::default();
     let result = runtime.block_on(run_ssh_session_with_signals(
         &mut client,
         pbox_agent_client::ExecRequest {
@@ -2612,11 +2622,11 @@ fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<R
             session_name: session_name.clone().unwrap_or_default(),
             ..Default::default()
         },
-        (terminal.as_ref(), title.as_ref()),
+        (terminal.as_ref(), title.as_ref(), &display),
         signals,
     ));
     if result.is_err() || session_name.is_some() {
-        ui::reset_terminal_display();
+        display.restore();
     }
     drop(terminal);
     drop(title);
@@ -2761,7 +2771,11 @@ async fn install_terminal_signals() -> Result<TerminalSignals> {
 async fn run_ssh_session_with_signals(
     client: &mut AgentClient,
     request: pbox_agent_client::ExecRequest,
-    terminal: (Option<&TerminalModeGuard>, Option<&ui::TerminalTitleGuard>),
+    terminal: (
+        Option<&TerminalModeGuard>,
+        Option<&ui::TerminalTitleGuard>,
+        &ui::TerminalDisplay,
+    ),
     signals: TerminalSignals,
 ) -> Result<ExecResult> {
     #[cfg(unix)]
@@ -2773,7 +2787,7 @@ async fn run_ssh_session_with_signals(
             mut terminate,
         } = signals;
         tokio::select! {
-            result = run_ssh_session(client, request, terminal.1.map(|title| title.name.as_str())) => result,
+            result = run_ssh_session(client, request, terminal.1.map(|title| title.name.as_str()), terminal.2) => result,
             _ = interrupt.recv() => terminate_after_signal(terminal, 128 + 2),
             _ = hangup.recv() => terminate_after_signal(terminal, 128 + 1),
             _ = quit.recv() => terminate_after_signal(terminal, 128 + 3),
@@ -2783,16 +2797,26 @@ async fn run_ssh_session_with_signals(
     #[cfg(not(unix))]
     {
         let _ = (terminal, signals);
-        run_ssh_session(client, request, terminal.1.map(|title| title.name.as_str())).await
+        run_ssh_session(
+            client,
+            request,
+            terminal.1.map(|title| title.name.as_str()),
+            terminal.2,
+        )
+        .await
     }
 }
 
 #[cfg(unix)]
 fn terminate_after_signal(
-    terminal: (Option<&TerminalModeGuard>, Option<&ui::TerminalTitleGuard>),
+    terminal: (
+        Option<&TerminalModeGuard>,
+        Option<&ui::TerminalTitleGuard>,
+        &ui::TerminalDisplay,
+    ),
     exit_code: i32,
 ) -> Result<ExecResult> {
-    ui::reset_terminal_display();
+    terminal.2.restore();
     if let Some(title) = terminal.1 {
         title.restore();
     }
@@ -2806,6 +2830,7 @@ async fn run_ssh_session(
     client: &mut AgentClient,
     request: pbox_agent_client::ExecRequest,
     title: Option<&str>,
+    display: &ui::TerminalDisplay,
 ) -> Result<ExecResult> {
     let (terminal_rows, terminal_cols) = terminal_size();
     let persistent = !request.session_name.is_empty();
@@ -2856,11 +2881,13 @@ async fn run_ssh_session(
         };
         match event.event {
             Some(exec_event::Event::Stdout(data)) => {
+                display.observe(&data);
                 write_pty_output(titles.push(&data), false)
                     .await
                     .context("write pbox-agent PTY output")?;
             }
             Some(exec_event::Event::Stderr(data)) => {
+                display.observe(&data);
                 write_pty_output(titles.push(&data), true)
                     .await
                     .context("write pbox-agent PTY error output")?;

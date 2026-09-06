@@ -396,6 +396,8 @@ pub fn supervise() -> Result<()> {
     }
     let args: Vec<String> = serde_json::from_slice(&fs::read(arguments)?)?;
     let mut agent = None;
+    let mut terminals = None;
+    let mut next_terminals = Instant::now();
     let mut network = None;
     let mut next_agent = Instant::now();
     let mut next_network = Instant::now();
@@ -405,12 +407,30 @@ pub fn supervise() -> Result<()> {
         application = Some(command(&request)?.stdin(Stdio::null()).spawn()?.id());
     }
     while !STOP.load(Ordering::Relaxed) {
+        if terminals.is_none() && Instant::now() >= next_terminals {
+            terminals = Some(
+                Command::new(binary)
+                    .arg("--terminal-host")
+                    .arg(crate::terminal_host::SOCKET)
+                    .arg(
+                        args.windows(2)
+                            .find(|pair| pair[0] == "--max-exec")
+                            .map_or("32", |pair| pair[1].as_str()),
+                    )
+                    .stdout(log("/var/log/pbox-terminals.log")?)
+                    .stderr(log("/var/log/pbox-terminals.log")?)
+                    .stdin(Stdio::null())
+                    .spawn()?
+                    .id(),
+            );
+        }
         if agent.is_none() && Instant::now() >= next_agent {
             agent = Some(
                 Command::new(binary)
                     .stdout(log("/var/log/pbox-agent.log")?)
                     .stderr(log("/var/log/pbox-agent.log")?)
                     .args(&args)
+                    .env("PBOX_TERMINAL_SOCKET", crate::terminal_host::SOCKET)
                     .stdin(Stdio::null())
                     .spawn()?
                     .id(),
@@ -444,6 +464,10 @@ pub fn supervise() -> Result<()> {
             let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
             if pid <= 0 {
                 break;
+            }
+            if Some(pid as u32) == terminals {
+                terminals = None;
+                next_terminals = Instant::now() + Duration::from_secs(2);
             }
             if Some(pid as u32) == agent {
                 agent = None;

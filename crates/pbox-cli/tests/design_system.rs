@@ -24,6 +24,7 @@ fn help_for_every_command_uses_the_shared_palette() {
         "new",
         "repair",
         "ssh",
+        "attach",
         "session",
         "session list",
         "session close",

@@ -75,6 +75,15 @@ fn config_path(args: impl IntoIterator<Item = OsString>) -> Option<PathBuf> {
 }
 
 fn boxes(current: &OsStr) -> Vec<CompletionCandidate> {
+    if std::env::args_os().any(|word| word == "ssh" || word == "attach" || word == "session")
+        && let Some((target, prefix)) = current.to_str().and_then(|word| word.split_once(':'))
+    {
+        return query_terminal_names(target.to_owned())
+            .into_iter()
+            .filter(|name| name.starts_with(prefix))
+            .map(|name| CompletionCandidate::new(format!("{target}:{name}")))
+            .collect();
+    }
     query(current, false)
 }
 
@@ -190,7 +199,7 @@ fn terminal_sessions(current: &OsStr) -> Vec<CompletionCandidate> {
         .collect();
     let target = words
         .iter()
-        .position(|word| word == "ssh")
+        .position(|word| word == "ssh" || word == "attach")
         .and_then(|i| words.get(i + 1))
         .or_else(|| {
             words
@@ -203,6 +212,14 @@ fn terminal_sessions(current: &OsStr) -> Vec<CompletionCandidate> {
     let Some(target) = target else {
         return Vec::new();
     };
+    query_terminal_names(target)
+        .into_iter()
+        .filter(|name| name.starts_with(current.to_str().unwrap_or("")))
+        .map(CompletionCandidate::new)
+        .collect()
+}
+
+fn query_terminal_names(target: String) -> Vec<String> {
     let store = ConfigStore::new(
         config_path(std::env::args_os()).unwrap_or_else(pbox_core::config::default_config_path),
     );
@@ -237,10 +254,6 @@ fn terminal_sessions(current: &OsStr) -> Vec<CompletionCandidate> {
     receiver
         .recv_timeout(Duration::from_secs(2))
         .unwrap_or_default()
-        .into_iter()
-        .filter(|name| name.starts_with(current.to_str().unwrap_or("")))
-        .map(CompletionCandidate::new)
-        .collect()
 }
 
 fn query(current: &OsStr, saved: bool) -> Vec<CompletionCandidate> {
@@ -311,6 +324,7 @@ mod tests {
         for words in [
             vec!["pbox", "rm", "pbox-f"],
             vec!["pbox", "--json", "ssh", "pbox-f"],
+            vec!["pbox", "attach", "pbox-f"],
             vec!["pbox", "checkpoint", "create", "pbox-f"],
             vec!["pbox", "snapshot", "create", "pbox-f"],
             vec!["pbox", "recipe", "apply", "tools", "--box-id", "pbox-f"],

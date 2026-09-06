@@ -1,5 +1,6 @@
 mod pty;
 mod sessions;
+mod terminal_host;
 mod workspace;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -250,6 +251,7 @@ struct AgentService {
     forward_allow: Vec<IpNet>,
     exec_slots: Arc<Semaphore>,
     sessions: sessions::Sessions,
+    terminal_host: Option<terminal_host::Client>,
 }
 #[tonic::async_trait]
 impl Agent for AgentService {
@@ -279,6 +281,11 @@ impl Agent for AgentService {
                 "forward".to_owned(),
             ]
             .into_iter()
+            .chain(
+                self.terminal_host
+                    .is_some()
+                    .then(|| "durable-sessions".to_owned()),
+            )
             .chain(
                 Path::new("/etc/pbox/image.json")
                     .exists()
@@ -332,6 +339,12 @@ impl Agent for AgentService {
         &self,
         request: Request<Streaming<ExecRequest>>,
     ) -> Result<Response<Self::TerminalStream>, Status> {
+        if let Some(mut host) = self.terminal_host.clone() {
+            let input = request.into_inner().map_while(Result::ok);
+            return Ok(Response::new(Box::pin(
+                host.terminal(input).await?.into_inner(),
+            )));
+        }
         let _permit = self
             .handshake_slots
             .clone()
@@ -352,6 +365,9 @@ impl Agent for AgentService {
         &self,
         request: Request<pbox_proto::agent::ListSessionsRequest>,
     ) -> Result<Response<pbox_proto::agent::ListSessionsResponse>, Status> {
+        if let Some(mut host) = self.terminal_host.clone() {
+            return host.list_sessions(request).await;
+        }
         sessions::check_protocol(request.into_inner().protocol_version)?;
         Ok(Response::new(pbox_proto::agent::ListSessionsResponse {
             sessions: self.sessions.list(),
@@ -362,6 +378,9 @@ impl Agent for AgentService {
         &self,
         request: Request<ExecRequest>,
     ) -> Result<Response<pbox_proto::agent::TerminalSession>, Status> {
+        if let Some(mut host) = self.terminal_host.clone() {
+            return host.start_session(request).await;
+        }
         let first = workspace::resolve_request(request.into_inner())?;
         validate_exec_request(&first)?;
         Ok(Response::new(
@@ -373,6 +392,9 @@ impl Agent for AgentService {
         &self,
         request: Request<pbox_proto::agent::SessionRequest>,
     ) -> Result<Response<pbox_proto::agent::ReadSessionResponse>, Status> {
+        if let Some(mut host) = self.terminal_host.clone() {
+            return host.read_session(request).await;
+        }
         let request = request.into_inner();
         sessions::check_protocol(request.protocol_version)?;
         Ok(Response::new(self.sessions.read(&request.name)?))
@@ -382,6 +404,9 @@ impl Agent for AgentService {
         &self,
         request: Request<pbox_proto::agent::SendSessionRequest>,
     ) -> Result<Response<pbox_proto::agent::SendSessionResponse>, Status> {
+        if let Some(mut host) = self.terminal_host.clone() {
+            return host.send_session(request).await;
+        }
         let request = request.into_inner();
         sessions::check_protocol(request.protocol_version)?;
         self.sessions
@@ -394,6 +419,9 @@ impl Agent for AgentService {
         &self,
         request: Request<pbox_proto::agent::CloseSessionRequest>,
     ) -> Result<Response<pbox_proto::agent::CloseSessionResponse>, Status> {
+        if let Some(mut host) = self.terminal_host.clone() {
+            return host.close_session(request).await;
+        }
         let request = request.into_inner();
         sessions::check_protocol(request.protocol_version)?;
         self.sessions.close(&request.name).await?;
@@ -1677,6 +1705,22 @@ fn build_server_tls_config(
 }
 
 fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--terminal-host") {
+        let path = std::env::args_os()
+            .nth(2)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(terminal_host::SOCKET));
+        let max_exec = std::env::args()
+            .nth(3)
+            .map(|value| value.parse::<usize>())
+            .transpose()?
+            .unwrap_or(32);
+        anyhow::ensure!(max_exec > 0, "terminal limit must be greater than zero");
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(terminal_host::serve(&path, max_exec));
+    }
     if std::env::args().nth(1).as_deref() == Some("--workspace-init") {
         return workspace::supervise();
     }
@@ -1769,6 +1813,7 @@ async fn serve() -> Result<()> {
         }
         tokio::spawn(pbox_relay::run_agent(access, route, local));
     }
+    let terminal_host = terminal_host::managed(args.max_exec).await?;
     let incoming = LimitedIncoming::new(listener, connection_slots, tls);
     println!("pbox-agent listening on {}", args.listen);
     Server::builder()
@@ -1782,6 +1827,7 @@ async fn serve() -> Result<()> {
             forward_allow: args.forward_allow,
             exec_slots,
             sessions: sessions::Sessions::default(),
+            terminal_host,
         }))
         .serve_with_incoming(incoming)
         .await
@@ -1813,6 +1859,7 @@ mod tests {
             forward_allow: vec!["127.0.0.0/8".parse().unwrap()],
             exec_slots: Arc::new(Semaphore::new(4)),
             sessions: sessions::Sessions::default(),
+            terminal_host: None,
         };
         let tls = build_server_tls_config(
             &server_certificate.certificate_pem,

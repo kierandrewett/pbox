@@ -16,8 +16,10 @@ enum Action {
     },
     /// Start a detached terminal without a local TTY.
     Start {
+        /// Box ID or name, optionally followed by :SESSION.
         id: String,
-        name: String,
+        /// Session name when not included in BOX:SESSION.
+        name: Option<String>,
         #[arg(long, default_value = "")]
         cwd: String,
         #[arg(long, default_value = "")]
@@ -32,11 +34,18 @@ enum Action {
         argv: Vec<String>,
     },
     /// Read the current screen as plain text without attaching.
-    Read { id: String, name: String },
+    Read {
+        /// Box ID or name, optionally followed by :SESSION.
+        id: String,
+        /// Session name when not included in BOX:SESSION.
+        name: Option<String>,
+    },
     /// Send text, then keys, without attaching. Does not retry input.
     Send {
+        /// Box ID or name, optionally followed by :SESSION.
         id: String,
-        name: String,
+        /// Session name when not included in BOX:SESSION.
+        name: Option<String>,
         #[arg(long, conflicts_with = "stdin")]
         text: Option<String>,
         /// Read up to 64 KiB of text from standard input.
@@ -48,12 +57,48 @@ enum Action {
     },
     /// End a terminal and its running processes.
     Close {
+        /// Box ID or name, optionally followed by :SESSION.
         id: String,
-        name: String,
+        /// Session name when not included in BOX:SESSION.
+        name: Option<String>,
         /// Skip confirmation.
         #[arg(long)]
         yes: bool,
     },
+}
+
+fn target(id: &str, name: Option<&str>) -> Result<(String, String)> {
+    let (id, name) = if let Some((id, suffix)) = id.split_once(':') {
+        anyhow::ensure!(
+            name.is_none(),
+            "use either BOX:SESSION or BOX NAME, not both"
+        );
+        (id, suffix)
+    } else {
+        (
+            id,
+            name.context("specify a terminal as BOX:SESSION or BOX NAME")?,
+        )
+    };
+    anyhow::ensure!(
+        !id.is_empty(),
+        "BOX:SESSION needs a box ID or name before the colon"
+    );
+    validate_name(name)?;
+    Ok((id.to_owned(), name.to_owned()))
+}
+
+pub(super) fn normalize_ssh_target(command: &mut SshCommand) -> Result<()> {
+    if command.id.contains(':') {
+        anyhow::ensure!(
+            command.session.is_none(),
+            "use either BOX:SESSION or --session NAME"
+        );
+        let (id, name) = target(&command.id, None)?;
+        command.id = id;
+        command.session = Some(name);
+    }
+    Ok(())
 }
 
 pub(super) fn validate_name(name: &str) -> Result<()> {
@@ -317,13 +362,12 @@ pub fn run(store: &ConfigStore, command: SessionCommand, json: bool) -> Result<R
                 | Action::Send { id, name, .. } => (id, name),
                 _ => unreachable!(),
             };
-            validate_name(name)?;
-            let (box_id, endpoint) = endpoint(&config, id)?;
+            let (id, name) = target(id, name.as_deref())?;
+            let (box_id, endpoint) = endpoint(&config, &id)?;
             let mut client =
                 runtime.block_on(connect(&config, &box_id, &endpoint, "session-control"))?;
             match action {
                 Action::Start {
-                    name,
                     cwd,
                     user,
                     env,
@@ -352,7 +396,7 @@ pub fn run(store: &ConfigStore, command: SessionCommand, json: bool) -> Result<R
                         ui::stdout().success(&format!("Started session {name} on {box_id}"));
                     }
                 }
-                Action::Read { name, .. } => {
+                Action::Read { .. } => {
                     let screen = runtime.block_on(client.read_session(&name))?;
                     if json {
                         let session = screen.session.context("agent omitted terminal details")?;
@@ -367,11 +411,7 @@ pub fn run(store: &ConfigStore, command: SessionCommand, json: bool) -> Result<R
                     }
                 }
                 Action::Send {
-                    name,
-                    text,
-                    stdin,
-                    keys,
-                    ..
+                    text, stdin, keys, ..
                 } => {
                     anyhow::ensure!(
                         text.is_some() || stdin || !keys.is_empty(),
@@ -400,18 +440,32 @@ pub fn run(store: &ConfigStore, command: SessionCommand, json: bool) -> Result<R
             }
         }
         Action::Close { id, name, yes } => {
-            validate_name(&name)?;
+            let (id, name) = target(&id, name.as_deref())?;
             let (box_id, endpoint) = endpoint(&config, &id)?;
             let mut client =
                 runtime.block_on(connect(&config, &box_id, &endpoint, "terminal-sessions"))?;
+            let session = runtime
+                .block_on(client.list_sessions())?
+                .into_iter()
+                .find(|session| session.name == name)
+                .with_context(|| format!("session '{name}' was not found on {box_id}"))?;
             if !yes {
                 anyhow::ensure!(
                     !json && io::stdin().is_terminal() && io::stderr().is_terminal(),
                     "repeat with --yes to close session {name}"
                 );
-                ui::stderr().section("Close terminal session");
-                ui::stderr().metadata("session", &name);
-                ui::stderr().warning("This ends the shell and its running processes.");
+                let box_name = inventory::read(store.path())
+                    .ok()
+                    .flatten()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .records
+                            .into_iter()
+                            .find(|record| record.id.to_string() == box_id)
+                    })
+                    .and_then(|record| record.name)
+                    .unwrap_or_else(|| id.clone());
+                ui::confirm_terminal_close(&box_name, &box_id, &session);
                 if !ui::confirm_action(
                     &mut io::stdin().lock(),
                     &mut io::stderr().lock(),
@@ -423,9 +477,11 @@ pub fn run(store: &ConfigStore, command: SessionCommand, json: bool) -> Result<R
             }
             runtime.block_on(client.close_session(&name))?;
             if json {
-                ui::json_text(&serde_json::json!({"name":name,"closed":true}).to_string());
+                ui::json_text(
+                    &serde_json::json!({"box_id":box_id,"name":name,"closed":true}).to_string(),
+                );
             } else {
-                ui::stdout().success(&format!("Closed session {name}"));
+                ui::stdout().success(&format!("Closed {box_id}:{name}"));
             }
         }
     }
@@ -435,6 +491,56 @@ pub fn run(store: &ConfigStore, command: SessionCommand, json: bool) -> Result<R
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn colon_targets_and_attach_share_the_ssh_path() {
+        for action in ["ssh", "attach"] {
+            let cli = Cli::try_parse_from(["pbox", action, "work:codex", "--", "codex"]).unwrap();
+            let Command::Ssh(mut command) = cli.command else {
+                panic!("expected SSH")
+            };
+            normalize_ssh_target(&mut command).unwrap();
+            assert_eq!(command.id, "work");
+            assert_eq!(command.session.as_deref(), Some("codex"));
+            assert_eq!(command.argv, ["codex"]);
+        }
+        for target in ["work:", ":codex", "work:bad:name"] {
+            let cli = Cli::try_parse_from(["pbox", "ssh", target]).unwrap();
+            let Command::Ssh(mut command) = cli.command else {
+                unreachable!()
+            };
+            assert!(normalize_ssh_target(&mut command).is_err());
+        }
+        let cli = Cli::try_parse_from(["pbox", "ssh", "work:one", "--session", "two"]).unwrap();
+        let Command::Ssh(mut command) = cli.command else {
+            unreachable!()
+        };
+        assert!(normalize_ssh_target(&mut command).is_err());
+    }
+
+    #[test]
+    fn every_session_operation_accepts_colon_targets() {
+        for action in ["start", "read", "send", "close"] {
+            assert!(Cli::try_parse_from(["pbox", "session", action, "work:codex"]).is_ok());
+            assert!(Cli::try_parse_from(["pbox", "session", action, "work", "codex"]).is_ok());
+        }
+        assert_eq!(
+            target("work:codex", None).unwrap(),
+            ("work".into(), "codex".into())
+        );
+        assert_eq!(
+            target("work", Some("codex")).unwrap(),
+            ("work".into(), "codex".into())
+        );
+        for (id, name) in [
+            ("work", None),
+            ("work:one", Some("two")),
+            (":one", None),
+            ("work:", None),
+        ] {
+            assert!(target(id, name).is_err());
+        }
+    }
+
     #[test]
     fn detach_handles_split_kitty_and_legacy_keys_without_consuming_other_input() {
         for key in [

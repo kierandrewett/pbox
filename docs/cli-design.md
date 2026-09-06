@@ -143,7 +143,8 @@ deletions overlay the cached row immediately, before the next PVE refresh.
 
 ## Terminal sessions
 
-`ssh BOX` resumes the agent-owned `main` shell. `--session NAME` selects another
+`ssh BOX` resumes the `main` shell. `ssh BOX:NAME` and its `attach` alias select another
+terminal. `--session NAME` also selects another
 terminal; `session list` shows all boxes, with an optional `BOX` filter.
 `session close BOX NAME` ends one terminal. Connection
 output names the session and explains `Ctrl-]` (detach) and `exit` (end shell).
@@ -216,3 +217,19 @@ in logs and verbose output. Unknown or malformed events are ignored; process exi
 status determines success. Callback logs respect `no_log`. Modules may buffer
 their output until task completion. `python3 scripts/test-ansible-progress.py`
 checks identical events with different stdout callbacks, failures, skips and redaction.
+
+Session targets accept `BOX:NAME` for start, read, send and close, as well as
+`BOX NAME`. Conflicting forms fail. Close confirmation identifies the box and
+session, attachment state, user, starting directory and command. It explains
+that running processes end and warns when an attachment will be disconnected.
+JSON close receipts add `box_id` while retaining `name` and `closed`.
+
+Terminal cleanup resets input modes without erasing screen contents or the
+current line. It leaves the alternate screen only when guest output entered it
+and has not left it. Guest bytes are observed without rewriting them.
+
+A separate terminal supervisor owns persistent PTYs on systemd and pbox minimal
+init guests. The agent proxies session RPCs over a private local socket. Agent
+updates preserve those processes; an interrupted attachment can reconnect.
+Legacy agent-owned sessions still defer updates until closed. The supervisor is
+not restarted as part of an agent update. Box shutdown ends all sessions.

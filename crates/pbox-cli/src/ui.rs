@@ -539,17 +539,77 @@ pub(crate) fn concise_error(error: &anyhow::Error) -> String {
     safe_terminal_text(&message)
 }
 
-pub(crate) fn reset_terminal_display() {
-    // TUIs normally emit these sequences while exiting. Send them ourselves
-    // when the remote session disappears so the local shell remains usable.
-    let mut stdout = io::stdout();
-    if !stdout.is_terminal() {
-        return;
+/// Observe modes without modifying guest bytes, including split control sequences.
+#[derive(Default)]
+pub(crate) struct TerminalDisplay(std::cell::RefCell<(vte::Parser, AlternateScreen)>);
+#[derive(Default)]
+struct AlternateScreen(bool);
+impl vte::Perform for AlternateScreen {
+    fn csi_dispatch(
+        &mut self,
+        params: &vte::Params,
+        intermediates: &[u8],
+        ignore: bool,
+        action: char,
+    ) {
+        if !ignore
+            && intermediates == b"?"
+            && matches!(action, 'h' | 'l')
+            && params.iter().any(|p| matches!(p, [47] | [1047] | [1049]))
+        {
+            self.0 = action == 'h';
+        }
     }
-    let _ = stdout.write_all(
-        b"\x1b[<16u\x1b[=0u\x1b[>4;0m\x1b[?2004l\x1b[?1004l\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1049l\r\x1b[2K",
-    );
-    let _ = stdout.flush();
+    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        if !ignore && intermediates.is_empty() && byte == b'c' {
+            self.0 = false;
+        }
+    }
+}
+impl TerminalDisplay {
+    pub(crate) fn observe(&self, bytes: &[u8]) {
+        let mut state = self.0.borrow_mut();
+        let (parser, modes) = &mut *state;
+        parser.advance(modes, bytes);
+    }
+    fn cleanup(&self) -> Vec<u8> {
+        let mut bytes = b"\x1b[<16u\x1b[=0u\x1b[>4;0m\x1b[?2004l\x1b[?1004l\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l".to_vec();
+        if self.0.borrow().1.0 {
+            bytes.extend_from_slice(b"\x1b[?1049l");
+        }
+        bytes
+    }
+    pub(crate) fn restore(&self) {
+        let mut stdout = io::stdout();
+        if stdout.is_terminal() {
+            let _ = stdout.write_all(&self.cleanup());
+            let _ = stdout.flush();
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_display_tests {
+    use super::*;
+    #[test]
+    fn cleanup_preserves_output_and_only_leaves_an_active_alternate_screen() {
+        let display = TerminalDisplay::default();
+        display.observe(b"shell output");
+        let plain = display.cleanup();
+        assert!(
+            !plain
+                .windows(2)
+                .any(|b| b == b"2K" || b == b"2J" || b == b"3J")
+        );
+        assert!(!plain.windows(5).any(|b| b == b"1049l"));
+        display.observe(b"\x1b[?10");
+        display.observe(b"49h");
+        assert!(display.cleanup().ends_with(b"\x1b[?1049l"));
+        display.observe(b"\x1b[?1049l");
+        assert_eq!(display.cleanup(), plain);
+        display.observe(b"\x1b]0;ignore [ ?1049h\x07");
+        assert_eq!(display.cleanup(), plain);
+    }
 }
 
 pub(crate) fn print_recipe_catalog(
@@ -1601,5 +1661,40 @@ mod image_feedback_preview {
         let mut metadata = pbox_core::PboxMetadata::new(record.id.clone(), record.vmid);
         metadata.image = Some("docker.io/cachyos/cachyos:latest".to_owned());
         delete_details(&record, Some(&metadata), false, stderr());
+    }
+}
+
+/// Show the exact terminal affected before asking for destructive confirmation.
+pub(crate) fn confirm_terminal_close(
+    reference: &str,
+    box_id: &str,
+    session: &pbox_agent_client::TerminalSession,
+) {
+    let style = stderr();
+    style.section("Close terminal session");
+    style.metadata(
+        "box",
+        &if reference == box_id {
+            box_id.to_owned()
+        } else {
+            format!("{reference} · {box_id}")
+        },
+    );
+    style.metadata("session", &session.name);
+    style.metadata(
+        "state",
+        if session.attached {
+            "attached"
+        } else {
+            "detached"
+        },
+    );
+    style.metadata("user", &session.user);
+    style.metadata("started in", &session.cwd);
+    style.metadata("command", &session.argv.join(" "));
+    style
+        .warning("This ends the terminal and all its running processes. Unsaved work may be lost.");
+    if session.attached {
+        style.hint("The connected terminal will be disconnected.");
     }
 }

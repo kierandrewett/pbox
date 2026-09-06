@@ -201,29 +201,39 @@ and carry on where you left off. **Ctrl-]** detaches; `exit` ends the shell.
 
 | Task | Command |
 | --- | --- |
-| Open a separate terminal | `pbox ssh BOX --session build` |
+| Open a separate terminal | `pbox ssh BOX:build` |
 | List terminals across all boxes | `pbox session list` |
 | List terminals in one box | `pbox session list BOX` |
-| End a terminal and its processes | `pbox session close BOX build` |
+| End a terminal and its processes | `pbox session close BOX:build` |
 
-The agent keeps sessions alive; tmux is not required. Reconnecting moves the
-session to the new connection. Sessions end when the agent restarts or the box
-stops. Agent updates are deferred while sessions are running.
+A separate terminal supervisor keeps shells and programs running during agent
+updates; tmux is not required. Reconnect with `pbox attach BOX:build` after an
+interrupted connection. Attaching moves the session from its previous connection.
+Stopping the box or its terminal supervisor ends the sessions.
+
+> [!NOTE]
+> Update survival works with systemd and pbox’s minimal guest init. Sessions created
+> by older agents still defer their first update until you close them. Other init
+> setups also defer updates while sessions are running.
 
 `pbox ssh BOX -- COMMAND` still runs a one-off command. Add `--session NAME`
 to keep that command in a named terminal. Working directory, user and environment
 options apply when a session is created; reconnecting keeps its existing shell.
+
+`BOX:NAME` works with session start, read, send and close. The separate `BOX NAME` form and
+SSH’s `--session NAME` option also work. Closing shows the box, session, command,
+user and starting directory before asking for confirmation.
 
 #### Control a session from a script or agent
 
 These commands work with pipes and `TERM=dumb`. No local terminal emulator is needed.
 
 ```sh
-pbox session start BOX codex -- codex
-pbox session read BOX codex
-pbox session send BOX codex --text "Explain this project"
-pbox session send BOX codex --key Enter
-pbox --json session read BOX codex
+pbox session start BOX:codex -- codex
+pbox session read BOX:codex
+pbox session send BOX:codex --text "Explain this project"
+pbox session send BOX:codex --key Enter
+pbox --json session read BOX:codex
 ```
 
 | Command | Result |
