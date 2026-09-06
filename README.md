@@ -48,7 +48,7 @@ command. It checks at most once a day and ignores network failures. Set
 
 ## Quick start
 
-Pbox runs on your workstation and creates Linux containers on Proxmox.
+Pbox runs on a Linux machine and creates Linux containers on Proxmox.
 Podman prepares the image locally; PVE provides the CPU, memory, disk and
 network for the running box.
 
@@ -58,23 +58,23 @@ You need:
 
 | Component | What it is used for |
 | --- | --- |
-| Linux workstation | Runs the `pbox` CLI and Podman |
+| Machine running pbox | Runs the `pbox` CLI and Podman |
 | Podman | Pulls and prepares OCI images |
 | Proxmox API token | Lets pbox create and manage LXCs |
 | PVE bridge | Connects the LXC to a network |
 | PVE storage | Holds the LXC root filesystem |
 
-Your workstation needs a route to the guest network for direct connections.
+The machine running pbox needs a route to the guest network for direct connections.
 Use a [relay](docs/relay.md) when it does not.
 
 | Network path | Choose this when | Configure |
 | --- | --- | --- |
-| **Direct** | The workstation can reach the guest IP | Nothing extra |
+| **Direct** | The machine running pbox can reach the guest IP | Nothing extra |
 | **Relay** | The guest network is private or unreachable | `relay.url` and `relay.key-file` |
 
 > **Common gap:** the PVE API address and the guest network are separate paths.
-> A working `pbox setup` proves API access; it does not prove that your laptop
-> can reach a guest IP.
+> A working `pbox setup` proves API access; it does not prove that the machine
+> running pbox can reach a guest IP.
 
 ### 2. Install pbox
 
@@ -108,14 +108,38 @@ The values normally map like this:
 | `pve.url` | `https://HOST:8006` |
 | `pve.token_id` / `pve.token_secret` | API token credentials |
 | `pve.node` | Target PVE node |
-| `pve.bridge` | Linux bridge, often `vmbr0` |
+| `pve.bridge` | PVE bridge attached to the required network |
 | `pve.storage` | LXC disk storage |
 | `pve.template_storage` | Temporary image/template storage |
 
+#### Proxmox references
+
+These are the relevant parts of the Proxmox documentation:
+
+- [API tokens and permissions](https://pve.proxmox.com/pve-docs/pve-admin-guide.pdf)
+  — token creation, privileges and token scope.
+- [`pveum` reference](https://pve.proxmox.com/pve-docs/pveum.1.html) — the token
+  ID format is `USER@REALM!TOKEN_NAME`; pbox stores that value as `pve.token_id`.
+- [Network configuration](https://pve.proxmox.com/wiki/Network_Configuration) —
+  bridges, routed networks, NAT and VLANs.
+- [`pct` reference](https://pve.proxmox.com/pve-docs/pct.1.html) — container
+  network settings such as `bridge`, `ip`, `ip6` and `gw`.
+- [`pvesm` reference](https://pve.proxmox.com/pve-docs/pvesm.1.html) — storage
+  types and the `rootdir` and `vztmpl` content types pbox uses.
+
+The API URL normally has this form:
+
+```text
+https://PROXMOX_HOST:8006
+```
+
+The token secret is separate from the token ID. Keep both private; `pbox config
+list` redacts the secret.
+
 ### 4. Add a relay when needed
 
-Use a relay when the box cannot be reached directly from your workstation. The
-box makes an outbound connection to the relay, so the workstation does not
+Use a relay when the box cannot be reached directly from the machine running
+pbox. The box makes an outbound connection to the relay, so that machine does not
 need a route to the guest network.
 
 ```sh
@@ -154,7 +178,7 @@ pbox recipe apply --box-id current dev/base language/rust
 ```
 
 Desktop recipes install a VNC server when required. `pbox desktop` opens the
-desktop in a native window on the workstation:
+desktop in a native window on the machine running pbox:
 
 ```sh
 pbox recipe apply --box-id current desktop/xfce
@@ -294,7 +318,7 @@ See [snapshots.md](docs/snapshots.md) for lifecycle and recovery details.
 
 ## Relay
 
-Use a relay when the workstation cannot route directly to a box. The box opens
+Use a relay when the machine running pbox cannot route directly to a box. The box opens
 an outbound connection to the relay, and the CLI uses the same relay to reach
 it. Pbox still needs separate access to the Proxmox API.
 
@@ -302,8 +326,8 @@ The relay forwards the encrypted agent connection. It does not read shell,
 file-transfer or port-forwarding data. Each box uses a credential scoped to
 that box.
 
-The relay master key belongs on the relay host and on the workstation that
-manages it. Keep it outside repositories and never copy it into a box. See
+The relay master key belongs on the relay host and on the machine that manages
+it. Keep it outside repositories and never copy it into a box. See
 [relay.md](docs/relay.md) for deployment, HTTPS and recovery instructions.
 
 ## License
