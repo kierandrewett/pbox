@@ -37,8 +37,8 @@ before human display. Calculate table padding before applying colour.
   restores the title on disconnect using the terminal title stack. Guest OSC 0/1/2 title
   changes receive a `box-name · ` prefix, including across transport chunks. Terminals without title-stack support may not restore it.
 - Guest output from `exec`, one-off `ssh`, and transferred files are data streams.
-  Preserve their bytes. Persistent interactive SSH uses the terminal viewport
-  below; redirected streams retain their byte-stream behavior.
+  Preserve their bytes. Persistent interactive SSH also passes live terminal
+  controls through, apart from the documented title prefixing.
 - Creation keeps each completed step with a green `ok` and its elapsed time, then
   shows a new spinner for the active step on a capable terminal. Failed steps are
   never marked complete. Redirected output
@@ -249,13 +249,15 @@ The confirmation warns about stopped programs and unsaved work. `--yes` requires
 `--kill-sessions` and skips that prompt for automation. There is no implicit
 kill or SSH prerequisite, and user input is never retried after an update.
 
-Persistent interactive SSH reserves a bottom row for the session and controls.
-Pass guest screen, cursor, mouse and keyboard controls through to the terminal;
-do not render a virtual screen, capture the wheel or add scrolling shortcuts.
-Only constrain scroll margins to the advertised guest area above the bar. Native
-scrollback belongs to the host terminal, so the bar is not pinned while browsing
-history. No pbox-owned alternate screen or screen clear is used on entry or exit.
-Track the cursor only to restore its position after painting the status row.
+Interactive SSH gives the guest the full physical terminal dimensions. Pass live
+screen, cursor, mouse and keyboard controls through; do not draw a status bar,
+rewrite scroll margins or reconstruct cursor positions. Terminal emulation is
+only for snapshots and the read-only viewer, never for decorating a live stream.
+Keep plain URLs and OSC 8 hyperlinks intact. Text selection and link activation
+belong to the host terminal; pbox must not capture their mouse events.
+Native scrollback belongs to the host terminal. No pbox-owned alternate screen
+or screen clear is used on entry or exit. Show the session and detach key in the
+connection message and keep the box name in the terminal title.
 
 The supervisor retains up to 10,000 ordinary full-screen scrollback lines for
 `session read --history`. This is a headless read API, not an interactive scroll
@@ -268,8 +270,8 @@ The plain read prints retained lines before the current screen; JSON adds
 input or resize RPCs. Ctrl+C leaves the viewer. Render inline updates and let the
 host terminal keep scrollback. Viewing does not update or resize the guest.
 
-The status row shows CPU, memory and root-disk percentages from Proxmox on wide
-terminals. Poll every five seconds off the terminal loop, with a three-second
+The read-only viewer status row shows CPU, memory and root-disk percentages from
+Proxmox on wide terminals. Poll every five seconds off the terminal loop, with a three-second
 request timeout. Missing, failed or stale readings display `—`; narrow views keep
 session controls instead. Do not repaint unchanged readings and disturb an idle
 cursor. Preserve guest cursor visibility, blinking and shape, including replay.

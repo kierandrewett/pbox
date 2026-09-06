@@ -198,17 +198,16 @@ results where supported.
 
 `pbox ssh BOX` opens your `main` shell. If the connection drops, run it again
 and carry on where you left off. **Ctrl-]** detaches; `exit` ends the shell.
-The bottom row shows the session, detach key and **⚙ CPU, 🧠 RAM and 💾 DISK**
-usage on wider terminals. Readings come from Proxmox every five seconds;
-amber means at least 80%, red at least 95%, and `—` means unavailable.
+The connection message and terminal title identify the session.
 
-Scrolling, mouse input and cursor settings belong to your terminal and the
-application. pbox does not capture the wheel, add scroll shortcuts or enter its
-own alternate screen. The status row scrolls out of view with native scrollback.
-The guest gets the remaining rows, so the bar does not cover application output.
+The application gets the **full terminal**, including its normal scrolling,
+text selection, clickable links, mouse input and cursor settings. pbox does not
+draw a bar over interactive sessions, capture the wheel, add scroll shortcuts or enter its own alternate
+screen. Native scrollback stays in the same terminal when you detach.
 
 Use `--read-only` to watch without sending input, resizing the guest, or taking
 over another connection. **Ctrl+C** exits the viewer and leaves the session running.
+The read-only viewer shows CPU, RAM and disk usage in its bottom row.
 
 | Task | Command |
 | --- | --- |

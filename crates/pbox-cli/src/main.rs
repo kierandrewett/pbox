@@ -2552,12 +2552,6 @@ fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<R
     let terminal = TerminalModeGuard::enter()?;
     let title = ui::TerminalTitleGuard::enter(&box_name);
     let display = ui::TerminalDisplay::default();
-    let status = session_name
-        .as_ref()
-        .and_then(|name| ui::TerminalStatus::enter(&box_name, name, false));
-    if let Some(status) = &status {
-        status.monitor_resources(sessions::resource_monitor(config.clone(), box_id.clone()));
-    }
     let result = runtime.block_on(run_ssh_session_with_signals(
         &mut client,
         pbox_agent_client::ExecRequest {
@@ -2568,14 +2562,11 @@ fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<R
             session_name: session_name.clone().unwrap_or_default(),
             ..Default::default()
         },
-        (terminal.as_ref(), title.as_ref(), &display, status.as_ref()),
+        (terminal.as_ref(), title.as_ref(), &display),
         signals,
     ));
     if result.is_err() || session_name.is_some() {
         display.restore();
-    }
-    if let Some(status) = &status {
-        status.finish();
     }
     drop(terminal);
     drop(title);
@@ -2724,7 +2715,6 @@ async fn run_ssh_session_with_signals(
         Option<&TerminalModeGuard>,
         Option<&ui::TerminalTitleGuard>,
         &ui::TerminalDisplay,
-        Option<&ui::TerminalStatus>,
     ),
     signals: TerminalSignals,
 ) -> Result<ExecResult> {
@@ -2737,7 +2727,7 @@ async fn run_ssh_session_with_signals(
             mut terminate,
         } = signals;
         tokio::select! {
-            result = run_ssh_session(client, request, terminal.1.map(|title| title.name.as_str()), terminal.2, terminal.3) => result,
+            result = run_ssh_session(client, request, terminal.1.map(|title| title.name.as_str()), terminal.2) => result,
             _ = interrupt.recv() => terminate_after_signal(terminal, 128 + 2),
             _ = hangup.recv() => terminate_after_signal(terminal, 128 + 1),
             _ = quit.recv() => terminate_after_signal(terminal, 128 + 3),
@@ -2752,7 +2742,6 @@ async fn run_ssh_session_with_signals(
             request,
             terminal.1.map(|title| title.name.as_str()),
             terminal.2,
-            terminal.3,
         )
         .await
     }
@@ -2764,14 +2753,10 @@ fn terminate_after_signal(
         Option<&TerminalModeGuard>,
         Option<&ui::TerminalTitleGuard>,
         &ui::TerminalDisplay,
-        Option<&ui::TerminalStatus>,
     ),
     exit_code: i32,
 ) -> Result<ExecResult> {
     terminal.2.restore();
-    if let Some(status) = terminal.3 {
-        status.finish();
-    }
     if let Some(title) = terminal.1 {
         title.restore();
     }
@@ -2786,19 +2771,18 @@ async fn run_ssh_session(
     request: pbox_agent_client::ExecRequest,
     title: Option<&str>,
     display: &ui::TerminalDisplay,
-    status: Option<&ui::TerminalStatus>,
 ) -> Result<ExecResult> {
-    let (terminal_rows, terminal_cols) =
-        status.map_or_else(terminal_size, ui::TerminalStatus::size);
+    let mut size = terminal_size();
+    let (terminal_rows, terminal_cols) = size;
     let persistent = !request.session_name.is_empty();
     let mut initial_screen = if persistent && io::stdout().is_terminal() {
         client
             .list_sessions()
             .await?
             .into_iter()
-            .find(|session| session.name == request.session_name)
+            .any(|session| session.name == request.session_name)
     } else {
-        None
+        false
     };
     let mut session = if persistent {
         client
@@ -2828,22 +2812,19 @@ async fn run_ssh_session(
     let mut window_change =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
             .context("register SIGWINCH handler")?;
-    let mut refresh = tokio::time::interval(Duration::from_secs(1));
     let mut result = ExecResult::default();
     let mut titles = ui::TitlePrefix::new(title);
     loop {
         #[cfg(unix)]
         let event = tokio::select! {
-            _ = refresh.tick(), if status.is_some() => { status.unwrap().refresh_resources(); continue; }
             input = local_input.recv(), if input_open => {
-                input_open = relay_view_input(input, status, &session.input).await?;
+                input_open = relay_terminal_input(input, &mut size, terminal_size(), &session.input).await?;
                 continue;
             }
             event = session.output.message() => event,
             _ = window_change.recv() => {
                 let (rows, cols) = terminal_size();
-                if let Some(status) = status { status.resize(rows, cols); }
-                let (rows, cols) = status.map_or((rows, cols), ui::TerminalStatus::size);
+                size = (rows, cols);
                 session.input.send(pbox_agent_client::ExecInput::Resize { rows, cols }).await
                     .map_err(|_| anyhow!("pbox-agent PTY input closed while resizing"))?;
                 continue;
@@ -2851,9 +2832,8 @@ async fn run_ssh_session(
         };
         #[cfg(not(unix))]
         let event = tokio::select! {
-            _ = refresh.tick(), if status.is_some() => { status.unwrap().refresh_resources(); continue; }
             input = local_input.recv(), if input_open => {
-                input_open = relay_view_input(input, status, &session.input).await?;
+                input_open = relay_terminal_input(input, &mut size, terminal_size(), &session.input).await?;
                 continue;
             }
             event = session.output.message() => event,
@@ -2863,18 +2843,15 @@ async fn run_ssh_session(
         };
         match event.event {
             Some(exec_event::Event::Stdout(data)) => {
-                let data = if let Some(initial) = initial_screen.take() {
-                    ui::append_initial_screen(data, initial.rows, initial.cols)
+                let data = if std::mem::take(&mut initial_screen) {
+                    // The supervisor resizes before producing this snapshot.
+                    // Old session-list dimensions would truncate a larger replay.
+                    ui::append_initial_screen(data, terminal_rows, terminal_cols)
                 } else {
                     data
                 };
                 display.observe(&data);
                 let data = titles.push(&data);
-                let data = if let Some(status) = status {
-                    status.output(data)
-                } else {
-                    data
-                };
                 write_pty_output(data, false)
                     .await
                     .context("write pbox-agent PTY output")?;
@@ -2910,31 +2887,25 @@ async fn run_ssh_session(
     Ok(result)
 }
 
-async fn relay_view_input(
+async fn relay_terminal_input(
     input: Option<ExecInput>,
-    status: Option<&ui::TerminalStatus>,
+    size: &mut (u32, u32),
+    current_size: (u32, u32),
     sender: &tokio::sync::mpsc::Sender<ExecInput>,
 ) -> Result<bool> {
     let Some(input) = input else {
         return Ok(false);
     };
-    let input = match (input, status) {
-        (ExecInput::Data(bytes), Some(status)) => {
-            // Input and SIGWINCH may become ready together. Queue the new PTY
-            // size first so a command cannot run with the previous dimensions.
-            let (rows, cols) = terminal_size();
-            if status.size() != (rows.saturating_sub(1).max(1), cols) {
-                status.resize(rows, cols);
-                let (rows, cols) = status.size();
-                sender
-                    .send(ExecInput::Resize { rows, cols })
-                    .await
-                    .map_err(|_| anyhow!("pbox-agent PTY input closed while resizing"))?;
-            }
-            ExecInput::Data(bytes)
-        }
-        (input, _) => input,
-    };
+    // Input and SIGWINCH may become ready together. Send the physical terminal
+    // dimensions first, then preserve the input bytes exactly.
+    if matches!(&input, ExecInput::Data(_)) && *size != current_size {
+        let (rows, cols) = current_size;
+        sender
+            .send(ExecInput::Resize { rows, cols })
+            .await
+            .map_err(|_| anyhow!("pbox-agent PTY input closed while resizing"))?;
+        *size = current_size;
+    }
     sender
         .send(input)
         .await
@@ -5434,6 +5405,26 @@ fn box_state_colour(state: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_resize_precedes_unmodified_input() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+            let mut size = (24, 80);
+            let bytes = b"\x1b[<64;3;5M\x1b[200~paste\x1b[201~".to_vec();
+            assert!(super::relay_terminal_input(
+                Some(super::ExecInput::Data(bytes.clone())),
+                &mut size,
+                (55, 154),
+                &sender,
+            ).await.unwrap());
+            assert!(matches!(receiver.recv().await, Some(super::ExecInput::Resize { rows: 55, cols: 154 })));
+            assert!(matches!(receiver.recv().await, Some(super::ExecInput::Data(actual)) if actual == bytes));
+            assert_eq!(size, (55, 154));
+            assert!(!super::relay_terminal_input(None, &mut size, (55, 154), &sender).await.unwrap());
+            assert!(receiver.try_recv().is_err());
+        });
+    }
+
     use super::{
         ANSI_CYAN, ANSI_RESET, AnsibleRun, BootstrapKey, BoxRecord, Cli, CliStyle, Command,
         ForwardCommand, NewCommand, RecipeSnapshot, SetupAnswers, SetupChoice, SetupCommand,

@@ -64,6 +64,19 @@ just test
 and the Python script tests. CLI presentation changes must also be inspected in
 terminal, redirected and JSON modes; follow [the design system](cli-design.md).
 
+For SSH changes, also run against a running box with Python:
+
+```sh
+cargo build -p pbox
+PBOX_AGENT_BINARY="$HOME/.cargo/bin/pbox-agent" \
+  python3 scripts/test-terminal-stream.py BOX --pbox target/debug/pbox
+```
+
+This creates its own session and checks split terminal controls, Unicode, input
+bytes and full-size resizing. It closes only that session. Use a portable agent
+binary with development CLI builds. Also check a real TUI response, resize and
+reconnection; a startup banner alone is not sufficient.
+
 ## Image tests
 
 Requires Docker, the build tools above and enough space for disposable images.

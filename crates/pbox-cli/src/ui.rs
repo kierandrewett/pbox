@@ -1788,9 +1788,9 @@ pub(crate) fn agent_update_result(
     }
 }
 
-/// A reserved terminal row, with the guest constrained to the rows above it.
-/// No alternate screen is entered and the existing screen is never cleared.
-pub(crate) struct TerminalStatus(std::cell::RefCell<StatusState>);
+/// Status for the decoded, read-only viewer only. Never wrap live guest output:
+/// cursor tracking cannot reproduce every control supported by the host terminal.
+struct TerminalStatus(std::cell::RefCell<StatusState>);
 struct StatusState {
     parser: vt100::Parser<NativeControls>,
     filter: ViewportFilter,
@@ -1885,7 +1885,7 @@ impl StatusState {
     }
 }
 impl TerminalStatus {
-    pub(crate) fn enter(box_name: &str, session: &str, read_only: bool) -> Option<Self> {
+    fn enter(box_name: &str, session: &str) -> Option<Self> {
         if !io::stdin().is_terminal() || !stdout().can_animate() {
             return None;
         }
@@ -1899,7 +1899,7 @@ impl TerminalStatus {
             rows: rows as u16,
             cols: cols as u16,
             label: format!("{box_name}:{session}"),
-            read_only,
+            read_only: true,
             colour: stdout().enabled,
             resources: None,
             usage: None,
@@ -2313,7 +2313,7 @@ impl SessionViewer {
         }
     }
     pub(crate) fn new(box_name: &str, session: &str) -> Self {
-        let status = TerminalStatus::enter(box_name, session, true);
+        let status = TerminalStatus::enter(box_name, session);
         if status.is_none() {
             stdout().stdout_heading(&format!("Watching {box_name}:{session} (read-only)"));
             stdout().stdout_hint("Ctrl+C exits the viewer. The session keeps running.");
@@ -2605,5 +2605,21 @@ mod viewport_tests {
             local.screen().contents(),
             "existing local output\n$ pending"
         );
+    }
+
+    #[test]
+    fn legacy_replay_uses_the_new_attachment_dimensions() {
+        // An older owner expands the saved screen before sending its snapshot.
+        let mut remote = vt100::Parser::new(40, 120, 0);
+        remote.process(b"\x1b[37;1Hresponse end\x1b[39;1H> unsent draft");
+        let mut replay = b"\x1b[?1049l".to_vec();
+        replay.extend(remote.screen().state_formatted());
+        replay.extend_from_slice(b"\x1b[<16u\x1b[=0u");
+        let output = append_initial_screen(replay, 40, 120);
+        let mut local = vt100::Parser::new(40, 120, 0);
+        local.process(&output);
+        assert!(local.screen().contents().contains("response end"));
+        assert!(local.screen().contents().contains("> unsent draft"));
+        assert_eq!(local.screen().cursor_position().1, 14);
     }
 }
