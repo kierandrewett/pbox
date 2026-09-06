@@ -564,18 +564,20 @@ pub(crate) fn print_box_records(records: &[BoxRecord], colour: bool) {
             .collect(),
         39,
     );
+    let gap = "  ";
     let header = format!(
-        "{id:<id_width$} {state:<state_width$} {ping:<ping_width$} {node:<node_width$} {ipv4:<ipv4_width$} {ipv6}NAME",
+        "{id:<id_width$}{gap}{state:<state_width$}{gap}{ping:<ping_width$}{gap}{node:<node_width$}{gap}{ipv4:<ipv4_width$}{gap}{ipv6}NAME",
         id = "ID",
         state = "STATE",
         ping = "PING",
         node = "NODE",
         ipv4 = "IPV4",
         ipv6 = if has_ipv6 {
-            format!("{:<width$} ", "IPV6", width = ipv6_width)
+            format!("{:<width$}", "IPV6", width = ipv6_width)
         } else {
             String::new()
         },
+        gap = gap,
     );
     println!("{}", style.paint(ANSI_BOLD_CYAN, &header));
     for record in records {
@@ -591,14 +593,11 @@ pub(crate) fn print_box_records(records: &[BoxRecord], colour: bool) {
         let ip = format_box_cell(style, record.ip.as_deref().unwrap_or("-"), ipv4_width, "");
         let name = style.text(record.name.as_deref().unwrap_or("-"));
         let ipv6 = if has_ipv6 {
-            format!(
-                "{} ",
-                format_box_cell(style, record.ipv6.as_deref().unwrap_or("-"), ipv6_width, "")
-            )
+            format_box_cell(style, record.ipv6.as_deref().unwrap_or("-"), ipv6_width, "")
         } else {
             String::new()
         };
-        println!("{id} {state} {ping} {node} {ip} {ipv6}{name}");
+        println!("{id}{gap}{state}{gap}{ping}{gap}{node}{gap}{ip}{gap}{ipv6}{name}");
     }
     if records.is_empty() {
         println!(
