@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish workspace crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish --locked -p pbox-proto
+          sleep 30
+          cargo publish --locked -p pbox-core
+          cargo publish --locked -p pbox-crypto
+          cargo publish --locked -p pbox-relay
+          sleep 30
+          cargo publish --locked -p pbox-agent-client
+          cargo publish --locked -p pbox-agent
+          sleep 30
+          cargo publish --locked -p pbox
+
+  binaries:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Build release binaries
+        run: cargo build --locked --release --target x86_64-unknown-linux-gnu -p pbox -p pbox-agent
+      - name: Package release binaries
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "pbox"))')
+          target=x86_64-unknown-linux-gnu
+          mkdir release
+          tar -C target/$target/release -czf release/pbox-$version-$target.tar.gz pbox
+          tar -C target/$target/release -czf release/pbox-agent-$version-$target.tar.gz pbox-agent
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.tar.gz
