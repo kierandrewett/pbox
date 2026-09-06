@@ -192,6 +192,18 @@ impl AgentClient {
         client_identity: &CertificateMaterial,
         relay: Option<&pbox_relay::RelayAccess>,
     ) -> Result<Self, AgentClientError> {
+        Self::connect_with_relay_route(endpoint, box_id, ca_pem, client_identity, relay, box_id)
+            .await
+    }
+
+    pub async fn connect_with_relay_route(
+        endpoint: &str,
+        box_id: &str,
+        ca_pem: &str,
+        client_identity: &CertificateMaterial,
+        relay: Option<&pbox_relay::RelayAccess>,
+        route: &str,
+    ) -> Result<Self, AgentClientError> {
         let domain = server_dns_name(box_id)
             .map_err(|error| AgentClientError::Identity(error.to_string()))?;
         let endpoint = Endpoint::from_shared(endpoint.to_owned())
@@ -209,7 +221,7 @@ impl AgentClient {
         .timeout(AGENT_RPC_TIMEOUT);
         validate_https_endpoint(&endpoint)?;
         let mut connector = AgentTlsConnector::new(domain, ca_pem, client_identity)?;
-        connector.relay = relay.cloned().map(|access| (access, box_id.to_owned()));
+        connector.relay = relay.cloned().map(|access| (access, route.to_owned()));
         let channel = connector_endpoint.connect_with_connector(connector).await?;
         let inner = GeneratedAgentClient::new(channel);
         Ok(Self {

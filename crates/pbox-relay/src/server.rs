@@ -1,5 +1,5 @@
 //! The relay matches scoped connections and forwards opaque binary frames.
-use crate::{DEAD_PEER, HEARTBEAT, READY, authorised, valid_box_id};
+use crate::{DEAD_PEER, HEARTBEAT, READY, authorised, valid_route};
 use axum::{
     Router,
     extract::{
@@ -60,7 +60,7 @@ async fn upgrade(
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
     if !matches!(role.as_str(), "agent" | "client")
-        || !valid_box_id(&box_id)
+        || !valid_route(&box_id)
         || !authorised(&state.key, &role, &box_id, token)
     {
         return StatusCode::UNAUTHORIZED.into_response();

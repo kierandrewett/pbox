@@ -68,6 +68,10 @@ struct Args {
     /// Root-readable JSON containing the relay URL and this guest's scoped token.
     #[arg(long)]
     relay_config: Option<PathBuf>,
+    /// Use a snapshot-scoped bootstrap route selected by the new PVE hostname.
+    #[arg(long)]
+    snapshot_bootstrap: bool,
+
     #[arg(
         long = "forward-allow",
         value_delimiter = ',',
@@ -1493,9 +1497,26 @@ async fn main() -> Result<()> {
         .await
         .context("bind agent listen address")?;
     if let Some(path) = args.relay_config {
-        let access: pbox_relay::RelayAccess = serde_json::from_slice(&tokio::fs::read(path).await?)
-            .context("parse relay configuration")?;
-        pbox_relay::websocket_url(&access.url, "agent", &args.box_id)?;
+        let mut access: pbox_relay::RelayAccess =
+            serde_json::from_slice(&tokio::fs::read(path).await?)
+                .context("parse relay configuration")?;
+        let route = if args.snapshot_bootstrap {
+            let hostname = tokio::fs::read_to_string("/etc/hostname").await?;
+            let suffix = hostname
+                .trim()
+                .strip_prefix("pbox-")
+                .context("snapshot clone hostname must be pbox-ID")?;
+            let route = format!("{}~pbx_{suffix}", args.box_id);
+            anyhow::ensure!(
+                pbox_relay::valid_route(&route),
+                "invalid snapshot bootstrap route"
+            );
+            access.token = pbox_relay::scoped_token(&access.token, "agent", &route);
+            route
+        } else {
+            args.box_id.clone()
+        };
+        pbox_relay::websocket_url(&access.url, "agent", &route)?;
         let mut local = listener.local_addr()?;
         if local.ip().is_unspecified() {
             local.set_ip(if local.is_ipv4() {
@@ -1504,7 +1525,7 @@ async fn main() -> Result<()> {
                 std::net::Ipv6Addr::LOCALHOST.into()
             });
         }
-        tokio::spawn(pbox_relay::run_agent(access, args.box_id.clone(), local));
+        tokio::spawn(pbox_relay::run_agent(access, route, local));
     }
     let incoming = LimitedIncoming::new(listener, connection_slots, tls);
     println!("pbox-agent listening on {}", args.listen);

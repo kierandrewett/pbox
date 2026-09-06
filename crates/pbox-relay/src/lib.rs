@@ -51,15 +51,24 @@ pub(crate) fn authorised(master: &str, role: &str, box_id: &str, token: &str) ->
     let Ok(bytes) = hex::decode(token) else {
         return false;
     };
+    let seed;
+    let key = if role == "agent"
+        && let Some((parent, _)) = box_id.split_once('~')
+    {
+        seed = scoped_token(master, "snapshot", parent);
+        seed.as_str()
+    } else {
+        master
+    };
     let mut mac =
-        Hmac::<Sha256>::new_from_slice(master.as_bytes()).expect("HMAC accepts any key length");
+        Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
     mac.update(format!("pbox-relay-v1/{role}/{box_id}").as_bytes());
     mac.verify_slice(&bytes).is_ok()
 }
 
 /// Validate an HTTP(S) or WS(S) relay origin, including private IPv4 and IPv6 addresses.
 pub fn websocket_url(origin: &str, role: &str, box_id: &str) -> Result<String> {
-    if !matches!(role, "agent" | "client") || !valid_box_id(box_id) {
+    if !matches!(role, "agent" | "client") || !valid_route(box_id) {
         bail!("invalid relay role or box ID");
     }
     let mut url = url::Url::parse(origin).context("parse relay URL")?;
@@ -81,6 +90,15 @@ pub fn websocket_url(origin: &str, role: &str, box_id: &str) -> Result<String> {
         .map_err(|_| anyhow::anyhow!("invalid relay URL scheme"))?;
     url.set_path(&format!("/v1/{role}/{box_id}"));
     Ok(url.to_string())
+}
+
+/// Bootstrap routes belong to one snapshot and one new box, never a normal box route.
+pub fn valid_route(value: &str) -> bool {
+    if let Some((parent, child)) = value.split_once('~') {
+        valid_box_id(parent) && valid_box_id(child)
+    } else {
+        valid_box_id(value)
+    }
 }
 
 pub(crate) fn valid_box_id(value: &str) -> bool {
@@ -192,6 +210,36 @@ mod tests {
     const BOX: &str = "pbx_12345678";
 
     #[test]
+    fn snapshot_delegation_cannot_impersonate_boxes_clients_or_other_snapshots() {
+        let route = "pbx_12345678~pbx_abcdefgh";
+        let seed = scoped_token(KEY, "snapshot", BOX);
+        let token = scoped_token(&seed, "agent", route);
+        assert!(valid_route(route));
+        assert!(authorised(KEY, "agent", route, &token));
+        assert!(!authorised(KEY, "client", route, &token));
+        assert!(!authorised(
+            KEY,
+            "agent",
+            "pbx_abcdefgh",
+            &scoped_token(&seed, "agent", "pbx_abcdefgh")
+        ));
+        let foreign = "pbx_87654321~pbx_abcdefgh";
+        assert!(!authorised(
+            KEY,
+            "agent",
+            foreign,
+            &scoped_token(&seed, "agent", foreign)
+        ));
+        assert!(!authorised(
+            KEY,
+            "client",
+            route,
+            &scoped_token(&seed, "client", route)
+        ));
+        assert!(!valid_route("pbx_12345678~pbx_abcdefgh~pbx_87654321"));
+    }
+
+    #[test]
     fn credentials_are_scoped_to_role_and_box() {
         let token = scoped_token(KEY, "agent", BOX);
         assert!(authorised(KEY, "agent", BOX, &token));
@@ -220,6 +268,18 @@ mod tests {
 
     #[tokio::test]
     async fn relay_transports_binary_data_and_reconnects_for_next_client() {
+        exercise_route(BOX, scoped_token(KEY, "agent", BOX)).await;
+    }
+    #[tokio::test]
+    async fn snapshot_bootstrap_route_transports_binary_data() {
+        let route = "pbx_12345678~pbx_abcdefgh";
+        exercise_route(
+            route,
+            scoped_token(&scoped_token(KEY, "snapshot", BOX), "agent", route),
+        )
+        .await;
+    }
+    async fn exercise_route(route: &str, agent_token: String) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -240,16 +300,16 @@ mod tests {
         });
         let guest = RelayAccess {
             url: url.clone(),
-            token: scoped_token(KEY, "agent", BOX),
+            token: agent_token,
         };
-        assert!(open(&guest, "client", BOX).await.is_err());
-        let agent = tokio::spawn(run_agent(guest, BOX.to_owned(), address));
+        assert!(open(&guest, "client", route).await.is_err());
+        let agent = tokio::spawn(run_agent(guest, route.to_owned(), address));
         let access = RelayAccess {
             url,
-            token: scoped_token(KEY, "client", BOX),
+            token: scoped_token(KEY, "client", route),
         };
         futures_util::future::join_all((0..8).map(|_| async {
-            let mut stream = tokio::time::timeout(Duration::from_secs(5), connect(&access, BOX))
+            let mut stream = tokio::time::timeout(Duration::from_secs(5), connect(&access, route))
                 .await
                 .unwrap()
                 .unwrap();
@@ -266,7 +326,7 @@ mod tests {
         }))
         .await;
         // A later command must still connect after the concurrent batch closes.
-        connect(&access, BOX).await.unwrap();
+        connect(&access, route).await.unwrap();
         agent.abort();
         echo.abort();
         server.abort();
