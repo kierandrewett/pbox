@@ -50,6 +50,8 @@ pub(crate) struct SavedEnvironment {
     pub node: String,
     pub vmid: u64,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
     pub created: String,
     pub bootstrap_id: String,
     pub recipes: Vec<PboxRecipeProvenance>,
@@ -354,6 +356,7 @@ fn create(
         node: record.node.clone(),
         vmid: 0,
         source: record.id.to_string(),
+        image: None,
         created: current_timestamp()?,
         bootstrap_id,
         recipes: vec![],
@@ -361,6 +364,7 @@ fn create(
     };
     if let Some(metadata) = parse_metadata(original.description.as_deref().unwrap_or(""))? {
         saved.recipes = metadata.recipes;
+        saved.image = metadata.image;
     }
     let was_running = client.get_lxc_state(&record.node, record.vmid)? == "running";
     if !was_running {
@@ -683,6 +687,8 @@ pub fn restore(config: &Config, command: NewCommand, json: bool, color: ColorCho
         &hostname,
         |vmid| {
             let mut metadata = PboxMetadata::new(id.clone(), vmid).with_node(&saved.node);
+            metadata.image = saved.image.clone();
+            metadata.snapshot = Some(format!("{} ({})", saved.name, saved.id));
             metadata.recipes = saved.recipes.clone();
             metadata.capabilities = saved.capabilities.clone();
             Ok(format!(
@@ -913,6 +919,7 @@ mod tests {
             node: "pve".into(),
             vmid: 9100,
             source: "pbx_abcdefgh".into(),
+            image: Some("docker.io/library/fedora:44".into()),
             created: "2026-09-06T00:00:00Z".into(),
             bootstrap_id: "pbx_12345678".into(),
             recipes: vec![],
@@ -923,6 +930,7 @@ mod tests {
         let restored = parse_saved(&description).unwrap().unwrap();
         assert_eq!(restored.id, saved.id);
         assert_eq!(restored.source, saved.source);
+        assert_eq!(restored.image, saved.image);
         assert!(parse_saved(&format!("{description}\n{description}")).is_err());
     }
     #[test]

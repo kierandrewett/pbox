@@ -11,6 +11,10 @@ pub struct PboxMetadata {
     pub id: PboxId,
     pub vmid: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recipes: Vec<PboxRecipeProvenance>,
@@ -34,6 +38,8 @@ impl PboxMetadata {
         Self {
             id,
             vmid,
+            image: None,
+            snapshot: None,
             node: None,
             recipes: Vec::new(),
             capabilities: Vec::new(),
@@ -145,6 +151,8 @@ mod tests {
             applied_at: None,
             result: Some("failed".to_owned()),
         });
+        metadata.image = Some("docker.io/library/fedora:44".to_owned());
+        metadata.snapshot = Some("llm-ready (psn_12345678)".to_owned());
         metadata.capabilities.push("desktop".to_owned());
         metadata.capabilities.push("contains --> safely".to_owned());
         let markdown = "User note\n\nKeep this text.";
