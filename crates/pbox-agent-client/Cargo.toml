@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Authenticated client for the pbox guest agent"
+repository.workspace = true
 
 [dependencies]
 pbox-relay = { version = "0.1.0", path = "../pbox-relay" }

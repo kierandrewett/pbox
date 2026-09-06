@@ -61,6 +61,54 @@ pbox ssh current
 `current` works when exactly one pbox exists. Use a box ID or name when
 there is more than one.
 
+## Examples
+
+List boxes:
+
+```text
+$ pbox list
+ID            STATE    PING  NODE  IPV4          NAME           IMAGE
+pbx_d7ky95gz  running  ok    pve   172.30.0.134  pbox-d7ky95gz  docker.io/cachyos/cachyos:latest
+```
+
+Inspect a box:
+
+```text
+$ pbox info current
+box pbx_d7ky95gz
+  vmid         9000
+  state        running
+  node         pve
+  ipv4         172.30.0.134
+  name         pbox-d7ky95gz
+  recipes      agent/codex, browser/helium, desktop/xfce, dev/base, language/rust
+```
+
+Apply recipes:
+
+```text
+$ pbox recipe apply --box-id current dev/base language/rust
+! Snapshots are unavailable on this storage; applying the recipe without a snapshot.
+dev/base, language/rust → pbx_d7ky95gz
+ok Preparing guest (1s)
+> Applying recipes
+> Install Rust with rustup
+ok Install Rust with rustup (8s)
+```
+
+Open a shell:
+
+```text
+$ pbox ssh current
+> Connected to pbx_d7ky95gz. Type exit to disconnect.
+[pbox@pbox-d7ky95gz ~]$ rustup --version
+rustup 1.28.2
+[pbox@pbox-d7ky95gz ~]$
+```
+
+The exact task lines and timings depend on the image and the recipes already
+installed. Use `--verbose` to stream the complete Ansible output.
+
 ## Boxes
 
 ```sh

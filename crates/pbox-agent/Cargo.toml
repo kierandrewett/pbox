@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Authenticated guest agent for pbox workspaces"
+repository.workspace = true
 
 [[bin]]
 name = "pbox-agent"
