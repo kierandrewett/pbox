@@ -7,6 +7,7 @@ mod guest;
 mod images;
 mod inventory;
 mod progress;
+mod sessions;
 mod snapshots;
 mod ui;
 mod update;
@@ -125,8 +126,10 @@ enum Command {
     New(NewCommand),
     /// Resume an interrupted guest-agent bootstrap.
     Repair { id: String },
-    /// Open an interactive shell through pbox-agent.
+    /// Resume your shell, or run a command, through pbox-agent.
     Ssh(SshCommand),
+    /// List and close persistent terminal sessions.
+    Session(sessions::SessionCommand),
     /// Execute a non-interactive command through pbox-agent.
     Exec(ExecCommand),
     /// Copy files between the control machine and a pbox.
@@ -273,6 +276,9 @@ struct ImagePullOutput {
 struct SshCommand {
     /// Box ID, unique name, or current when exactly one box exists.
     id: String,
+    /// Open or resume a named terminal. The default shell uses main.
+    #[arg(long)]
+    session: Option<String>,
     /// Agent endpoint override. By default pbox resolves the guest address from PVE.
     #[arg(long)]
     endpoint: Option<String>,
@@ -470,6 +476,43 @@ struct BoxInfo {
     name: Option<String>,
     recipes: Vec<PboxRecipeProvenance>,
     capabilities: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resources: Option<BoxResources>,
+}
+
+#[derive(Debug, Serialize)]
+struct BoxResources {
+    cores: Option<u64>,
+    memory_mib: Option<u64>,
+    swap_mib: Option<u64>,
+    disk_size: Option<String>,
+    storage: Option<String>,
+    filesystem_size_bytes: Option<u64>,
+    filesystem_used_bytes: Option<u64>,
+}
+
+impl From<&pbox_core::LxcConfig> for BoxResources {
+    fn from(config: &pbox_core::LxcConfig) -> Self {
+        let rootfs = config.rootfs.as_deref().unwrap_or("");
+        let volume = rootfs.split(',').next().unwrap_or("");
+        Self {
+            filesystem_size_bytes: None,
+            filesystem_used_bytes: None,
+            cores: config.cores,
+            memory_mib: config.memory,
+            swap_mib: config.swap,
+            disk_size: rootfs.split(',').find_map(|part| {
+                part.strip_prefix("size=")
+                    .filter(|size| !size.is_empty())
+                    .map(str::to_owned)
+            }),
+            storage: volume
+                .strip_prefix("volume=")
+                .unwrap_or(volume)
+                .split_once(':')
+                .map(|(storage, _)| storage.to_owned()),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -601,6 +644,7 @@ fn run() -> Result<RunOutcome> {
             run_repair(&store, &id, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
         Command::Ssh(command) => run_ssh(&store, command, cli.json),
+        Command::Session(command) => sessions::run(&store, command, cli.json),
         Command::Exec(command) => run_exec(&store, command, cli.json),
         Command::Desktop(command) => {
             desktop::run(&store, command, cli.json).map(|_| RunOutcome::Success)
@@ -2384,6 +2428,13 @@ fn run_exec(store: &ConfigStore, command: ExecCommand, json: bool) -> Result<Run
     }
 }
 fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<RunOutcome> {
+    let session_name = command
+        .session
+        .clone()
+        .or_else(|| command.argv.is_empty().then(|| "main".to_owned()));
+    if let Some(name) = &session_name {
+        sessions::validate_name(name)?;
+    }
     if json {
         bail!("pbox ssh does not support --json");
     }
@@ -2448,7 +2499,12 @@ fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<R
         && agent_binary.is_file()
     {
         let expected_digest = file_digest(&agent_binary)?;
-        if info.agent_digest != expected_digest {
+        let sessions_active = info.capabilities.iter().any(|c| c == "terminal-sessions")
+            && !runtime.block_on(client.list_sessions())?.is_empty();
+        if info.agent_digest != expected_digest && sessions_active {
+            ui::stderr().hint("Agent update deferred while terminal sessions are running.");
+        }
+        if info.agent_digest != expected_digest && !sessions_active {
             ui::stderr().progress("Updating pbox-agent");
             let binary = fs::read(&agent_binary)
                 .with_context(|| format!("read pbox-agent binary {}", agent_binary.display()))?;
@@ -2462,7 +2518,7 @@ fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<R
                         vec![
                             "/bin/sh".to_owned(),
                             "-c".to_owned(),
-                            "install -m 0755 /tmp/pbox-agent-update /usr/local/bin/pbox-agent && (systemctl restart pbox-agent.service >/dev/null 2>&1 &)".to_owned(),
+                            "install -m 0755 /tmp/pbox-agent-update /usr/local/bin/pbox-agent && systemctl --no-block restart pbox-agent.service".to_owned(),
                         ],
                         "/",
                         [],
@@ -2483,19 +2539,39 @@ fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<R
                 }
             })?;
             drop(client);
-            std::thread::sleep(Duration::from_millis(800));
             let (reconnected, refreshed) = runtime.block_on(async {
-                let mut client =
-                    relay::connect_agent(&config, &endpoint, &box_id, &ca_pem, &client_identity)
+                tokio::time::timeout(Duration::from_secs(20), async {
+                    loop {
+                        if let Ok(mut client) = relay::connect_agent(
+                            &config,
+                            &endpoint,
+                            &box_id,
+                            &ca_pem,
+                            &client_identity,
+                        )
                         .await
-                        .context("reconnect to updated pbox-agent")?;
-                let info = client.info().await.context("validate updated pbox-agent")?;
-                Ok::<_, anyhow::Error>((client, info))
+                            && let Ok(info) = client.info().await
+                            && info.agent_digest == expected_digest
+                        {
+                            return (client, info);
+                        }
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                })
+                .await
+                .context(
+                    "agent update did not become ready; check the pbox-agent service in the guest",
+                )
             })?;
             client = reconnected;
             info = refreshed;
             ui::stderr().clear_progress_line();
         }
+    }
+    if session_name.is_some() && !info.capabilities.iter().any(|c| c == "terminal-sessions") {
+        bail!(
+            "the guest agent needs an update for persistent shells; install the matching pbox-agent binary and retry"
+        );
     }
     let workspace = info.capabilities.iter().any(|c| c == "workspace");
     if !workspace && command.cwd.is_empty() {
@@ -2511,34 +2587,35 @@ fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<R
     {
         bail!("pbox-agent does not advertise PTY support; upgrade the guest agent");
     }
-    if command.argv.is_empty() {
-        if !workspace {
-            let user = if command.user.is_empty() {
-                "pbox"
-            } else {
-                &command.user
-            };
-            let access = runtime.block_on(guest::check_client(&mut client, user));
-            ui::user_access(&info.box_id, user, access);
-        }
-        ui::stderr().progress(&format!(
-            "Connected to {}. Type exit to disconnect.",
-            info.box_id
-        ));
+    if command.argv.is_empty() && !workspace {
+        let user = if command.user.is_empty() {
+            "pbox"
+        } else {
+            &command.user
+        };
+        let access = runtime.block_on(guest::check_client(&mut client, user));
+        ui::user_access(&info.box_id, user, access);
+    }
+    if let Some(name) = &session_name {
+        ui::session_connected(&info.box_id, name);
     }
     let signals = runtime.block_on(install_terminal_signals())?;
     let terminal = TerminalModeGuard::enter()?;
     let title = ui::TerminalTitleGuard::enter(&box_name);
     let result = runtime.block_on(run_ssh_session_with_signals(
         &mut client,
-        argv,
-        command.cwd,
-        env,
-        command.user,
+        pbox_agent_client::ExecRequest {
+            argv,
+            cwd: command.cwd,
+            env: env.into_iter().collect(),
+            user: command.user,
+            session_name: session_name.clone().unwrap_or_default(),
+            ..Default::default()
+        },
         (terminal.as_ref(), title.as_ref()),
         signals,
     ));
-    if result.is_err() {
+    if result.is_err() || session_name.is_some() {
         ui::reset_terminal_display();
     }
     drop(terminal);
@@ -2680,10 +2757,7 @@ async fn install_terminal_signals() -> Result<TerminalSignals> {
 
 async fn run_ssh_session_with_signals(
     client: &mut AgentClient,
-    argv: Vec<String>,
-    cwd: String,
-    env: Vec<(String, String)>,
-    user: String,
+    request: pbox_agent_client::ExecRequest,
     terminal: (Option<&TerminalModeGuard>, Option<&ui::TerminalTitleGuard>),
     signals: TerminalSignals,
 ) -> Result<ExecResult> {
@@ -2696,7 +2770,7 @@ async fn run_ssh_session_with_signals(
             mut terminate,
         } = signals;
         tokio::select! {
-            result = run_ssh_session(client, argv, cwd, env, user, terminal.1.map(|title| title.name.as_str())) => result,
+            result = run_ssh_session(client, request, terminal.1.map(|title| title.name.as_str())) => result,
             _ = interrupt.recv() => terminate_after_signal(terminal, 128 + 2),
             _ = hangup.recv() => terminate_after_signal(terminal, 128 + 1),
             _ = quit.recv() => terminate_after_signal(terminal, 128 + 3),
@@ -2706,15 +2780,7 @@ async fn run_ssh_session_with_signals(
     #[cfg(not(unix))]
     {
         let _ = (terminal, signals);
-        run_ssh_session(
-            client,
-            argv,
-            cwd,
-            env,
-            user,
-            terminal.1.map(|title| title.name.as_str()),
-        )
-        .await
+        run_ssh_session(client, request, terminal.1.map(|title| title.name.as_str())).await
     }
 }
 
@@ -2723,6 +2789,7 @@ fn terminate_after_signal(
     terminal: (Option<&TerminalModeGuard>, Option<&ui::TerminalTitleGuard>),
     exit_code: i32,
 ) -> Result<ExecResult> {
+    ui::reset_terminal_display();
     if let Some(title) = terminal.1 {
         title.restore();
     }
@@ -2734,19 +2801,34 @@ fn terminate_after_signal(
 
 async fn run_ssh_session(
     client: &mut AgentClient,
-    argv: Vec<String>,
-    cwd: String,
-    env: Vec<(String, String)>,
-    user: String,
+    request: pbox_agent_client::ExecRequest,
     title: Option<&str>,
 ) -> Result<ExecResult> {
     let (terminal_rows, terminal_cols) = terminal_size();
-    let mut session = client
-        .exec_pty_session_with_size(argv, cwd, env, user, terminal_rows, terminal_cols)
-        .await
-        .context("start pbox-agent PTY session")?;
+    let persistent = !request.session_name.is_empty();
+    let mut session = if persistent {
+        client
+            .terminal_session(pbox_agent_client::ExecRequest {
+                terminal_rows,
+                terminal_cols,
+                ..request
+            })
+            .await
+    } else {
+        client
+            .exec_pty_session_with_size(
+                request.argv,
+                request.cwd,
+                request.env,
+                request.user,
+                terminal_rows,
+                terminal_cols,
+            )
+            .await
+    }
+    .context("open terminal session")?;
     let input_sender = session.input.clone();
-    let _input_thread = thread::spawn(move || pump_terminal_input(input_sender));
+    let _input_thread = thread::spawn(move || pump_terminal_input(input_sender, persistent));
     #[cfg(unix)]
     let mut window_change =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
@@ -2792,6 +2874,9 @@ async fn run_ssh_session(
     write_pty_output(titles.finish(), false).await?;
     if !result.exited {
         bail!("pbox-agent PTY stream ended without exit status");
+    }
+    if persistent {
+        return Ok(result);
     }
     match tokio::time::timeout(SSH_POST_EXIT_TIMEOUT, session.output.message()).await {
         Ok(Ok(None)) => {}
@@ -2842,11 +2927,28 @@ async fn write_pty_output(data: Vec<u8>, stderr: bool) -> Result<()> {
     result.context("write PTY output")
 }
 
-fn pump_terminal_input(sender: tokio::sync::mpsc::Sender<ExecInput>) {
+fn pump_terminal_input(sender: tokio::sync::mpsc::Sender<ExecInput>, persistent: bool) {
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
     let mut buffer = [0_u8; 8192];
+    let mut input = sessions::TerminalInput::default();
     loop {
+        #[cfg(unix)]
+        if input.pending() {
+            let mut poll = nix::libc::pollfd {
+                fd: nix::libc::STDIN_FILENO,
+                events: nix::libc::POLLIN,
+                revents: 0,
+            };
+            // A lone Escape key must still reach the application promptly.
+            if unsafe { nix::libc::poll(&mut poll, 1, 30) } == 0
+                && sender
+                    .blocking_send(ExecInput::Data(input.flush()))
+                    .is_err()
+            {
+                break;
+            }
+        }
         let count = match stdin.read(&mut buffer) {
             Ok(count) => count,
             Err(error) => {
@@ -2858,10 +2960,16 @@ fn pump_terminal_input(sender: tokio::sync::mpsc::Sender<ExecInput>) {
             let _ = sender.blocking_send(ExecInput::Eof);
             break;
         }
-        if sender
-            .blocking_send(ExecInput::Data(buffer[..count].to_vec()))
-            .is_err()
-        {
+        let (bytes, detach) = if persistent {
+            input.push(&buffer[..count])
+        } else {
+            (buffer[..count].to_vec(), false)
+        };
+        if !bytes.is_empty() && sender.blocking_send(ExecInput::Data(bytes)).is_err() {
+            break;
+        }
+        if detach {
+            let _ = sender.blocking_send(ExecInput::Detach);
             break;
         }
     }
@@ -3880,6 +3988,7 @@ fn run_new(store: &ConfigStore, command: NewCommand, json: bool, color: ColorCho
         ("running".to_owned(), Some(ip.to_string()))
     };
     let info = BoxInfo {
+        resources: None,
         id,
         vmid,
         state,
@@ -4029,6 +4138,7 @@ fn run_repair(
     })?;
 
     let info = BoxInfo {
+        resources: None,
         id: record.id,
         vmid: record.vmid,
         state: record.state,
@@ -4075,6 +4185,7 @@ fn run_start(
         let current = find_box(&client, &record.id.to_string())?;
         return print_box_info(
             &BoxInfo {
+                resources: None,
                 id: record.id,
                 vmid: record.vmid,
                 node: record.node,
@@ -4107,6 +4218,7 @@ fn run_start(
         ui::user_access(&box_id, "pbox", guest::check(&config, &box_id, &endpoint));
     }
     let info = BoxInfo {
+        resources: None,
         id: record.id,
         vmid: record.vmid,
         state: "running".to_owned(),
@@ -4178,6 +4290,7 @@ where
         None
     };
     let info = BoxInfo {
+        resources: None,
         id: record.id,
         vmid: record.vmid,
         state: state.to_owned(),
@@ -4907,7 +5020,21 @@ async fn probe_agent_once(config: &Config, endpoint: &str, id: &str) -> Result<(
 fn run_info(store: &ConfigStore, requested_id: &str, json: bool, color: ColorChoice) -> Result<()> {
     let client = client_from_store(store)?;
     let record = find_box(&client, requested_id)?;
+    let mut resources = BoxResources::from(
+        &client
+            .get_lxc_config(&record.node, record.vmid)
+            .context("read box resources from Proxmox")?,
+    );
+    if let Some(resource) = client.list_cluster_resources()?.into_iter().find(|item| {
+        item.resource_type == "lxc"
+            && item.vmid == Some(record.vmid)
+            && item.node.as_deref() == Some(&record.node)
+    }) {
+        resources.filesystem_size_bytes = resource.maxdisk.filter(|size| *size > 0);
+        resources.filesystem_used_bytes = resource.disk;
+    }
     let info = BoxInfo {
+        resources: Some(resources),
         id: record.id,
         vmid: record.vmid,
         state: record.state,
@@ -5680,6 +5807,32 @@ mod tests {
             *fake.events.borrow(),
             [format!("clone:{vmid}:1"), "wait:clone".to_owned()]
         );
+    }
+
+    #[test]
+    fn snapshot_deletion_only_waits_when_requested_and_propagates_failure() {
+        let record = test_record();
+        let saved: super::snapshots::SavedEnvironment = serde_json::from_value(serde_json::json!({
+            "id": "psn_12345678", "name": "tools-ready", "node": "pve01", "vmid": 9100,
+            "source": record.id, "created": "2026-09-06T00:00:00Z",
+            "bootstrap_id": "pbx_12345678", "recipes": [], "capabilities": []
+        }))
+        .unwrap();
+        let fake = FakePve::new(&test_metadata(&record), "test");
+        // A failing eventual task must not be polled by the default queue operation.
+        fake.fail_next_task();
+        let task = super::snapshots::delete_saved(&fake, &saved, false, true).unwrap();
+        assert_eq!(task.upid, "delete");
+        assert_eq!(*fake.events.borrow(), ["delete"]);
+
+        fake.events.borrow_mut().clear();
+        let error = super::snapshots::delete_saved(&fake, &saved, true, true).unwrap_err();
+        assert!(format!("{error:#}").contains("ERROR: test"));
+        assert_eq!(*fake.events.borrow(), ["delete", "wait:delete"]);
+
+        fake.events.borrow_mut().clear();
+        super::snapshots::delete_saved(&fake, &saved, true, true).unwrap();
+        assert_eq!(*fake.events.borrow(), ["delete", "wait:delete"]);
     }
 
     #[test]
@@ -6835,6 +6988,7 @@ mod tests {
     #[test]
     fn ssh_rejects_nul_bytes_in_command_arguments() {
         let command = SshCommand {
+            session: None,
             id: "pbx_t3yzd9y3".to_owned(),
             endpoint: Some("https://127.0.0.1:7443".to_owned()),
             cwd: "/home/pbox".to_owned(),

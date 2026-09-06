@@ -126,8 +126,9 @@ pbox list
 pbox ssh current
 ```
 
-Pbox waits for the guest agent before completing creation. Type `exit` to
-disconnect; the box keeps running.
+Pbox waits for the guest agent before completing creation. Press **Ctrl-]** to
+detach and keep your shell running. Reconnect with the same command. Type `exit`
+to end the shell; the box keeps running.
 
 `current` selects the only box. With several boxes, use a `pbx_` ID or unique
 name from `pbox list`. Shell access uses pbox's agent; you do not need to
@@ -144,7 +145,8 @@ ID            STATE    PING  NODE  IPV4          NAME           IMAGE
 pbx_d7ky95gz  running  ok    pve   172.30.0.134  pbox-d7ky95gz  docker.io/library/debian:13
 
 $ pbox ssh current
-> Connected to pbx_d7ky95gz. Type exit to disconnect.
+> Connected to pbx_d7ky95gz · main
+  Ctrl-] detaches. Type exit to end this shell.
 [pbox@pbox-d7ky95gz ~]$
 ```
 
@@ -178,7 +180,8 @@ Replace `BOX` with an ID, unique name or `current`.
 | Task | Command |
 | --- | --- |
 | List boxes | `pbox list` |
-| Inspect a box | `pbox info BOX` |
+| Inspect a box, including CPU, memory and disk allocation | `pbox info BOX` |
+| Open or resume your shell | `pbox ssh BOX` |
 | Run a command | `pbox exec BOX -- uname -a` |
 | Copy a file into a box | `pbox scp ./file.txt BOX:/tmp/file.txt` |
 | Reach an app on port 3000 | `pbox forward BOX 3000` |
@@ -190,6 +193,25 @@ Replace `BOX` with an ID, unique name or `current`.
 `pbox list` uses a background inventory cache; changes can take a refresh to
 appear. Use `pbox COMMAND --help` for options and `--json` for structured
 results where supported.
+
+### Terminal sessions
+
+`pbox ssh BOX` opens your `main` shell. If the connection drops, run it again
+and carry on where you left off. **Ctrl-]** detaches; `exit` ends the shell.
+
+| Task | Command |
+| --- | --- |
+| Open a separate terminal | `pbox ssh BOX --session build` |
+| List terminals | `pbox session list BOX` |
+| End a terminal and its processes | `pbox session close BOX build` |
+
+The agent keeps sessions alive; tmux is not required. Reconnecting moves the
+session to the new connection. Sessions end when the agent restarts or the box
+stops. Agent updates are deferred while sessions are running.
+
+`pbox ssh BOX -- COMMAND` still runs a one-off command. Add `--session NAME`
+to keep that command in a named terminal. Working directory, user and environment
+options apply when a session is created; reconnecting keeps its existing shell.
 
 ### Save an environment
 
@@ -238,13 +260,13 @@ pbox completions fish > ~/.config/fish/completions/pbox.fish
 ### Updates
 
 `pbox update` installs the latest published CLI through cargo-binstall or Cargo.
-Until packages are published, repeat the source-install steps after updating
-the checkout.
 
 Pbox checks for published updates before selected commands and caches successful
 checks for a day. Network failures are silent. Set `PBOX_NO_UPDATE_CHECK=1` to
 disable checks. The CLI update does not update the local agent binary or relay;
 `pbox ssh` compares the guest agent with the local binary before connecting.
+It defers agent updates while terminal sessions are running. End those sessions
+first to allow the update on your next connection.
 
 ## Troubleshooting
 

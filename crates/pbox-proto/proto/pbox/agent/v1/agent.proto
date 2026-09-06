@@ -6,6 +6,9 @@ service Agent {
   rpc Info(InfoRequest) returns (InfoResponse);
   rpc Ping(PingRequest) returns (PingResponse);
   rpc Exec(stream ExecRequest) returns (stream ExecEvent);
+  rpc Terminal(stream ExecRequest) returns (stream ExecEvent);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
   rpc PutFile(stream FileChunk) returns (FileResult);
   rpc GetFile(GetFileRequest) returns (stream FileChunk);
   rpc Forward(stream ForwardEvent) returns (stream ForwardEvent);
@@ -45,7 +48,27 @@ message ExecRequest {
   uint32 terminal_rows = 9;
   uint32 terminal_cols = 10;
   // Non-zero values on later stream messages resize the active PTY.
+  // Used only by Terminal. Empty means the default session, "main".
+  string session_name = 11;
 }
+
+message ListSessionsRequest { uint32 protocol_version = 1; }
+message ListSessionsResponse { repeated TerminalSession sessions = 1; }
+message TerminalSession {
+  string name = 1;
+  string user = 2;
+  string cwd = 3;
+  repeated string argv = 4;
+  bool attached = 5;
+  uint64 created_unix = 6;
+  uint32 rows = 7;
+  uint32 cols = 8;
+}
+message CloseSessionRequest {
+  uint32 protocol_version = 1;
+  string name = 2;
+}
+message CloseSessionResponse {}
 
 message ExecEvent {
   oneof event {

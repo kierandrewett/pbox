@@ -518,6 +518,14 @@ pub(crate) fn safe_terminal_text(value: &str) -> String {
 
 pub(crate) fn concise_error(error: &anyhow::Error) -> String {
     let message = format!("{error:#}");
+    for reason in [
+        "session moved to another connection",
+        "terminal session closed",
+    ] {
+        if message.contains(reason) {
+            return reason.to_owned();
+        }
+    }
     if message.contains("peer closed connection without sending TLS close_notify") {
         return "pbox-agent connection closed unexpectedly; retry the command".to_owned();
     }
@@ -528,8 +536,11 @@ pub(crate) fn reset_terminal_display() {
     // TUIs normally emit these sequences while exiting. Send them ourselves
     // when the remote session disappears so the local shell remains usable.
     let mut stdout = io::stdout();
+    if !stdout.is_terminal() {
+        return;
+    }
     let _ = stdout.write_all(
-        b"\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1049l\x1b[H\x1b[2K",
+        b"\x1b[<16u\x1b[=0u\x1b[>4;0m\x1b[?2004l\x1b[?1004l\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1049l\r\x1b[2K",
     );
     let _ = stdout.flush();
 }
@@ -655,6 +666,26 @@ pub(crate) fn print_snapshot_list(snapshots: &[LxcSnapshot], colour: bool) {
     }
 }
 
+fn disk_allocation(size: Option<&str>) -> String {
+    let Some(size) = size else {
+        return "Not reported".into();
+    };
+    let split = size
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(size.len());
+    let (number, unit) = size.split_at(split);
+    if number.parse::<f64>().ok() == Some(0.0) {
+        return "No quota".into();
+    }
+    match unit {
+        "K" => format!("{number} KiB"),
+        "M" => format!("{number} MiB"),
+        "G" => format!("{number} GiB"),
+        "T" => format!("{number} TiB"),
+        _ => size.to_owned(),
+    }
+}
+
 pub(crate) fn print_box_info(info: &BoxInfo, json: bool, color: ColorChoice) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(info)?);
@@ -669,6 +700,52 @@ pub(crate) fn print_box_info(info: &BoxInfo, json: bool, color: ColorChoice) -> 
             style.stdout_metadata("ipv6", ipv6);
         }
         style.stdout_metadata("name", info.name.as_deref().unwrap_or("-"));
+        if let Some(resources) = &info.resources {
+            style.stdout_metadata(
+                "cpu cores",
+                &resources
+                    .cores
+                    .map_or_else(|| "Not set".into(), |cores| cores.to_string()),
+            );
+            for (label, mib) in [
+                ("memory", resources.memory_mib),
+                ("swap", resources.swap_mib),
+            ] {
+                let value = mib.map_or_else(
+                    || "Not set".into(),
+                    |mib| {
+                        if mib == 0 {
+                            "0 MiB".into()
+                        } else {
+                            byte_size(mib.saturating_mul(1024 * 1024))
+                        }
+                    },
+                );
+                style.stdout_metadata(label, &value);
+            }
+            style.stdout_metadata(
+                "root disk",
+                &disk_allocation(resources.disk_size.as_deref()),
+            );
+            style.stdout_metadata(
+                "storage",
+                resources.storage.as_deref().unwrap_or("Not reported"),
+            );
+            if let Some(capacity) = resources.filesystem_size_bytes {
+                let shared = disk_allocation(resources.disk_size.as_deref()) == "No quota";
+                let used = resources
+                    .filesystem_used_bytes
+                    .map_or_else(|| "unknown".into(), byte_size);
+                style.stdout_metadata(
+                    "filesystem",
+                    &format!(
+                        "{used} / {} used{}",
+                        byte_size(capacity),
+                        if shared { " (shared)" } else { "" }
+                    ),
+                );
+            }
+        }
         let recipes = info
             .recipes
             .iter()
@@ -812,12 +889,16 @@ pub(crate) fn color_enabled(color: ColorChoice, json: bool) -> bool {
 }
 
 pub(crate) fn confirm_delete(input: &mut impl BufRead, output: &mut impl Write) -> Result<bool> {
+    confirm_action(input, output, "Delete permanently?")
+}
+
+pub(crate) fn confirm_action(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    question: &str,
+) -> Result<bool> {
     loop {
-        write!(
-            output,
-            "{}",
-            stderr().prompt_text("Delete permanently?", Some("y/N"))
-        )?;
+        write!(output, "{}", stderr().prompt_text(question, Some("y/N")))?;
         output.flush()?;
         let mut answer = String::new();
         if input.read_line(&mut answer)? == 0 {
@@ -1240,6 +1321,64 @@ pub(crate) fn image_search_results(entries: &[super::images::ImageSearchEntry]) 
     style.stdout_hint("Create a box:  pbox new --image IMAGE:TAG");
 }
 
+pub(crate) fn session_connected(box_id: &str, name: &str) {
+    stderr().progress(&format!("Connected to {box_id} · {name}"));
+    stderr().hint("Ctrl-] detaches. Type exit to end this shell.");
+}
+
+pub(crate) fn terminal_sessions(box_id: &str, sessions: &[pbox_agent_client::TerminalSession]) {
+    let style = stdout();
+    style.stdout_heading(&format!("Terminal sessions · {box_id}"));
+    if sessions.is_empty() {
+        style.stdout_hint("No running sessions.");
+    } else {
+        let width = sessions
+            .iter()
+            .map(|s| s.name.len())
+            .max()
+            .unwrap_or(4)
+            .max(4);
+        style.stdout_heading(&format!(
+            "{:<width$}  {:<8}  {:<12}  COMMAND",
+            "NAME", "STATE", "USER"
+        ));
+        for session in sessions {
+            println!(
+                "{:<width$}  {:<8}  {:<12}  {}",
+                safe_terminal_text(&session.name),
+                if session.attached {
+                    "attached"
+                } else {
+                    "detached"
+                },
+                safe_terminal_text(&session.user),
+                clip_terminal_text(
+                    &session.argv.join(" "),
+                    terminal_columns().saturating_sub(width + 26)
+                )
+            );
+        }
+    }
+    if sessions.is_empty() {
+        style.command(&format!("pbox ssh {box_id}"));
+    } else {
+        style.command(&format!("pbox ssh {box_id} --session NAME"));
+    }
+}
+
+pub(crate) fn snapshot_deletion_queued(saved: &super::snapshots::SavedEnvironment, upid: &str) {
+    let style = stdout();
+    style.success(&format!("Deletion queued: {}", saved.name));
+    style.stdout_hint("Proxmox will finish deleting the saved disks in the background.");
+    style.stdout_hint(&format!(
+        "Check Proxmox → {} → Tasks (VMID {}) for the result.",
+        saved.node, saved.vmid
+    ));
+    if super::progress::verbose() {
+        style.stdout_metadata("task", upid);
+    }
+}
+
 pub(crate) fn saved_environments(saved: &[super::snapshots::SavedEnvironment]) {
     let style = stdout();
     style.stdout_heading("Snapshots");
@@ -1272,6 +1411,16 @@ pub(crate) fn saved_environments(saved: &[super::snapshots::SavedEnvironment]) {
 #[cfg(test)]
 mod design_tests {
     use super::*;
+
+    #[test]
+    fn resource_sizes_keep_missing_values_zero_quotas_and_fractional_sizes_distinct() {
+        assert_eq!(disk_allocation(None), "Not reported");
+        assert_eq!(disk_allocation(Some("0T")), "No quota");
+        assert_eq!(disk_allocation(Some("0")), "No quota");
+        assert_eq!(disk_allocation(Some("8G")), "8 GiB");
+        assert_eq!(disk_allocation(Some("1.5G")), "1.5 GiB");
+        assert_eq!(disk_allocation(Some("unknown")), "unknown");
+    }
 
     #[test]
     fn titles_are_prefixed_across_every_chunk_boundary() {

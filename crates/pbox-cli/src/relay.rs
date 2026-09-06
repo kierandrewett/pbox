@@ -527,6 +527,7 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
         }
         print_box_info(
             &BoxInfo {
+                resources: None,
                 id,
                 vmid,
                 node,
@@ -634,6 +635,7 @@ pub fn repair(
         key.cleanup()?;
         print_box_info(
             &BoxInfo {
+                resources: None,
                 id: record.id,
                 vmid: record.vmid,
                 node: record.node,

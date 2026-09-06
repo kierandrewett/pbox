@@ -37,13 +37,17 @@ fn add_completers(
     saved: ArgValueCompleter,
     recipes: ArgValueCompleter,
 ) -> clap::Command {
+    let desktop = command.get_name() == "desktop";
+    let session_close = command.get_name() == "close";
     let box_source = matches!(command.get_name(), "create" | "repair-source");
     let mut command = command.mut_args(|arg| match arg.get_id().as_str() {
         "id" | "box_id" => arg.add(boxes.clone()),
         "source" if box_source => arg.add(boxes.clone()),
         "snapshot" => arg.add(saved.clone()),
         "recipe" => arg.add(recipes.clone()),
-        "session" => arg.add(ArgValueCompleter::new(desktop_sessions)),
+        "session" if desktop => arg.add(ArgValueCompleter::new(desktop_sessions)),
+        "session" => arg.add(ArgValueCompleter::new(terminal_sessions)),
+        "name" if session_close => arg.add(ArgValueCompleter::new(terminal_sessions)),
         _ => arg,
     });
     for child in command.get_subcommands_mut() {
@@ -133,6 +137,65 @@ fn desktop_sessions(current: &OsStr) -> Vec<CompletionCandidate> {
 #[cfg(test)]
 fn no_completions(_: &OsStr) -> Vec<CompletionCandidate> {
     Vec::new()
+}
+
+fn terminal_sessions(current: &OsStr) -> Vec<CompletionCandidate> {
+    let words: Vec<String> = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let target = words
+        .iter()
+        .position(|word| word == "ssh")
+        .and_then(|i| words.get(i + 1))
+        .or_else(|| {
+            words
+                .iter()
+                .position(|word| word == "session")
+                .and_then(|i| words.get(i + 2))
+        })
+        .filter(|id| !id.starts_with('-'))
+        .cloned();
+    let Some(target) = target else {
+        return Vec::new();
+    };
+    let store = ConfigStore::new(
+        config_path(std::env::args_os()).unwrap_or_else(pbox_core::config::default_config_path),
+    );
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result: anyhow::Result<Vec<String>> = (|| {
+            let config = load_config(&store)?;
+            let (box_id, endpoint) = super::resolve_agent_endpoint(&config, &target, None)?;
+            let materials = super::agent_materials(&config, &box_id)?;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(async {
+                    let mut client = super::relay::connect_agent(
+                        &config,
+                        &endpoint,
+                        &box_id,
+                        &materials.ca.certificate_pem,
+                        &materials.client,
+                    )
+                    .await?;
+                    Ok(client
+                        .list_sessions()
+                        .await?
+                        .into_iter()
+                        .map(|session| session.name)
+                        .collect())
+                })
+        })();
+        let _ = sender.send(result.unwrap_or_default());
+    });
+    receiver
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|name| name.starts_with(current.to_str().unwrap_or("")))
+        .map(CompletionCandidate::new)
+        .collect()
 }
 
 fn query(current: &OsStr, saved: bool) -> Vec<CompletionCandidate> {

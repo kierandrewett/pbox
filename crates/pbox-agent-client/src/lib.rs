@@ -1,11 +1,11 @@
 use hyper_util::rt::TokioIo;
 use pbox_crypto::{CertificateMaterial, server_dns_name};
 use pbox_proto::PROTOCOL_VERSION;
-pub use pbox_proto::agent::{ExecEvent, exec_event};
+pub use pbox_proto::agent::{ExecEvent, ExecRequest, TerminalSession, exec_event};
 use pbox_proto::agent::{
-    ExecRequest, FileChunk, FileResult, ForwardClose, ForwardEvent, ForwardOpen, GetFileRequest,
-    InfoRequest, InfoResponse, PingRequest, PingResponse,
-    agent_client::AgentClient as GeneratedAgentClient, forward_event,
+    FileChunk, FileResult, ForwardClose, ForwardEvent, ForwardOpen, GetFileRequest, InfoRequest,
+    InfoResponse, PingRequest, PingResponse, agent_client::AgentClient as GeneratedAgentClient,
+    forward_event,
 };
 use rustls::ClientConfig;
 use rustls::RootCertStore;
@@ -65,8 +65,13 @@ pub struct ExecResult {
 #[derive(Debug)]
 pub enum ExecInput {
     Data(Vec<u8>),
-    Resize { rows: u32, cols: u32 },
+    Resize {
+        rows: u32,
+        cols: u32,
+    },
     Eof,
+    /// End the attachment without sending input to a persistent shell.
+    Detach,
 }
 
 pub struct ExecPtySession {
@@ -301,27 +306,73 @@ impl AgentClient {
         terminal_rows: u32,
         terminal_cols: u32,
     ) -> Result<ExecPtySession, AgentClientError> {
-        let (request_sender, request_receiver) = mpsc::channel(32);
-        request_sender
-            .send(ExecRequest {
+        self.open_pty_session(
+            ExecRequest {
                 protocol_version: PROTOCOL_VERSION,
                 argv,
                 cwd: cwd.into(),
                 env: env.into_iter().collect(),
                 user: user.into(),
                 allocate_pty: true,
-                stdin_eof: false,
                 terminal_rows,
                 terminal_cols,
                 ..Default::default()
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Attach to an agent-owned terminal, creating it when its name is unused.
+    pub async fn terminal_session(
+        &mut self,
+        mut request: ExecRequest,
+    ) -> Result<ExecPtySession, AgentClientError> {
+        request.protocol_version = PROTOCOL_VERSION;
+        request.allocate_pty = true;
+        self.open_pty_session(request, true).await
+    }
+
+    pub async fn list_sessions(
+        &mut self,
+    ) -> Result<Vec<pbox_proto::agent::TerminalSession>, AgentClientError> {
+        Ok(self
+            .inner
+            .list_sessions(pbox_proto::agent::ListSessionsRequest {
+                protocol_version: PROTOCOL_VERSION,
             })
+            .await?
+            .into_inner()
+            .sessions)
+    }
+
+    pub async fn close_session(&mut self, name: impl Into<String>) -> Result<(), AgentClientError> {
+        self.inner
+            .close_session(pbox_proto::agent::CloseSessionRequest {
+                protocol_version: PROTOCOL_VERSION,
+                name: name.into(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn open_pty_session(
+        &mut self,
+        first: ExecRequest,
+        persistent: bool,
+    ) -> Result<ExecPtySession, AgentClientError> {
+        let (request_sender, request_receiver) = mpsc::channel(32);
+        request_sender
+            .send(first)
             .await
             .map_err(|_| AgentClientError::ExecRequestClosed)?;
-        let output = self
-            .inner
-            .exec(ReceiverStream::new(request_receiver))
-            .await?
-            .into_inner();
+        let requests = ReceiverStream::new(request_receiver);
+        let output = if persistent {
+            self.inner.terminal(requests).await?
+        } else {
+            self.inner.exec(requests).await?
+        }
+        .into_inner();
         let (input_sender, mut input_receiver) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut sent_eof = false;
@@ -337,7 +388,7 @@ impl AgentClient {
                         let (stdin, stdin_eof, terminal_rows, terminal_cols) = match input {
                             ExecInput::Data(data) => (data, false, 0, 0),
                             ExecInput::Resize { rows, cols } => (Vec::new(), false, rows, cols),
-                            ExecInput::Eof => (Vec::new(), true, 0, 0),
+                            ExecInput::Eof | ExecInput::Detach => (Vec::new(), true, 0, 0),
                         };
                         if request_sender
                             .send(ExecRequest {
@@ -408,6 +459,7 @@ impl AgentClient {
             stdin_eof: true,
             terminal_rows: 0,
             terminal_cols: 0,
+            ..Default::default()
         };
         let stream = self.exec_stream(tokio_stream::iter([request])).await?;
         tokio::time::timeout(AGENT_RPC_TIMEOUT, collect_exec_stream(stream))

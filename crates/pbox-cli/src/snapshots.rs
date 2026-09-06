@@ -30,12 +30,15 @@ enum Action {
     List,
     /// Show a saved environment.
     Info { snapshot: String },
-    /// Delete a saved environment. Existing full clones remain intact.
+    /// Queue deletion of a saved environment. Existing full clones remain intact.
     #[command(visible_alias = "rm")]
     Delete {
         snapshot: String,
         #[arg(long)]
         yes: bool,
+        /// Wait for deletion to finish, showing progress and task logs.
+        #[arg(long)]
+        wait: bool,
     },
     /// Remove preparation files left on a source box by an interrupted snapshot operation.
     RepairSource { source: String },
@@ -170,7 +173,11 @@ pub fn run(
             name,
             storage,
         } => create(&config, &client, &source, &name, storage, json)?,
-        Action::Delete { snapshot, yes } => {
+        Action::Delete {
+            snapshot,
+            yes,
+            wait,
+        } => {
             let saved = find(&client, &snapshot)?;
             if !yes {
                 anyhow::ensure!(
@@ -188,12 +195,15 @@ pub fn run(
                     return Ok(());
                 }
             }
-            wait_for_task(
-                &client,
-                &saved.node,
-                client.delete_lxc(&saved.node, saved.vmid)?,
-            )?;
-            if json {
+            let task = delete_saved(&client, &saved, wait, json)?;
+            if !wait && json {
+                ui::json_text(&serde_json::to_string_pretty(&serde_json::json!({
+                    "id": saved.id, "node": saved.node, "vmid": saved.vmid,
+                    "deleted": false, "queued": true, "upid": task.upid
+                }))?);
+            } else if !wait {
+                ui::snapshot_deletion_queued(&saved, &task.upid);
+            } else if json {
                 ui::json_text(&serde_json::json!({"id":saved.id,"deleted":true}).to_string());
             } else {
                 ui::stdout().success(&format!("Deleted snapshot {}", saved.name));
@@ -226,6 +236,31 @@ pub fn run(
     }
     let _ = color;
     Ok(())
+}
+
+pub(super) fn delete_saved(
+    client: &impl PveApi,
+    saved: &SavedEnvironment,
+    wait: bool,
+    json: bool,
+) -> Result<PveTaskResponse> {
+    let display = wait.then(|| {
+        progress::CreationProgress::start(json, &format!("Deleting snapshot {}", saved.name))
+    });
+    let task = client
+        .delete_lxc(&saved.node, saved.vmid)
+        .with_context(|| format!("queue deletion of snapshot {}", saved.name))?;
+    if let Some(display) = display {
+        wait_for_task_with_progress(
+            client,
+            &saved.node,
+            task.clone(),
+            None,
+            &format!("Removing saved disks on {}", saved.node),
+        )?;
+        display.finish();
+    }
+    Ok(task)
 }
 
 pub(super) fn clone_full(
@@ -1040,6 +1075,18 @@ mod tests {
     }
     #[test]
     fn snapshot_commands_use_snapshot_identity_except_when_capturing() {
+        for alias in ["delete", "rm"] {
+            for wait in [false, true] {
+                let mut args = vec!["pbox", "snapshot", alias, "tools-ready", "--yes"];
+                if wait {
+                    args.push("--wait");
+                }
+                let cli = Cli::try_parse_from(args).unwrap();
+                assert!(matches!(cli.command, Command::Snapshot(SnapshotCommand {
+                    command: Action::Delete { wait: parsed, yes: true, .. }
+                }) if parsed == wait));
+            }
+        }
         assert!(Cli::try_parse_from(["pbox", "snapshot", "list"]).is_ok());
         assert!(
             Cli::try_parse_from([

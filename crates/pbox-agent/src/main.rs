@@ -1,3 +1,4 @@
+mod sessions;
 mod workspace;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -34,7 +35,7 @@ use tokio::process::Command;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
-use tokio_stream::{Stream, wrappers::ReceiverStream};
+use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tonic::transport::Server;
 use tonic::transport::server::{Connected, TcpConnectInfo};
 use tonic::{Request, Response, Status, Streaming};
@@ -247,9 +248,12 @@ struct AgentService {
     file_slots: Arc<Semaphore>,
     forward_allow: Vec<IpNet>,
     exec_slots: Arc<Semaphore>,
+    sessions: sessions::Sessions,
 }
 #[tonic::async_trait]
 impl Agent for AgentService {
+    type TerminalStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<ExecEvent, Status>> + Send>>;
     type ExecStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<ExecEvent, Status>> + Send>>;
     type GetFileStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<FileChunk, Status>> + Send>>;
@@ -268,6 +272,7 @@ impl Agent for AgentService {
             capabilities: vec![
                 "exec".to_owned(),
                 "pty".to_owned(),
+                "terminal-sessions".to_owned(),
                 "files".to_owned(),
                 "forward".to_owned(),
             ]
@@ -307,7 +312,8 @@ impl Agent for AgentService {
             .await
             .map_err(|_| Status::deadline_exceeded("exec handshake timed out"))??
             .ok_or_else(|| Status::invalid_argument("exec stream is empty"))?;
-        let first = workspace::resolve_request(first)?;
+        let mut first = workspace::resolve_request(first)?;
+        first.session_name.clear(); // Exec always keeps its ordinary command lifetime.
         validate_exec_request(&first)?;
         drop(handshake_permit);
         let permit = self
@@ -318,6 +324,46 @@ impl Agent for AgentService {
         let (sender, receiver) = mpsc::channel(16);
         tokio::spawn(run_command(first, requests, sender, permit));
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
+
+    async fn terminal(
+        &self,
+        request: Request<Streaming<ExecRequest>>,
+    ) -> Result<Response<Self::TerminalStream>, Status> {
+        let _permit = self
+            .handshake_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("too many concurrent handshakes"))?;
+        let mut requests = request.into_inner();
+        let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, requests.message())
+            .await
+            .map_err(|_| Status::deadline_exceeded("terminal handshake timed out"))??
+            .ok_or_else(|| Status::invalid_argument("terminal stream is empty"))?;
+        let first = workspace::resolve_request(first)?;
+        validate_exec_request(&first)?;
+        let stream = self.sessions.attach(first, requests, &self.exec_slots)?;
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn list_sessions(
+        &self,
+        request: Request<pbox_proto::agent::ListSessionsRequest>,
+    ) -> Result<Response<pbox_proto::agent::ListSessionsResponse>, Status> {
+        sessions::check_protocol(request.into_inner().protocol_version)?;
+        Ok(Response::new(pbox_proto::agent::ListSessionsResponse {
+            sessions: self.sessions.list(),
+        }))
+    }
+
+    async fn close_session(
+        &self,
+        request: Request<pbox_proto::agent::CloseSessionRequest>,
+    ) -> Result<Response<pbox_proto::agent::CloseSessionResponse>, Status> {
+        let request = request.into_inner();
+        sessions::check_protocol(request.protocol_version)?;
+        self.sessions.close(&request.name).await?;
+        Ok(Response::new(pbox_proto::agent::CloseSessionResponse {}))
     }
 
     async fn put_file(
@@ -651,7 +697,7 @@ async fn run_piped_command(
     requests: Streaming<ExecRequest>,
     sender: mpsc::Sender<Result<ExecEvent, Status>>,
 ) {
-    let deadline = tokio::time::Instant::now() + EXEC_COMMAND_TIMEOUT;
+    let deadline = Some(tokio::time::Instant::now() + EXEC_COMMAND_TIMEOUT);
     let mut command = match prepare_command(&request) {
         Ok(command) => command,
         Err(error) => {
@@ -725,10 +771,13 @@ async fn run_piped_command(
 
 async fn run_pty_command(
     request: ExecRequest,
-    requests: Streaming<ExecRequest>,
+    requests: impl Stream<Item = Result<ExecRequest, Status>> + Unpin + Send + 'static,
     sender: mpsc::Sender<Result<ExecEvent, Status>>,
 ) {
-    let deadline = tokio::time::Instant::now() + EXEC_COMMAND_TIMEOUT;
+    let deadline = request
+        .session_name
+        .is_empty()
+        .then(|| tokio::time::Instant::now() + EXEC_COMMAND_TIMEOUT);
     let winsize = if request.terminal_rows > 0 && request.terminal_cols > 0 {
         Some(nix::pty::Winsize {
             ws_row: request.terminal_rows.min(u16::MAX as u32) as u16,
@@ -931,7 +980,7 @@ fn is_pty_eof_error(error: &std::io::Error) -> bool {
 }
 
 async fn forward_stdin<W>(
-    mut requests: Streaming<ExecRequest>,
+    mut requests: impl Stream<Item = Result<ExecRequest, Status>> + Unpin,
     mut writer: Option<W>,
     pty: bool,
     initial_data: Vec<u8>,
@@ -951,9 +1000,10 @@ where
         finish_stdin(&mut writer, pty).await?;
         return Ok(());
     }
-    while let Some(request) = tokio::time::timeout(EXEC_STREAM_IDLE_TIMEOUT, requests.message())
+    while let Some(request) = tokio::time::timeout(EXEC_STREAM_IDLE_TIMEOUT, requests.next())
         .await
-        .map_err(|_| Status::deadline_exceeded("stdin stream idle timeout"))??
+        .map_err(|_| Status::deadline_exceeded("stdin stream idle timeout"))?
+        .transpose()?
     {
         if request.protocol_version != PROTOCOL {
             return Err(Status::failed_precondition(
@@ -1018,9 +1068,14 @@ async fn wait_for_child(
     sender: &mpsc::Sender<Result<ExecEvent, Status>>,
     process_group: bool,
     output_failure: &Notify,
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
 ) -> (std::io::Result<std::process::ExitStatus>, Option<Status>) {
-    let deadline_sleep = tokio::time::sleep_until(deadline);
+    let deadline_sleep = async {
+        match deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
     tokio::pin!(deadline_sleep);
     let process_group_id = child.id();
     tokio::select! {
@@ -1052,7 +1107,34 @@ fn kill_process_group(process_group_id: u32) -> bool {
     let Ok(process_group_id) = i32::try_from(process_group_id) else {
         return false;
     };
-    unsafe { libc::kill(-process_group_id, libc::SIGKILL) == 0 }
+    let killed = unsafe { libc::kill(-process_group_id, libc::SIGKILL) == 0 };
+    // Interactive shells put foreground and background jobs in separate process
+    // groups. They still share the PTY's session ID; close those jobs as well.
+    #[cfg(target_os = "linux")]
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some((_, fields)) = stat.rsplit_once(')') else {
+                continue;
+            };
+            if fields
+                .split_whitespace()
+                .nth(3)
+                .and_then(|sid| sid.parse::<i32>().ok())
+                == Some(process_group_id)
+            {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    killed
 }
 
 async fn terminate_child(child: &mut tokio::process::Child, process_group: bool) {
@@ -1071,7 +1153,7 @@ async fn wait_for_child_with_input(
     input_task: &mut tokio::task::JoinHandle<Result<(), Status>>,
     process_group: bool,
     output_failure: &Notify,
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
 ) -> (
     std::io::Result<std::process::ExitStatus>,
     Option<Status>,
@@ -1634,6 +1716,7 @@ async fn serve() -> Result<()> {
             forward_slots,
             forward_allow: args.forward_allow,
             exec_slots,
+            sessions: sessions::Sessions::default(),
         }))
         .serve_with_incoming(incoming)
         .await
@@ -1664,6 +1747,7 @@ mod tests {
             file_slots: Arc::new(Semaphore::new(4)),
             forward_allow: vec!["127.0.0.0/8".parse().unwrap()],
             exec_slots: Arc::new(Semaphore::new(4)),
+            sessions: sessions::Sessions::default(),
         };
         let tls = build_server_tls_config(
             &server_certificate.certificate_pem,
@@ -1818,6 +1902,229 @@ mod tests {
         assert_eq!(result.code, 0);
         assert!(result.exited);
 
+        stop_test_agent(task).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_sessions_survive_reconnection_resize_takeover_and_close() {
+        let box_id = "pbx_t3yzd9y3";
+        let ca = generate_context_ca(&derive_context_seed("sessions", "secret")).unwrap();
+        let server = issue_certificate(
+            &ca,
+            &server_subject(box_id).unwrap(),
+            CertificatePurpose::Server,
+        )
+        .unwrap();
+        let identity = issue_certificate(
+            &ca,
+            "pbox.cwd.dev/context/test-client",
+            CertificatePurpose::Client,
+        )
+        .unwrap();
+        let (endpoint, task) = spawn_test_agent(box_id, server, &ca).await;
+        let mut agent = AgentClient::connect(&endpoint, box_id, &ca.certificate_pem, &identity)
+            .await
+            .unwrap();
+        let request = ExecRequest {
+            argv: vec!["/bin/sh".into(), "-c".into(), "stty -echo; printf '__ready__\\n'; while IFS= read -r line; do eval \"$line\"; done".into()],
+            cwd: "/tmp".into(), user: "root".into(), session_name: "main".into(), terminal_rows: 24, terminal_cols: 80,
+            ..Default::default()
+        };
+        async fn until(session: &mut pbox_agent_client::ExecPtySession, marker: &str) -> String {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut output = Vec::new();
+                loop {
+                    let event = session
+                        .output
+                        .message()
+                        .await
+                        .unwrap()
+                        .expect("session closed before marker");
+                    if let Some(exec_event::Event::Stdout(bytes)) = event.event {
+                        output.extend(bytes);
+                    }
+                    if String::from_utf8_lossy(&output).contains(marker) {
+                        return String::from_utf8_lossy(&output).into_owned();
+                    }
+                }
+            })
+            .await
+            .expect("terminal output timeout")
+        }
+        let mut first = agent.terminal_session(request.clone()).await.unwrap();
+        until(&mut first, "__ready__").await;
+        first
+            .input
+            .send(ExecInput::Data(
+                b"value=retained; cd /; printf '__saved__\\n'\n".to_vec(),
+            ))
+            .await
+            .unwrap();
+        until(&mut first, "__saved__").await;
+        drop(first);
+        drop(agent);
+        let mut agent = AgentClient::connect(&endpoint, box_id, &ca.certificate_pem, &identity)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let sessions = agent.list_sessions().await.unwrap();
+                if sessions.len() == 1 && !sessions[0].attached {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut second = agent
+            .terminal_session(ExecRequest {
+                argv: vec!["/bin/false".into()],
+                ..request.clone()
+            })
+            .await
+            .unwrap();
+        until(&mut second, "__saved__").await;
+        second
+            .input
+            .send(ExecInput::Resize {
+                rows: 40,
+                cols: 100,
+            })
+            .await
+            .unwrap();
+        second
+            .input
+            .send(ExecInput::Data(
+                b"printf '__state__%s:%s\\n' \"$value\" \"$PWD\"; stty size\n".to_vec(),
+            ))
+            .await
+            .unwrap();
+        let output = until(&mut second, "40 100").await;
+        assert!(output.contains("__state__retained:/"), "{output:?}");
+        let sessions = agent.list_sessions().await.unwrap();
+        assert_eq!((sessions[0].rows, sessions[0].cols), (40, 100));
+        assert!(sessions[0].attached);
+
+        // A fresh connection moves the attachment; it does not start another shell.
+        let mut third = agent.terminal_session(request.clone()).await.unwrap();
+        until(&mut third, "__state__retained:/").await;
+        let error = tokio::time::timeout(Duration::from_secs(3), second.output.message())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Cancelled);
+        let wrong_user = agent
+            .terminal_session(ExecRequest {
+                user: "different-user".into(),
+                ..request.clone()
+            })
+            .await;
+        assert!(wrong_user.is_err());
+        // Named terminals share the execution limit, even while detached.
+        for name in ["one", "two", "three"] {
+            let session = agent
+                .terminal_session(ExecRequest {
+                    session_name: name.into(),
+                    ..request.clone()
+                })
+                .await
+                .unwrap();
+            drop(session);
+        }
+        assert!(
+            agent
+                .terminal_session(ExecRequest {
+                    session_name: "overflow".into(),
+                    ..request.clone()
+                })
+                .await
+                .is_err()
+        );
+        for name in ["one", "two", "three", "main"] {
+            agent.close_session(name).await.unwrap();
+        }
+        assert!(agent.list_sessions().await.unwrap().is_empty());
+
+        // Output must keep draining while nobody is attached, including beyond
+        // the viewer channel's capacity. Reattach shows the latest screen.
+        let flood_request = ExecRequest {
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "seq 1 50000; printf '__flood_done__\\n'; exec /bin/cat".into(),
+            ],
+            session_name: "flood".into(),
+            ..request.clone()
+        };
+        drop(agent.terminal_session(flood_request.clone()).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut flood = agent.terminal_session(flood_request).await.unwrap();
+        until(&mut flood, "__flood_done__").await;
+        agent.close_session("flood").await.unwrap();
+
+        // Closing a PTY also ends jobs in the shell's other process groups.
+        let mut jobs = agent
+            .terminal_session(ExecRequest {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-ic".into(),
+                    r#"sleep 60 & printf '__job__%s__end__\n' "$!"; wait"#.into(),
+                ],
+                session_name: "jobs".into(),
+                ..request.clone()
+            })
+            .await
+            .unwrap();
+        let output = until(&mut jobs, "__end__").await;
+        let pid: u32 = output
+            .split("__job__")
+            .nth(1)
+            .unwrap()
+            .split("__end__")
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        agent.close_session("jobs").await.unwrap();
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            assert!(
+                stat.rsplit_once(')')
+                    .unwrap()
+                    .1
+                    .trim_start()
+                    .starts_with('Z'),
+                "job survived session close: {stat}"
+            );
+        }
+
+        // Exiting the shell removes the session and releases its execution slot.
+        let mut exiting = agent.terminal_session(request).await.unwrap();
+        until(&mut exiting, "__ready__").await;
+        exiting
+            .input
+            .send(ExecInput::Data(b"exit 7\n".to_vec()))
+            .await
+            .unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let event = exiting.output.message().await.unwrap().unwrap();
+                if let Some(exec_event::Event::Exit(exit)) = event.event {
+                    return exit;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(exit.code, 7);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !agent.list_sessions().await.unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         stop_test_agent(task).await;
     }
 
@@ -2149,7 +2456,7 @@ mod tests {
             &sender,
             true,
             &output_failure,
-            tokio::time::Instant::now() + Duration::from_millis(25),
+            Some(tokio::time::Instant::now() + Duration::from_millis(25)),
         )
         .await;
 

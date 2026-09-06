@@ -63,6 +63,19 @@ pbox snapshot rm tools-ready
 ```
 
 Only the saved template is removed. Existing full copies keep their data.
+After confirmation, pbox queues the deletion and returns. Proxmox continues
+removing the saved disks even after you close the terminal. Check the node's
+**Tasks** tab in Proxmox for success or failure.
+
+To wait for completion with elapsed time and live task logs:
+
+```sh
+pbox snapshot rm tools-ready --wait
+```
+
+Use `--yes` to skip confirmation in scripts. JSON output reports `queued: true`
+and the task ID (`upid`) by default; with `--wait`, `deleted: true` means the
+deletion finished successfully.
 
 ## Checkpoints
 

@@ -158,7 +158,8 @@ test WebSocket forwarding or connectivity from a guest.
 ## Sessions and recovery
 
 Agents reconnect after a relay restart. An interrupted shell must be reopened
-with `pbox ssh BOX`; commands are not replayed.
+with `pbox ssh BOX` to resume the same agent-owned shell. One-off commands are
+not replayed. See [terminal sessions](../README.md#terminal-sessions).
 
 ```sh
 pbox repair BOX

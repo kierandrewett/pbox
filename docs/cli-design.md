@@ -51,7 +51,10 @@ before human display. Calculate table padding before applying colour.
 - Confirmation uses the shared prompt component with a safe default. Deletion
   uses `[y/N]`; cancellation is a hint, not a runtime error. Background deletion
   says `Deletion queued`, never `Deleted`, and identifies where to check its result.
-  The confirmation explains the immediate stop; `--wait` uses graceful shutdown.
+  Box deletion confirmation explains the immediate stop; `--wait` uses graceful shutdown.
+  Snapshot deletion also queues by default; `--wait` shows timed progress and task
+  logs until Proxmox confirms completion. The queued receipt identifies the node
+  and VMID to find in Proxmox's Tasks tab.
 - Clap owns help layout and usage errors, with palette tokens supplied by `ui.rs`.
 - `completions SHELL` emits an unchanged shell script on stdout, even with
   `--json` or forced colour. Generating the script needs no PVE configuration or connection. Live argument
@@ -124,11 +127,37 @@ The box list includes IMAGE from recorded OCI provenance, with `-` for older
 boxes lacking it. Columns fit their content and use two spaces between columns,
 including optional IPv6. JSON includes the optional `image` field when known.
 
+`info` reads the box's current Proxmox configuration and shows CPU cores,
+allocated memory, swap, root disk size and storage. Memory uses binary units;
+disk size uses binary units. A zero-size directory volume is shown as `No quota`,
+and filesystem usage is labelled shared rather than attributed to that box. Missing values are explicit, and zero
+swap remains zero. JSON adds a `resources` object with `cores`, `memory_mib`,
+`swap_mib`, `disk_size` (original PVE notation), `storage`, `filesystem_size_bytes`
+and `filesystem_used_bytes`; existing fields keep their meanings.
+
 `list` reads pboxd's persistent inventory snapshot without PVE requests or pings.
 The daemon refreshes independently and restarts on demand after exiting. Caches
 are scoped to configuration. A missing initial cache reports background loading;
 an old cache is displayed immediately with its age on human stderr. Queued local
 deletions overlay the cached row immediately, before the next PVE refresh.
+
+## Terminal sessions
+
+`ssh BOX` resumes the agent-owned `main` shell. `--session NAME` selects another
+terminal; `session list BOX` and `session close BOX NAME` manage them. Connection
+output names the session and explains `Ctrl-]` (detach) and `exit` (end shell).
+A new attachment moves the terminal from its old connection. Named sessions
+require the agent's `terminal-sessions` capability; never silently fall back to
+a disposable PTY. One-off `ssh BOX -- COMMAND` retains its previous behaviour.
+
+The agent restores screen contents and input modes on reattachment without
+replaying terminal queries or clipboard writes. Live guest output remains a data
+stream. Detach and connection failures reset local keyboard, mouse and paste
+modes and restore the terminal title and termios. Session lists use stdout;
+JSON returns an array of session records. Closing requires confirmation or
+`--yes` and reports success only after the PTY process is reaped. Completion
+queries for session names are read-only and have the same two-second limit as
+box completion.
 
 ## Snapshot progress
 
