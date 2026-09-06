@@ -29,6 +29,8 @@ fn help_for_every_command_uses_the_shared_palette() {
         "recipe",
         "snapshot",
         "list",
+        "ls",
+        "ps",
         "info",
         "start",
         "stop",

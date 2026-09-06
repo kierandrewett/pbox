@@ -10,6 +10,62 @@ use serde::Serialize;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::atomic::{AtomicU8, Ordering};
 static MODE: AtomicU8 = AtomicU8::new(0);
+
+pub(crate) fn image_preparation_error(image: &str, reason: &str) {
+    let style = stderr();
+    style.error("Image preparation failed");
+    style.metadata("image", image);
+    style.metadata("box", "Not created; nothing uploaded to PVE");
+    style.section("What failed");
+    let reason = reason
+        .strip_prefix("Image compatibility check failed:")
+        .unwrap_or(reason)
+        .trim();
+    for line in wrap_diagnostic(reason, 84) {
+        style.hint(&line);
+    }
+    style.section("Next steps");
+    style.hint(
+        "Fix the reported requirement in your Dockerfile, or choose a compatible base image.",
+    );
+    style.hint("Rebuild and publish your image before retrying:");
+    style.command("pbox new --image YOUR_IMAGE");
+    style.hint("Add --verbose to retain the full preparation logs.");
+}
+
+fn wrap_diagnostic(value: &str, width: usize) -> Vec<String> {
+    let safe = safe_terminal_text(value);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in safe.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+pub(crate) fn byte_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
 /// Completion scripts are machine output, independent of colour and JSON mode.
 pub(crate) fn completions(shell: clap_complete::Shell) -> Result<()> {
     let mut script = Vec::new();
@@ -41,6 +97,31 @@ pub(crate) fn agent_startup_help(box_id: &str) {
     style.hint("For connection errors: check ip route, /etc/resolv.conf and outbound access to your relay.");
     style.hint("If container login is unavailable, a PVE administrator can use pct enter VMID from the node's Shell.");
     style.hint(&format!("After fixing the cause: pbox repair {box_id}"));
+}
+
+pub(crate) fn delete_details(
+    record: &BoxRecord,
+    metadata: Option<&pbox_core::PboxMetadata>,
+    wait: bool,
+    style: CliStyle,
+) {
+    style.section("Delete box");
+    style.metadata("id", &record.id.to_string());
+    style.metadata("name", record.name.as_deref().unwrap_or("unnamed"));
+    style.metadata(
+        "image",
+        metadata
+            .and_then(|value| value.image.as_deref())
+            .unwrap_or("Not recorded"),
+    );
+    if let Some(snapshot) = metadata.and_then(|value| value.snapshot.as_deref()) {
+        style.metadata("snapshot", snapshot);
+    }
+    style.metadata("state", &record.state);
+    style.warning("This permanently deletes the box and its data.");
+    if !wait {
+        style.hint("Running boxes will be stopped immediately. Deletion continues in Proxmox.");
+    }
 }
 pub(crate) fn configure(color: ColorChoice, json: bool) {
     MODE.store(
@@ -990,5 +1071,43 @@ mod design_tests {
         let rendered = style.prompt_text("Name\x1b[2J", Some("test\nnext"));
         assert!(!rendered.contains("\x1b[2J"));
         assert!(!rendered.contains('\n'));
+    }
+}
+
+#[cfg(test)]
+mod image_feedback_preview {
+    use super::*;
+
+    /// Manual terminal/plain/JSON-mode design-system preview; no PVE access.
+    #[test]
+    #[ignore = "manual design-system preview"]
+    fn render_image_feedback() {
+        let mode = std::env::var("PBOX_PREVIEW_MODE").unwrap_or_default();
+        configure(
+            if mode == "color" {
+                ColorChoice::Always
+            } else {
+                ColorChoice::Never
+            },
+            mode == "json",
+        );
+        image_preparation_error(
+            "docker.io/library/alpine:latest",
+            "Image compatibility check failed: Alpine uses musl and OpenRC; this agent requires glibc and systemd. Choose a supported systemd image.",
+        );
+        let record = BoxRecord {
+            id: pbox_core::PboxId::parse("pbx_test1234").unwrap(),
+            vmid: 9000,
+            state: "running".to_owned(),
+            node: "pve".to_owned(),
+            ip: None,
+            ipv6: None,
+            name: Some("pbox-test".to_owned()),
+            recipes: Vec::new(),
+            capabilities: Vec::new(),
+        };
+        let mut metadata = pbox_core::PboxMetadata::new(record.id.clone(), record.vmid);
+        metadata.image = Some("docker.io/cachyos/cachyos:latest".to_owned());
+        delete_details(&record, Some(&metadata), false, stderr());
     }
 }

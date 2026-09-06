@@ -181,7 +181,7 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
     )?;
     let filename = format!("pbox-bootstrap-{box_id}");
     let volume = format!("{storage}:vztmpl/{filename}.tar.zst");
-    let resolved =
+    let mut resolved =
         resolve_new_command_with_template(&client, config, &command, Some(&volume), Some(&node))?;
     let key = BootstrapKey::generate(&box_id)?;
     let mut operation =
@@ -197,19 +197,22 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
             command.image.as_deref().unwrap_or(&config.images.default),
         );
         let image = super::images::ImageReference::parse(&image)?.canonical();
+        resolved.image = image.clone();
         creation.phase(&format!("Preparing {image}"));
         let archive = super::images::build_local_oci_archive(&image, &filename, Some(&payload))?;
-        creation.phase("Creating your box");
-        super::progress::substep(&format!("Uploading image to {node}/{storage}"));
+        resolved.ostype = Some(archive.ostype.clone());
+        creation.phase(&format!("Creating your box on {node}"));
+        let archive_size = super::ui::byte_size(fs::metadata(&archive.path)?.len());
+        super::progress::substep(&format!("Uploading {archive_size} to PVE {node}/{storage}"));
         upload_attempted = true;
         let upload = client.upload_storage_template(
             &node,
             storage,
             &format!("{filename}.tar.zst"),
-            &archive,
+            &archive.path,
         );
         // The API upload has consumed the file, so no local credential archive needs to remain.
-        if let Some(parent) = archive.parent() {
+        if let Some(parent) = archive.path.parent() {
             fs::remove_dir_all(parent).context("remove private local image archive")?;
         }
         fs::remove_dir_all(payload).context("remove local agent payload")?;

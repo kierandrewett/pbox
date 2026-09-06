@@ -131,6 +131,7 @@ enum Command {
     /// Manage per-box PVE rollback checkpoints (deleted with their box).
     Checkpoint(CheckpointCommand),
     /// List pbox-managed containers discovered from PVE metadata.
+    #[command(visible_aliases = ["ls", "ps"])]
     List,
     /// Show one pbox discovered from PVE metadata.
     Info { id: String },
@@ -500,8 +501,12 @@ fn main() {
         Ok(RunOutcome::Success) => {}
         Ok(RunOutcome::Exit(code)) => std::process::exit(code),
         Err(error) => {
-            let message = safe_terminal_text(&format!("{error:#}"));
-            ui::stderr().error(&message);
+            if let Some(failure) = error.downcast_ref::<images::ImagePreparationFailure>() {
+                ui::image_preparation_error(&failure.image, &error.root_cause().to_string());
+            } else {
+                let message = safe_terminal_text(&format!("{error:#}"));
+                ui::stderr().error(&message);
+            }
             if let Some(failure) = error.downcast_ref::<relay::AgentStartupFailure>() {
                 ui::agent_startup_help(&failure.box_id);
             }
@@ -2908,6 +2913,8 @@ fn terminate_secret_prompt_on_signal(
 }
 #[derive(Debug, Clone)]
 struct ResolvedNew {
+    ostype: Option<String>,
+    image: String,
     node: String,
     ostemplate: String,
     rootfs: String,
@@ -3258,6 +3265,8 @@ fn resolve_new_command_with_template(
         .transpose()?;
 
     Ok(ResolvedNew {
+        ostype: None,
+        image: ostemplate.clone(),
         node,
         ostemplate,
         rootfs,
@@ -3299,12 +3308,14 @@ fn create_lxc_with_retry(
             .vmid_pattern
             .allocate_lowest(occupied.iter())
             .context("allocate a free PVE VMID")?;
-        let metadata = PboxMetadata::new(id.clone(), vmid).with_node(&resolved.node);
+        let mut metadata = PboxMetadata::new(id.clone(), vmid).with_node(&resolved.node);
+        metadata.image = Some(resolved.image.clone());
         let description = format!(
             "Managed by `pbox`.\n{}",
             encode_metadata(&metadata).context("encode pbox metadata")?
         );
         let request = LxcCreateRequest {
+            ostype: resolved.ostype.clone(),
             ostemplate: Some(resolved.ostemplate.clone()),
             hostname: Some(hostname.to_owned()),
             memory: Some(resolved.memory),
@@ -4001,14 +4012,9 @@ fn run_delete(
                 record.id
             );
         }
-        style.section("Delete box");
-        style.metadata("id", &record.id.to_string());
-        style.metadata("name", record.name.as_deref().unwrap_or("unnamed"));
-        style.metadata("state", &record.state);
-        style.warning("This permanently deletes the box and its data.");
-        if !wait {
-            style.hint("Running boxes will be stopped immediately. Deletion continues in Proxmox.");
-        }
+        let config = client.get_lxc_config(&record.node, record.vmid)?;
+        let metadata = parse_metadata(config.description.as_deref().unwrap_or(""))?;
+        ui::delete_details(&record, metadata.as_ref(), wait, style);
         if !confirm_delete(&mut io::stdin().lock(), &mut io::stderr().lock())? {
             style.hint("Cancelled. No changes made.");
             return Ok(());
@@ -5325,6 +5331,8 @@ mod tests {
 
     fn test_resolved_new() -> super::ResolvedNew {
         super::ResolvedNew {
+            ostype: None,
+            image: "docker.io/library/debian:13".to_owned(),
             node: "pve01".to_owned(),
             ostemplate: "local:vztmpl/debian-13-standard_13.0-1_amd64.tar.zst".to_owned(),
             rootfs: "local:8G".to_owned(),
@@ -5758,7 +5766,9 @@ mod tests {
         ];
         let key = BootstrapKey::generate("pbx_create_success").unwrap();
         let id = PboxId::parse("pbx_t3yzd9y3").unwrap();
-        let resolved = test_resolved_new();
+        let mut resolved = test_resolved_new();
+        resolved.ostype = Some("archlinux".to_owned());
+        resolved.image = "docker.io/cachyos/cachyos:latest".to_owned();
 
         let (vmid, task) =
             create_lxc_with_retry(&fake, &Config::default(), &resolved, &id, "pbox-test", &key)
@@ -5776,6 +5786,7 @@ mod tests {
                 request.ostemplate.as_deref(),
                 Some(resolved.ostemplate.as_str())
             );
+            assert_eq!(request.ostype.as_deref(), Some("archlinux"));
             assert_eq!(request.rootfs.as_deref(), Some(resolved.rootfs.as_str()));
             assert_eq!(request.net0.as_deref(), Some(resolved.net0.as_str()));
             assert_eq!(request.memory, Some(2048));
@@ -5787,6 +5798,7 @@ mod tests {
             let metadata = parse_metadata(request.description.as_deref().unwrap())
                 .unwrap()
                 .unwrap();
+            assert_eq!(metadata.image.as_deref(), Some(resolved.image.as_str()));
             assert_eq!(metadata.id, id);
             assert_eq!(metadata.vmid, 9002);
             assert_eq!(metadata.node.as_deref(), Some("pve01"));

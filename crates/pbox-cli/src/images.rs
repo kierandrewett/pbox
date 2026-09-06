@@ -317,8 +317,9 @@ fn prepare_local_oci_template(
     filename: &str,
 ) -> Result<OciTemplate> {
     let archive = build_local_oci_archive(reference, filename, None)?;
-    let result = upload_local_oci_template(client, node, storage, reference, filename, &archive);
-    if let Some(workspace) = archive.parent() {
+    let result =
+        upload_local_oci_template(client, node, storage, reference, filename, &archive.path);
+    if let Some(workspace) = archive.path.parent() {
         let _ = fs::remove_dir_all(workspace);
     }
     result
@@ -341,6 +342,10 @@ pub fn upload_local_oci_template(
             task: None,
         });
     }
+    super::progress::substep(&format!(
+        "Uploading {} to PVE {node}/{storage}",
+        super::ui::byte_size(fs::metadata(archive)?.len())
+    ));
     let task = client
         .upload_storage_template(node, storage, &format!("{filename}.tar.zst"), archive)
         .with_context(|| {
@@ -354,64 +359,62 @@ pub fn upload_local_oci_template(
     })
 }
 
-const OCI_GUEST_PREPARATION: &str = r#"set -eu
-run_timed() {
-    seconds="$1"
-    shift
-    if command -v timeout >/dev/null 2>&1; then
-        timeout --foreground "${seconds}s" "$@"
-    else
-        "$@"
-    fi
+const OCI_GUEST_PREPARATION: &str = include_str!("guest-scripts/prepare.sh");
+
+pub(crate) fn preparation_script(with_agent: bool) -> String {
+    if with_agent {
+        format!(
+            "set -eu\n(\n{OCI_GUEST_PREPARATION}\n)\n{}\n{RELAY_GUEST_PREPARATION}\n{IMAGE_PREFLIGHT}",
+            super::guest::USER_SETUP
+        )
+    } else {
+        OCI_GUEST_PREPARATION.to_owned()
+    }
 }
-if [ -x /sbin/init ] && command -v sshd >/dev/null 2>&1 && command -v ip >/dev/null 2>&1 && command -v dhclient >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
-    exit 0
-fi
-if command -v apt-get >/dev/null 2>&1; then
-    printf '%s\n' '#!/bin/sh' 'exit 101' > /usr/sbin/policy-rc.d
-    chmod 755 /usr/sbin/policy-rc.d
-    export DEBIAN_FRONTEND=noninteractive
-    printf '%s\n' '[pbox-image] Updating package metadata'
-    run_timed 120 apt-get -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=1 update
-    printf '%s\n' '[pbox-image] Installing guest packages: systemd, OpenSSH, sudo, Python, CA certificates, iproute2, ifupdown, DHCP client'
-    run_timed 180 apt-get install -y --no-install-recommends systemd-sysv openssh-server sudo python3 ncurses-base ca-certificates iproute2 ifupdown isc-dhcp-client
-    printf '%s\n' '[pbox-image] Cleaning package metadata'
-    rm -rf /var/lib/apt/lists/* /usr/sbin/policy-rc.d
-elif command -v dnf >/dev/null 2>&1; then
-    printf '%s\n' '[pbox-image] Installing guest packages: systemd, OpenSSH, sudo, Python, CA certificates, iproute, DHCP client'
-    run_timed 180 dnf install -y systemd openssh-server sudo python3 ncurses-base ca-certificates iproute dhcp-client
-    printf '%s\n' '[pbox-image] Cleaning package metadata'
-    dnf clean all
-else
-    echo 'Image compatibility check failed: pbox needs systemd, OpenSSH, sudo, Python and guest networking tools. Automatic preparation supports apt-get or dnf. Install these prerequisites in your Dockerfile, rebuild and publish the image, then retry pbox new --image IMAGE. No PVE box has been created.' >&2
-    exit 1
-fi
-printf '%s\n' '[pbox-image] Guest preparation complete'
-"#;
+
+pub struct LocalOciArchive {
+    pub path: PathBuf,
+    pub ostype: String,
+}
 
 pub fn build_local_oci_archive(
     reference: &str,
     filename: &str,
     payload: Option<&Path>,
-) -> Result<PathBuf> {
+) -> Result<LocalOciArchive> {
     let workspace = create_local_oci_workspace(filename)?;
-    let result = (|| {
+    let result: Result<LocalOciArchive> = (|| {
         let image = ImageReference::parse(reference)?.canonical();
-        let pull_action = format!("Pulling OCI image {image}");
+        super::progress::substep("Checking registry image size (before download)");
+        let size = registry_layer_size(&image)
+            .map(|bytes| {
+                format!(
+                    "{} compressed layers; cached layers reused",
+                    super::ui::byte_size(bytes)
+                )
+            })
+            .unwrap_or_else(|| "registry size unavailable; cached layers reused".to_owned());
+        let pull_action = format!("Pulling OCI image {image} locally ({size})");
         run_local_command("podman", &["pull", image.as_str()], &pull_action)?;
+        let local_size = Command::new("podman")
+            .args(["image", "inspect", "--format", "{{.Size}}", &image])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
+            .map(super::ui::byte_size)
+            .unwrap_or_else(|| "size unavailable".to_owned());
         let container = workspace
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow::anyhow!("local OCI workspace has no valid container name"))?
             .to_owned();
-        let preparation = if payload.is_some() {
-            format!(
-                "set -eu\n(\n{OCI_GUEST_PREPARATION}\n)\n{}\n{RELAY_GUEST_PREPARATION}\n{IMAGE_PREFLIGHT}",
-                super::guest::USER_SETUP
-            )
-        } else {
-            OCI_GUEST_PREPARATION.to_owned()
-        };
+        let preparation = preparation_script(payload.is_some());
         run_local_command(
             "podman",
             &[
@@ -431,10 +434,11 @@ pub fn build_local_oci_archive(
                 "-c",
                 &preparation,
             ],
-            "Creating temporary OCI container",
+            &format!("Creating local build container ({local_size} unpacked)"),
         )?;
         let tar = workspace.join(format!("{filename}.tar"));
         let compressed = workspace.join(format!("{filename}.tar.zst"));
+        let mut ostype = String::new();
         let operation_result = (|| {
             if let Some(payload) = payload {
                 run_local_command(
@@ -454,6 +458,24 @@ pub fn build_local_oci_archive(
                 &["start", "--attach", container.as_str()],
                 "Installing guest prerequisites (systemd, OpenSSH, sudo, Python)",
             ).with_context(|| format!("image {image} could not be prepared; no PVE box has been created. Fix the reported prerequisite in your Dockerfile and rebuild the image. Use --verbose to retain preparation logs"))?;
+            let manifest = workspace.join("ostype");
+            run_local_command(
+                "podman",
+                &[
+                    "cp",
+                    &format!("{container}:/etc/pbox-image-ostype"),
+                    &path_text(&manifest)?,
+                ],
+                "Reading image compatibility result",
+            )?;
+            ostype = fs::read_to_string(manifest)?.trim().to_owned();
+            anyhow::ensure!(
+                matches!(
+                    ostype.as_str(),
+                    "debian" | "ubuntu" | "fedora" | "centos" | "archlinux" | "opensuse"
+                ),
+                "invalid image OS type"
+            );
             run_local_command(
                 "podman",
                 &["export", "--output", tar_text.as_str(), container.as_str()],
@@ -469,7 +491,10 @@ pub fn build_local_oci_archive(
                     "-o",
                     compressed_text.as_str(),
                 ],
-                "Compressing OCI root filesystem",
+                &format!(
+                    "Compressing {} root filesystem",
+                    super::ui::byte_size(fs::metadata(&tar)?.len())
+                ),
             )?;
             Ok::<(), anyhow::Error>(())
         })();
@@ -480,15 +505,64 @@ pub fn build_local_oci_archive(
         );
         operation_result?;
         cleanup_result?;
-        Ok(compressed)
+        Ok(LocalOciArchive {
+            path: compressed,
+            ostype,
+        })
     })();
     match result {
         Ok(path) => Ok(path),
         Err(error) => {
             let _ = fs::remove_dir_all(&workspace);
-            Err(error)
+            Err(error).context(ImagePreparationFailure {
+                image: ImageReference::parse(reference)
+                    .map(|image| image.canonical())
+                    .unwrap_or_else(|_| reference.to_owned()),
+            })
         }
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct ImagePreparationFailure {
+    pub image: String,
+}
+impl std::fmt::Display for ImagePreparationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "could not prepare image {}", self.image)
+    }
+}
+
+fn registry_layer_size(image: &str) -> Option<u64> {
+    // Optional metadata lookup: inability to inspect must not prevent pulling.
+    let output = Command::new("skopeo")
+        .args([
+            "--command-timeout",
+            "10s",
+            "inspect",
+            "--no-tags",
+            "--format",
+            "{{json .LayersData}}",
+            &format!("docker://{image}"),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    layer_bytes(&output.stdout)
+}
+
+fn layer_bytes(json: &[u8]) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_slice(json).ok()?;
+    let layers = value.as_array()?;
+    if layers.is_empty() {
+        return None;
+    }
+    layers.iter().try_fold(0u64, |total, layer| {
+        total.checked_add(layer.get("Size")?.as_u64()?)
+    })
 }
 
 fn create_local_oci_workspace(filename: &str) -> Result<PathBuf> {
@@ -846,37 +920,43 @@ fn hex_lower(bytes: &[u8]) -> String {
     value
 }
 
-const RELAY_GUEST_PREPARATION: &str = r#"
-install -d -o pbox -g pbox -m 0755 /home/pbox
-chmod 0755 /usr/local/bin/pbox-agent
-chmod 0700 /etc/pbox
-chmod 0600 /etc/pbox/server-key.pem /etc/pbox/relay.json
-mkdir -p /etc/systemd/system/multi-user.target.wants
-ln -sf /etc/systemd/system/pbox-agent.service /etc/systemd/system/multi-user.target.wants/pbox-agent.service
-"#;
+const RELAY_GUEST_PREPARATION: &str = include_str!("guest-scripts/relay.sh");
 
 /// Runs inside the prepared OCI filesystem before it is uploaded to PVE.
-const IMAGE_PREFLIGHT: &str = r#"
-printf '%s\n' '[pbox-image] Checking image compatibility (init, agent runtime and service startup)'
-fail_image() {
-    printf 'Image compatibility check failed: %s\n' "$1" >&2
-    exit 1
-}
-for tool in systemctl sshd sudo python3 ip; do
-    command -v "$tool" >/dev/null 2>&1 || fail_image "Missing $tool; install it in your Dockerfile."
-done
-[ -x /bin/bash ] || fail_image 'Missing /bin/bash; install Bash for the pbox login shell.'
-init_binary="$(readlink -f /sbin/init)"
-"$init_binary" --version 2>/dev/null | head -n 1 | grep -q '^systemd ' || fail_image '/sbin/init must run systemd; choose a systemd-compatible base image.'
-agent_error=$(/usr/local/bin/pbox-agent --help 2>&1 >/dev/null) || fail_image "pbox-agent cannot run in this image: ${agent_error:-the executable returned an error}. Check its CPU architecture, libc and shared libraries. Use a compatible image or configure agent.binary with a build for this image."
-systemctl --root=/ preset pbox-agent.service >/dev/null || fail_image 'Cannot apply the pbox-agent service preset; check systemd masks and presets in your image.'
-systemctl --root=/ is-enabled --quiet pbox-agent.service || fail_image 'Image policy disables pbox-agent.service. Remove its mask or add an earlier systemd preset that enables pbox-agent.service.'
-printf '%s\n' '[pbox-image] Image checks passed; guest boot and relay connectivity will be checked after creation'
-"#;
+const IMAGE_PREFLIGHT: &str = include_str!("guest-scripts/preflight.sh");
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Export exactly the production payload/scripts with disposable test credentials.
+    #[test]
+    #[ignore = "fixture exporter for scripts/test-images.py"]
+    fn export_docker_image_fixture() {
+        let directory =
+            PathBuf::from(std::env::var_os("PBOX_TEST_FIXTURE").expect("fixture directory"));
+        fs::create_dir_all(&directory).unwrap();
+        let mut config = pbox_core::Config::default();
+        config.pve.token_id = Some("docker-test@pve!test".to_owned());
+        config.pve.token_secret = Some(pbox_core::config::Secret::new("local-test-only"));
+        config.agent.binary = Some(PathBuf::from(
+            std::env::var_os("PBOX_TEST_AGENT").expect("agent binary"),
+        ));
+        super::super::relay::write_payload(&directory.join("payload"), &config, "pbx_test1234")
+            .unwrap();
+        pbox_core::config::save_file(&directory.join("config.toml"), &config).unwrap();
+        fs::write(directory.join("prepare.sh"), preparation_script(true)).unwrap();
+        fs::write(directory.join("preflight.sh"), IMAGE_PREFLIGHT).unwrap();
+        fs::write(directory.join("user.sh"), super::super::guest::USER_SETUP).unwrap();
+    }
+
+    #[test]
+    fn registry_sizes_require_complete_nonnegative_layer_metadata() {
+        assert_eq!(layer_bytes(br#"[{"Size":1024},{"Size":2048}]"#), Some(3072));
+        assert_eq!(layer_bytes(br#"[{"Size":1024},{}]"#), None);
+        assert_eq!(layer_bytes(br#"[{"Size":-1}]"#), None);
+        assert_eq!(layer_bytes(br#"[]"#), None);
+    }
 
     #[test]
     fn image_preflight_error_keeps_the_actionable_reason_without_package_logs() {

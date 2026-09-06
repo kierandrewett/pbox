@@ -95,3 +95,12 @@ listing is a separate command. Missing interactive search terms use the shared
 prompt, while redirected input gets a concrete usage hint. Snapshot listing needs
 no box ID and lists independent saved environments by name and psn_ ID. Source
 box IDs are provenance only. Per-box PVE rollback points are called checkpoints.
+
+Image preparation errors use a short error heading, image and creation-status
+metadata, then separate `What failed` and `Next steps` sections. Diagnostic text
+wraps onto aligned lines. Creation distinguishes local image preparation from
+upload to a named PVE node/storage, and reports known compressed-layer, rootfs
+and upload sizes without implying that cached bytes were downloaded.
+Deletion confirmation includes image provenance (and snapshot provenance when
+available); older boxes without recorded provenance show `Not recorded`.
+`ls` and `ps` are visible aliases of `list` and share its output.
