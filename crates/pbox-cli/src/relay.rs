@@ -101,14 +101,33 @@ pub(crate) fn write_payload(directory: &Path, config: &Config, box_id: &str) -> 
     } else {
         ""
     };
+    let agent_args = format!(
+        "--listen {listen}:{} --box-id {box_id} --certificate /etc/pbox/server.pem --private-key /etc/pbox/server-key.pem --client-ca /etc/pbox/client-ca.pem{relay_arg}",
+        config.agent.port
+    );
     // Start immediately; the agent retries outbound connections while DHCP becomes ready.
     fs::write(
         unit,
         format!(
-            "[Unit]\nDescription=pbox guest agent\nWants=network.target\nAfter=network.target\n\n[Service]\nExecStart=/usr/local/bin/pbox-agent --listen {listen}:{} --box-id {} --certificate /etc/pbox/server.pem --private-key /etc/pbox/server-key.pem --client-ca /etc/pbox/client-ca.pem {relay_arg}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
-            config.agent.port, box_id
+            "[Unit]\nDescription=pbox guest agent\nWants=network.target\nAfter=network.target\n\n[Service]\nExecStart=/usr/local/bin/pbox-agent {agent_args}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"
         ),
     )?;
+    let openrc = directory.join("etc/init.d/pbox-agent");
+    fs::create_dir_all(openrc.parent().unwrap())?;
+    fs::write(
+        &openrc,
+        format!(
+            "#!/sbin/openrc-run\nname=pbox-agent\ncommand=/usr/local/bin/pbox-agent\ncommand_args=\"{agent_args}\"\ncommand_background=true\npidfile=/run/${{RC_SVCNAME}}.pid\nrespawn_delay=2\nrespawn_max=0\ndepend() {{\n    need net\n}}\n"
+        ),
+    )?;
+    fs::set_permissions(&openrc, fs::Permissions::from_mode(0o755))?;
+    let runit = directory.join("etc/service/pbox-agent/run");
+    fs::create_dir_all(runit.parent().unwrap())?;
+    fs::write(
+        &runit,
+        format!("#!/bin/sh\nexec /usr/local/bin/pbox-agent {agent_args}\n"),
+    )?;
+    fs::set_permissions(&runit, fs::Permissions::from_mode(0o755))?;
     // First-boot presets can remove an enable symlink on distributions such as
     // Fedora. Keep the managed agent enabled when systemd applies that policy.
     let presets = directory.join("etc/systemd/system-preset");
@@ -449,6 +468,11 @@ mod tests {
         assert!(unit.contains("--listen 127.0.0.1:7443"));
         assert!(unit.contains("After=network.target"));
         assert!(!unit.contains("After=network-online.target"));
+        let openrc = fs::read_to_string(directory.join("etc/init.d/pbox-agent")).unwrap();
+        assert!(openrc.contains("command_background=true"));
+        assert!(openrc.contains("/usr/local/bin/pbox-agent"));
+        let runit = fs::read_to_string(directory.join("etc/service/pbox-agent/run")).unwrap();
+        assert!(runit.starts_with("#!/bin/sh\nexec /usr/local/bin/pbox-agent"));
         let relay_script = include_str!("guest-scripts/relay.sh");
         assert!(relay_script.contains("systemd-networkd.service"));
         // Fedora applies a disable-all preset on first boot. Exercise systemd's

@@ -47,9 +47,10 @@ addresses, and the exact command to connect. Use
 live image/PVE logs expand beneath it; they collapse into its completed row. Preparing an OCI image still
 installs the prerequisites needed to boot it as an LXC guest.
 
-Before uploading a prepared relay image, pbox checks systemd, required tools,
-the agent's executable compatibility and its service preset. Failed checks stop
-creation with the image name and instructions for fixing the Dockerfile.
+Before uploading a prepared relay image, pbox checks the init system (systemd,
+OpenRC or runit), required tools, the agent's executable compatibility and its
+service configuration. Failed checks stop creation with the image name and
+instructions for fixing the Dockerfile.
 These checks do not prove that guest networking or container permissions will
 work after boot. If the agent cannot connect, pbox keeps the box and shows how
 to inspect its service logs and networking in the PVE console, then retry with
