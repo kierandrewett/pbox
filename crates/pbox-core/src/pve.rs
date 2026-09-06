@@ -125,6 +125,29 @@ pub trait PveApi {
         ))
     }
 
+    fn clone_lxc(
+        &self,
+        node: &str,
+        vmid: u64,
+        request: &LxcCloneRequest,
+    ) -> Result<PveTaskResponse, PveError> {
+        let _ = (node, vmid, request);
+        Err(PveError::Unsupported(
+            "container cloning is unavailable".into(),
+        ))
+    }
+    fn template_lxc(&self, node: &str, vmid: u64) -> Result<(), PveError> {
+        let _ = (node, vmid);
+        Err(PveError::Unsupported(
+            "container templates are unavailable".into(),
+        ))
+    }
+    fn template_tasks(&self, node: &str, vmid: u64) -> Result<Vec<PveTaskResponse>, PveError> {
+        let _ = (node, vmid);
+        Err(PveError::Unsupported(
+            "template task listing is unavailable".into(),
+        ))
+    }
     fn create_lxc_snapshot(
         &self,
         node: &str,
@@ -470,6 +493,34 @@ impl PveApi for PveClient {
         self.task_without_form(Method::DELETE, &format!("/nodes/{node}/lxc/{vmid}?force=1"))
     }
 
+    fn clone_lxc(
+        &self,
+        node: &str,
+        vmid: u64,
+        request: &LxcCloneRequest,
+    ) -> Result<PveTaskResponse, PveError> {
+        validate_path_segment(node, "node")?;
+        self.task(
+            Method::POST,
+            &format!("/nodes/{node}/lxc/{vmid}/clone"),
+            request,
+        )
+    }
+    fn template_lxc(&self, node: &str, vmid: u64) -> Result<(), PveError> {
+        validate_path_segment(node, "node")?;
+        let response = self
+            .request(Method::POST, &format!("/nodes/{node}/lxc/{vmid}/template"))
+            .send()
+            .map_err(PveError::Request)?;
+        let _: serde_json::Value = decode_response(response)?;
+        Ok(())
+    }
+    fn template_tasks(&self, node: &str, vmid: u64) -> Result<Vec<PveTaskResponse>, PveError> {
+        validate_path_segment(node, "node")?;
+        self.get(&format!(
+            "/nodes/{node}/tasks?vmid={vmid}&typefilter=vztemplate&limit=10"
+        ))
+    }
     fn create_lxc_snapshot(
         &self,
         node: &str,
@@ -741,6 +792,17 @@ where
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct LxcCloneRequest {
+    pub newid: u64,
+    pub hostname: String,
+    pub description: String,
+    /// Always request an independent copy, including when cloning a template.
+    pub full: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct LxcCreateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -780,6 +842,9 @@ pub struct LxcCreateRequest {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct LxcConfigUpdateRequest {
+    /// Additional netN interfaces configured through the standard PVE API.
+    #[serde(flatten, default)]
+    pub networks: std::collections::BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

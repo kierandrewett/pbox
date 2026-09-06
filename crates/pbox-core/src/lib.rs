@@ -15,8 +15,8 @@ pub use metadata::{
     preserve_metadata,
 };
 pub use pve::{
-    ClusterResource, LxcConfig, LxcConfigUpdateRequest, LxcCreateRequest, LxcInterface,
-    LxcSnapshot, LxcSnapshotRequest, PveApi, PveClient, PveClientConfig, PveError,
+    ClusterResource, LxcCloneRequest, LxcConfig, LxcConfigUpdateRequest, LxcCreateRequest,
+    LxcInterface, LxcSnapshot, LxcSnapshotRequest, PveApi, PveClient, PveClientConfig, PveError,
     PveNetworkInterface, PveNode, PveStorage, PveStorageContent, PveTaskLog, PveTaskResponse,
     PveTaskStatus, select_lxc_ipv4, select_lxc_ipv6,
 };
