@@ -190,7 +190,16 @@ impl BridgeHandle {
         config_path: PathBuf,
         pbox_binary: PathBuf,
     ) -> Result<Self> {
-        let socket_path = invocation.operation_directory.join("bridge.sock");
+        // Linux limits Unix-domain socket paths to SUN_LEN bytes. Operation
+        // directories intentionally include the recipe, box and operation
+        // identifiers, so putting the bridge below them can exceed that
+        // limit before Ansible has a chance to connect.
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("read system clock for Ansible bridge socket")?
+            .as_nanos();
+        let socket_path =
+            std::env::temp_dir().join(format!("pbox-b-{}-{stamp}.sock", std::process::id()));
         match fs::remove_file(&socket_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

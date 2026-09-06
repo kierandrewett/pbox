@@ -242,6 +242,12 @@ impl RecipeRepository {
         self.discover_unlocked_checked()
     }
 
+    /// Read the last synchronised catalog without contacting the repository.
+    /// Completion must remain local, silent and safe to invoke repeatedly.
+    pub(crate) fn cached_catalog(&self) -> Result<RecipeCatalog> {
+        self.discover()
+    }
+
     fn discover_unlocked_checked(&self) -> Result<RecipeCatalog> {
         self.ensure_cache_path_is_safe()?;
         restrict_cache_directory(&self.cache_dir)?;
