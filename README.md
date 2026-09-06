@@ -11,6 +11,11 @@ pbox new --image debian:13
 pbox ssh BOX_ID
 ```
 
+The first normal `pbox` command starts a small per-user `pboxd` state daemon
+under `~/.local/share/pbox/`. It caches guest agent reachability for list output;
+if it exits, the next command starts it again. It uses the configured PVE API
+and relay, and communicates with the CLI over a mode-0600 Unix socket.
+
 Enable shell completion for commands, flags, live box IDs/names and snapshot IDs/names:
 
 ```sh

@@ -38,7 +38,7 @@ network_ready() {
         debian) command -v ifup >/dev/null && command -v dhclient >/dev/null;;
         ubuntu|fedora|arch) [ -x /usr/lib/systemd/systemd-networkd ] || [ -x /lib/systemd/systemd-networkd ];;
         rhel) command -v NetworkManager >/dev/null;;
-        suse) command -v wicked >/dev/null;;
+        suse) command -v wicked >/dev/null || [ -x /usr/lib/systemd/systemd-networkd ] || [ -x /lib/systemd/systemd-networkd ];;
     esac
 }
 ready=true
@@ -90,7 +90,10 @@ case "$family" in
         ;;
     suse)
         command -v zypper >/dev/null || fail_image "Missing zypper in $id. Install guest prerequisites in your Dockerfile."
-        run_timed zypper --non-interactive install --no-recommends systemd openssh sudo python3 bash ncurses-utils ca-certificates iproute2 wicked wicked-service shadow
+        if ! run_timed zypper --non-interactive install --no-recommends systemd openssh sudo python3 bash ncurses-utils ca-certificates iproute2 wicked wicked-service shadow; then
+            printf '%s\n' '[pbox-image] wicked is unavailable; falling back to systemd-networkd for the SUSE PVE network layout'
+            run_timed zypper --non-interactive install --no-recommends systemd openssh sudo python3 bash ncurses-utils ca-certificates iproute2 shadow
+        fi
         zypper clean --all
         ;;
 esac

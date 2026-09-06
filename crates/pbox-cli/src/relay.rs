@@ -105,7 +105,7 @@ pub(crate) fn write_payload(directory: &Path, config: &Config, box_id: &str) -> 
     fs::write(
         unit,
         format!(
-            "[Unit]\nDescription=pbox guest agent\nAfter=network.target\n\n[Service]\nExecStart=/usr/local/bin/pbox-agent --listen {listen}:{} --box-id {} --certificate /etc/pbox/server.pem --private-key /etc/pbox/server-key.pem --client-ca /etc/pbox/client-ca.pem {relay_arg}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
+            "[Unit]\nDescription=pbox guest agent\nWants=network-online.target\nAfter=network-online.target\n\n[Service]\nExecStart=/usr/local/bin/pbox-agent --listen {listen}:{} --box-id {} --certificate /etc/pbox/server.pem --private-key /etc/pbox/server-key.pem --client-ca /etc/pbox/client-ca.pem {relay_arg}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
             config.agent.port, box_id
         ),
     )?;

@@ -6,11 +6,29 @@ chmod 0600 /etc/pbox/server-key.pem
 if [ -f /etc/pbox/relay.json ]; then chmod 0600 /etc/pbox/relay.json; fi
 mkdir -p /etc/systemd/system/multi-user.target.wants
 ln -sf /etc/systemd/system/pbox-agent.service /etc/systemd/system/multi-user.target.wants/pbox-agent.service
-# PVE writes the guest network files through its supported ostype plugin. Keep
-# the matching network daemon enabled even when the image already has a machine
-# id and systemd therefore skips first-boot preset application.
-if [ -e /usr/lib/systemd/system/systemd-networkd.service ]; then
-    ln -sf /usr/lib/systemd/system/systemd-networkd.service /etc/systemd/system/multi-user.target.wants/systemd-networkd.service
-elif [ -e /lib/systemd/system/systemd-networkd.service ]; then
-    ln -sf /lib/systemd/system/systemd-networkd.service /etc/systemd/system/multi-user.target.wants/systemd-networkd.service
-fi
+enable_unit() {
+    unit="$1"
+    for root in /usr/lib/systemd/system /lib/systemd/system; do
+        if [ -e "$root/$unit" ]; then
+            ln -sf "$root/$unit" "/etc/systemd/system/multi-user.target.wants/$unit"
+            return 0
+        fi
+    done
+    return 1
+}
+# PVE writes network files through the selected ostype plugin. Enable that
+# plugin explicitly because an image with an existing machine-id may skip
+# systemd's first-boot presets. The fallback order mirrors PVE's supported
+# network configuration: networkd for Debian-family modern Ubuntu/Fedora/Arch,
+# NetworkManager for RHEL 10+, wicked then networkd for SUSE, and ifupdown's
+# networking unit for Debian. We never invent a second network configuration.
+ostype=$(cat /etc/pbox-image-ostype 2>/dev/null || true)
+case "$ostype" in
+    debian) enable_unit networking.service || true ;;
+    ubuntu|fedora|archlinux)
+        enable_unit systemd-networkd.service || enable_unit NetworkManager.service || true
+        enable_unit systemd-networkd.socket || true
+        ;;
+    centos) enable_unit NetworkManager.service || enable_unit network.service || true ;;
+    opensuse) enable_unit wicked.service || enable_unit systemd-networkd.service || true ;;
+esac

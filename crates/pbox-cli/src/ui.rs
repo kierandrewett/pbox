@@ -87,16 +87,22 @@ pub(crate) fn agent_startup_help(box_id: &str) {
     let style = stderr();
     style.section("Check guest startup");
     style.hint("Image checks cannot verify guest networking before boot.");
-    style.hint(&format!(
-        "Run pbox info {box_id} to find its PVE node and VMID."
-    ));
-    style.hint("In a root shell inside the container, run:");
-    style.hint("systemctl status pbox-agent.service");
-    style.hint("journalctl -u pbox-agent.service -b --no-pager");
-    style.hint("If disabled: systemctl enable --now pbox-agent.service");
-    style.hint("For connection errors: check ip route, /etc/resolv.conf and outbound access to your relay.");
-    style.hint("If container login is unavailable, a PVE administrator can use pct enter VMID from the node's Shell.");
-    style.hint(&format!("After fixing the cause: pbox repair {box_id}"));
+    style.hint("Find the guest location:");
+    style.command_stderr(&format!("pbox info {box_id}"));
+    style.hint("In a root shell inside the container, inspect the service:");
+    style.command_stderr("systemctl status pbox-agent.service");
+    style.command_stderr("journalctl -u pbox-agent.service -b --no-pager");
+    style.hint("If it is disabled, enable it:");
+    style.command_stderr("systemctl enable --now pbox-agent.service");
+    style.hint("For connection errors, inspect networking:");
+    style.command_stderr("ip route");
+    style.command_stderr("cat /etc/resolv.conf");
+    style.command_stderr("curl -I https://your-relay-host/healthz");
+    style
+        .hint("If container login is unavailable, a PVE administrator can enter it from the node:");
+    style.command_stderr("pct enter VMID");
+    style.hint("After fixing the cause, retry the relay connection:");
+    style.command_stderr(&format!("pbox repair {box_id}"));
 }
 
 pub(crate) fn delete_details(
@@ -263,6 +269,22 @@ impl CliStyle {
             self.progress(message);
         }
     }
+    pub(crate) fn can_animate(self) -> bool {
+        self.interactive
+    }
+
+    pub(crate) fn spinner(self, frame: char, message: &str) {
+        if self.interactive {
+            eprint!(
+                "\r\x1b[2K{} {}",
+                self.paint(ANSI_CYAN, &frame.to_string()),
+                self.paint(ANSI_BOLD, message)
+            );
+            let _ = io::stderr().flush();
+        } else {
+            self.progress(message);
+        }
+    }
 
     pub(crate) fn clear_progress_line(self) {
         if self.interactive {
@@ -303,6 +325,13 @@ impl CliStyle {
             self.paint(ANSI_CYAN, command)
         );
     }
+    pub(crate) fn command_stderr(self, command: &str) {
+        eprintln!(
+            "  {} {}",
+            self.paint(ANSI_DIM, "$"),
+            self.paint(ANSI_CYAN, command)
+        );
+    }
     pub(crate) fn diagnostic(self, message: &str) {
         self.hint(message);
     }
@@ -313,10 +342,6 @@ impl CliStyle {
             self.paint(ANSI_DIM, &format!("({elapsed}s)"))
         );
     }
-    pub(crate) fn can_animate(self) -> bool {
-        self.interactive
-    }
-
     pub(crate) fn stdout_status(self, marker: &str, code: &str, message: &str) {
         println!("{}", self.status(marker, code, message));
     }
@@ -500,9 +525,10 @@ pub(crate) fn print_box_records(records: &[BoxRecord], colour: bool) {
     let style = CliStyle::from_enabled(colour);
     let has_ipv6 = records.iter().any(|record| record.ipv6.is_some());
     let header = format!(
-        "{:<16} {:<10} {:<16} {:<16} {}NAME",
+        "{:<16} {:<10} {:<8} {:<16} {:<16} {}NAME",
         "ID",
         "STATE",
+        "PING",
         "NODE",
         "IPV4",
         if has_ipv6 {
@@ -515,6 +541,7 @@ pub(crate) fn print_box_records(records: &[BoxRecord], colour: bool) {
     for record in records {
         let id = format_box_cell(style, &record.id.to_string(), 16, ANSI_CYAN);
         let state = format_box_cell(style, &record.state, 10, box_state_colour(&record.state));
+        let ping = format_box_cell(style, record.ping.as_deref().unwrap_or("-"), 8, "");
         let node = format_box_cell(style, &record.node, 16, ANSI_CYAN);
         let ip = format_box_cell(style, record.ip.as_deref().unwrap_or("-"), 16, "");
         let name = style.text(record.name.as_deref().unwrap_or("-"));
@@ -526,7 +553,7 @@ pub(crate) fn print_box_records(records: &[BoxRecord], colour: bool) {
         } else {
             String::new()
         };
-        println!("{id} {state} {node} {ip} {ipv6}{name}");
+        println!("{id} {state} {ping} {node} {ip} {ipv6}{name}");
     }
     if records.is_empty() {
         println!(
@@ -1105,6 +1132,7 @@ mod image_feedback_preview {
             name: Some("pbox-test".to_owned()),
             recipes: Vec::new(),
             capabilities: Vec::new(),
+            ping: None,
         };
         let mut metadata = pbox_core::PboxMetadata::new(record.id.clone(), record.vmid);
         metadata.image = Some("docker.io/cachyos/cachyos:latest".to_owned());

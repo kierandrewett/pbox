@@ -185,6 +185,7 @@ mod tests {
                 name: Some(name.into()),
                 recipes: Vec::new(),
                 capabilities: Vec::new(),
+                ping: None,
             }
         }
         let selected = super::super::select_box_reference(

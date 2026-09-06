@@ -104,3 +104,6 @@ and upload sizes without implying that cached bytes were downloaded.
 Deletion confirmation includes image provenance (and snapshot provenance when
 available); older boxes without recorded provenance show `Not recorded`.
 `ls` and `ps` are visible aliases of `list` and share its output.
+`list` probes the guest agent and shows `PING`; a PVE-running container with no
+agent response is shown as `disconnected`. A small per-user `pboxd` process owns
+that probe cache and is restarted automatically by the next CLI invocation.

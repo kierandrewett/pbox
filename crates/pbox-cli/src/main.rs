@@ -44,6 +44,8 @@ use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::net::Ipv4Addr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -157,6 +159,15 @@ enum Command {
         #[arg(long)]
         wait: bool,
     },
+    /// Internal local state daemon.
+    #[command(hide = true)]
+    Daemon,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct DaemonStatus {
+    state: String,
+    ping: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -438,6 +449,8 @@ struct BoxRecord {
     name: Option<String>,
     recipes: Vec<PboxRecipeProvenance>,
     capabilities: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ping: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -523,6 +536,15 @@ fn run() -> Result<RunOutcome> {
         cli.config
             .unwrap_or_else(pbox_core::config::default_config_path),
     );
+    let daemon_command = matches!(&cli.command, Command::Daemon);
+    if !daemon_command
+        && !matches!(
+            &cli.command,
+            Command::Completions { .. } | Command::Id | Command::Config(_) | Command::Setup(_)
+        )
+    {
+        ensure_pboxd(store.path());
+    }
     match cli.command {
         Command::Completions { shell } => ui::completions(shell).map(|_| RunOutcome::Success),
         Command::Id => print_value(
@@ -578,6 +600,7 @@ fn run() -> Result<RunOutcome> {
         Command::Delete { id, yes, wait } => {
             run_delete(&store, &id, yes, wait, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
+        Command::Daemon => run_pboxd(store.path()),
     }
 }
 
@@ -2261,17 +2284,40 @@ fn run_ssh(store: &ConfigStore, command: SshCommand, json: bool) -> Result<RunOu
         .enable_all()
         .build()
         .context("create async runtime for pbox-agent shell")?;
+    let style = ui::stderr();
     let (mut client, info) = runtime.block_on(async move {
-        let mut client =
-            relay::connect_agent(&config, &endpoint, &box_id, &ca_pem, &client_identity)
+        let connect = async {
+            let mut client =
+                relay::connect_agent(&config, &endpoint, &box_id, &ca_pem, &client_identity)
+                    .await
+                    .context("connect to pbox-agent")?;
+            let info = client
+                .info()
                 .await
-                .context("connect to pbox-agent")?;
-        let info = client
-            .info()
-            .await
-            .context("validate pbox-agent identity")?;
-        Ok::<_, anyhow::Error>((client, info))
+                .context("validate pbox-agent identity")?;
+            Ok::<_, anyhow::Error>((client, info))
+        };
+        tokio::pin!(connect);
+        let mut frames = tokio::time::interval(Duration::from_millis(120));
+        let started = Instant::now();
+        let mut frame = 0;
+        loop {
+            tokio::select! {
+                result = &mut connect => break result,
+                _ = frames.tick() => {
+                    if started.elapsed() >= Duration::from_secs(3) {
+                        if style.can_animate() {
+                            style.spinner(['|', '/', '-', '\\'][frame % 4], "Connecting to your box");
+                        } else if frame == 0 {
+                            style.progress("Connecting to your box");
+                        }
+                        frame += 1;
+                    }
+                }
+            }
+        }
     })?;
+    style.clear_progress_line();
     if !info
         .capabilities
         .iter()
@@ -4487,13 +4533,228 @@ fn wait_for_task_with_progress(
 
 fn run_list(store: &ConfigStore, json: bool, color: ColorChoice) -> Result<()> {
     let client = client_from_store(store)?;
-    let records = discover_boxes(&client)?;
+    let config = load_config(store)?;
+    let mut records = discover_boxes(&client)?;
+    if let Some(statuses) = request_pboxd_status() {
+        for record in &mut records {
+            if let Some(status) = statuses.get(&record.id.to_string()) {
+                record.state.clone_from(&status.state);
+                record.ping.clone_from(&status.ping);
+            }
+        }
+    } else {
+        probe_box_agents(&config, &mut records);
+    }
     if json {
         ui::json_text(&(serde_json::to_string_pretty(&records)?));
     } else {
         let colour = color_enabled(color, json);
         print_box_records(&records, colour);
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn pboxd_socket() -> Option<PathBuf> {
+    Some(dirs::data_local_dir()?.join("pbox").join("pboxd.sock"))
+}
+
+#[cfg(not(unix))]
+fn pboxd_socket() -> Option<PathBuf> {
+    None
+}
+
+fn ensure_pboxd(config_path: &Path) {
+    #[cfg(unix)]
+    {
+        let Some(socket) = pboxd_socket() else { return };
+        if UnixStream::connect(&socket).is_ok() {
+            return;
+        }
+        if let Some(parent) = socket.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = std::process::Command::new(
+            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pbox")),
+        )
+        .arg("daemon")
+        .arg("--config")
+        .arg(config_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    }
+}
+
+fn request_pboxd_status() -> Option<std::collections::BTreeMap<String, DaemonStatus>> {
+    #[cfg(unix)]
+    {
+        let socket = pboxd_socket()?;
+        let mut stream = UnixStream::connect(socket).ok()?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(12)))
+            .ok()?;
+        stream.write_all(b"status\n").ok()?;
+        stream.shutdown(std::net::Shutdown::Write).ok()?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).ok()?;
+        serde_json::from_str(&response).ok()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn run_pboxd(store_path: &Path) -> Result<RunOutcome> {
+    #[cfg(unix)]
+    {
+        let socket = pboxd_socket().context("resolve pboxd socket")?;
+        if let Some(parent) = socket.parent() {
+            fs::create_dir_all(parent).context("create pboxd state directory")?;
+        }
+        let _ = fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).context("bind pboxd socket")?;
+        let _ = fs::set_permissions(&socket, fs::Permissions::from_mode(0o600));
+        let mut cached_status: Option<(Instant, String)> = None;
+        for stream in listener.incoming() {
+            let mut stream = match stream {
+                Ok(stream) => stream,
+                Err(_) => continue,
+            };
+            let mut request = String::new();
+            if stream.read_to_string(&mut request).is_err() || request.trim() != "status" {
+                continue;
+            }
+            if let Some((created, response)) = &cached_status
+                && created.elapsed() < Duration::from_secs(5)
+            {
+                let _ = stream.write_all(response.as_bytes());
+                continue;
+            }
+            let result = (|| -> Result<_> {
+                let store = ConfigStore::new(store_path);
+                let config = load_config(&store)?;
+                let client = client_from_config(&config)?;
+                let mut records = discover_boxes(&client)?;
+                probe_box_agents(&config, &mut records);
+                Ok(records
+                    .into_iter()
+                    .map(|record| {
+                        (
+                            record.id.to_string(),
+                            DaemonStatus {
+                                state: record.state,
+                                ping: record.ping,
+                            },
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>())
+            })();
+            let response = serde_json::to_string(&result.unwrap_or_default())
+                .unwrap_or_else(|_| "{}".to_owned());
+            cached_status = Some((Instant::now(), response.clone()));
+            let _ = stream.write_all(response.as_bytes());
+        }
+        unreachable!("pboxd socket loop ended")
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = store_path;
+        bail!("pboxd is only supported on Unix hosts")
+    }
+}
+
+fn probe_box_agents(config: &Config, records: &mut [BoxRecord]) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            for record in records
+                .iter_mut()
+                .filter(|record| record.state == "running")
+            {
+                record.state = "disconnected".to_owned();
+                record.ping = Some("error".to_owned());
+            }
+            return;
+        }
+    };
+    let config = config.clone();
+    let probes = records
+        .iter()
+        .filter(|record| record.state == "running")
+        .map(|record| {
+            let endpoint = if config.relay.url.is_some() {
+                relay::ENDPOINT.to_owned()
+            } else if let Some(ip) = &record.ip {
+                format!("https://{}:{}", ip, config.agent.port)
+            } else {
+                String::new()
+            };
+            (record.id.to_string(), endpoint)
+        })
+        .collect::<Vec<_>>();
+    let results = runtime.block_on(async move {
+        let mut set = tokio::task::JoinSet::new();
+        for (id, endpoint) in probes {
+            let config = config.clone();
+            set.spawn(async move {
+                if endpoint.is_empty() {
+                    return (id, "unknown".to_owned());
+                }
+                let result = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    probe_agent_once(&config, &endpoint, &id),
+                )
+                .await;
+                let status = match result {
+                    Ok(Ok(())) => "ok",
+                    Ok(Err(_)) => "error",
+                    Err(_) => "timeout",
+                };
+                (id, status.to_owned())
+            });
+        }
+        let mut results = Vec::new();
+        while let Some(result) = set.join_next().await {
+            if let Ok(result) = result {
+                results.push(result);
+            }
+        }
+        results
+    });
+    for record in records
+        .iter_mut()
+        .filter(|record| record.state == "running")
+    {
+        let status = results
+            .iter()
+            .find(|(id, _)| id == &record.id.to_string())
+            .map(|(_, status)| status.as_str())
+            .unwrap_or("unknown");
+        record.ping = Some(status.to_owned());
+        if status != "ok" {
+            record.state = "disconnected".to_owned();
+        }
+    }
+}
+
+async fn probe_agent_once(config: &Config, endpoint: &str, id: &str) -> Result<()> {
+    let materials = agent_materials(config, id)?;
+    let mut client = relay::connect_agent(
+        config,
+        endpoint,
+        id,
+        &materials.ca.certificate_pem,
+        &materials.client,
+    )
+    .await
+    .context("connect to pbox-agent")?;
+    client.info().await.context("agent info probe failed")?;
     Ok(())
 }
 fn run_info(store: &ConfigStore, requested_id: &str, json: bool, color: ColorChoice) -> Result<()> {
@@ -4757,6 +5018,7 @@ fn discover_boxes(client: &impl PveApi) -> Result<Vec<BoxRecord>> {
             name,
             recipes: metadata.recipes,
             capabilities: metadata.capabilities,
+            ping: None,
         });
     }
     records.sort_by(|left, right| left.id.cmp(&right.id));
@@ -5306,6 +5568,7 @@ mod tests {
             name: Some("test-box".to_owned()),
             recipes: Vec::new(),
             capabilities: Vec::new(),
+            ping: None,
         }
     }
 
