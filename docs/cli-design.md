@@ -54,6 +54,11 @@ before human display. Calculate table padding before applying colour.
   says `Deletion queued`, never `Deleted`, and identifies where to check its result.
   The confirmation explains the immediate stop; `--wait` uses graceful shutdown.
 - Clap owns help layout and usage errors, with palette tokens supplied by `ui.rs`.
+- `completions SHELL` emits an unchanged shell script on stdout, even with
+  `--json` or forced colour. It needs no PVE configuration or connection.
+- Image compatibility failures name the failed requirement before PVE creation.
+  Agent startup timeouts keep the box and show a shared diagnostic section on
+  stderr with PVE console checks and the repair command.
 
 ## Command coverage
 
@@ -66,6 +71,7 @@ before human display. Calculate table padding before applying colour.
 | `list`, `info`, `id` | Tables, metadata, resource titles |
 | `recipe` | Tables, metadata, success, warnings |
 | `snapshot`, `checkpoint` | Tables, success, errors |
+| `completions` | Unchanged generated script |
 | `ssh`, `exec`, `scp`, `forward` | Connection/transfer status and errors; unchanged guest data |
 | All help | Shared Clap palette |
 

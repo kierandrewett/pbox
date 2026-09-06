@@ -97,6 +97,11 @@ enum ColorChoice {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Generate a shell completion script (no PVE connection required).
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     /// Generate a public pbox identifier.
     Id,
     /// Configure pbox for first use.
@@ -493,6 +498,9 @@ fn main() {
         Err(error) => {
             let message = safe_terminal_text(&format!("{error:#}"));
             ui::stderr().error(&message);
+            if let Some(failure) = error.downcast_ref::<relay::AgentStartupFailure>() {
+                ui::agent_startup_help(&failure.box_id);
+            }
             std::process::exit(1);
         }
     }
@@ -507,6 +515,7 @@ fn run() -> Result<RunOutcome> {
             .unwrap_or_else(pbox_core::config::default_config_path),
     );
     match cli.command {
+        Command::Completions { shell } => ui::completions(shell).map(|_| RunOutcome::Success),
         Command::Id => print_value(
             &IdOutput {
                 id: PboxId::generate(),

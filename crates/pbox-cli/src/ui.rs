@@ -10,6 +10,32 @@ use serde::Serialize;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::atomic::{AtomicU8, Ordering};
 static MODE: AtomicU8 = AtomicU8::new(0);
+/// Completion scripts are machine output, independent of colour and JSON mode.
+pub(crate) fn completions(shell: clap_complete::Shell) -> Result<()> {
+    use clap::CommandFactory;
+    let mut script = Vec::new();
+    clap_complete::generate(shell, &mut Cli::command(), "pbox", &mut script);
+    io::stdout()
+        .lock()
+        .write_all(&script)
+        .context("write shell completion script")
+}
+
+pub(crate) fn agent_startup_help(box_id: &str) {
+    let style = stderr();
+    style.section("Check guest startup");
+    style.hint("Image checks cannot verify guest networking before boot.");
+    style.hint(&format!(
+        "Run pbox info {box_id} to find its PVE node and VMID."
+    ));
+    style.hint("In a root shell inside the container, run:");
+    style.hint("systemctl status pbox-agent.service");
+    style.hint("journalctl -u pbox-agent.service -b --no-pager");
+    style.hint("If disabled: systemctl enable --now pbox-agent.service");
+    style.hint("For connection errors: check ip route, /etc/resolv.conf and outbound access to your relay.");
+    style.hint("If container login is unavailable, a PVE administrator can use pct enter VMID from the node's Shell.");
+    style.hint(&format!("After fixing the cause: pbox repair {box_id}"));
+}
 pub(crate) fn configure(color: ColorChoice, json: bool) {
     MODE.store(
         if json {

@@ -16,6 +16,7 @@ fn pbox(args: &[&str], no_color: bool) -> Output {
 fn help_for_every_command_uses_the_shared_palette() {
     for command in [
         "id",
+        "completions",
         "config",
         "image",
         "setup",
@@ -67,6 +68,32 @@ fn help_for_every_command_uses_the_shared_palette() {
             "{command}: {text:?}"
         );
         assert!(text.contains("Usage:"));
+    }
+}
+
+#[test]
+fn completions_are_offline_unstyled_scripts_for_each_shell() {
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+        let output = pbox(
+            &[
+                "--config",
+                "/nonexistent/pbox-test.toml",
+                "completions",
+                shell,
+            ],
+            false,
+        );
+        assert!(output.status.success(), "{shell}: {:?}", output.stderr);
+        assert!(output.stderr.is_empty());
+        let script = String::from_utf8(output.stdout.clone()).unwrap();
+        for command in ["snapshot", "checkpoint", "completions"] {
+            assert!(script.contains(command), "{shell} missing {command}");
+        }
+        assert!(!output.stdout.contains(&27));
+        let forced = pbox(&["--json", "--color=always", "completions", shell], false);
+        assert!(forced.status.success());
+        assert_eq!(output.stdout, forced.stdout);
+        assert!(forced.stderr.is_empty());
     }
 }
 

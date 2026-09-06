@@ -11,12 +11,39 @@ pbox new --image debian:13
 pbox ssh BOX_ID
 ```
 
+Enable shell completion for commands, flags and known option values:
+
+```sh
+# Zsh: add after compinit in ~/.zshrc
+source <(pbox completions zsh)
+
+# Bash: add to ~/.bashrc
+source <(pbox completions bash)
+
+# Fish: install once, regenerate after updating pbox
+mkdir -p ~/.config/fish/completions
+pbox completions fish > ~/.config/fish/completions/pbox.fish
+```
+
+Zsh must initialise completion with `autoload -Uz compinit; compinit` before
+sourcing the script. `pbox completions` also supports `powershell` and `elvish`.
+Generation is offline and always writes a plain shell script, including with
+`--json`. Completion does not query live box IDs or snapshot names.
+
 With a relay configured, creation keeps completed steps above the active spinner
 and names the resolved image. The result shows that image, available IPv4/IPv6
 addresses, and the exact command to connect. Use
 `pbox new --verbose` to retain full logs. While a phase runs, recent substeps and
 live image/PVE logs expand beneath it; they collapse into its completed row. Preparing an OCI image still
 installs the prerequisites needed to boot it as an LXC guest.
+
+Before uploading a prepared relay image, pbox checks systemd, required tools,
+the agent's executable compatibility and its service preset. Failed checks stop
+creation with the image name and instructions for fixing the Dockerfile.
+These checks do not prove that guest networking or container permissions will
+work after boot. If the agent cannot connect, pbox keeps the box and shows how
+to inspect its service logs and networking in the PVE console, then retry with
+`pbox repair BOX_ID`. Existing image-user restrictions are reported after connection.
 
 Find images with `pbox image search debian` (Docker Hub by default), or use
 `--registry REGISTRY` / a qualified query to search another registry. Bare

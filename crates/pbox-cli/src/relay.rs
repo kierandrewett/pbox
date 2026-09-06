@@ -189,6 +189,7 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
     operation.relay = true;
     operation.relay_template = Some(volume);
     key.save_operation(&operation)?;
+    let mut upload_attempted = false;
     let result: Result<()> = (|| {
         let payload = key.operation_directory().join("payload");
         write_payload(&payload, config, &box_id)?;
@@ -200,6 +201,7 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
         let archive = super::images::build_local_oci_archive(&image, &filename, Some(&payload))?;
         creation.phase("Creating your box");
         super::progress::substep(&format!("Uploading image to {node}/{storage}"));
+        upload_attempted = true;
         let upload = client.upload_storage_template(
             &node,
             storage,
@@ -288,6 +290,11 @@ pub fn run_new(config: &Config, command: NewCommand, json: bool, color: ColorCho
         }
         Ok(())
     })();
+    if result.is_err() && !upload_attempted {
+        key.cleanup()
+            .context("remove unused image preparation credentials")?;
+        return result;
+    }
     result.with_context(|| format!("relay bootstrap for {box_id}; use `pbox repair {box_id}` or `pbox delete {box_id} --yes` to recover; operation {}", key.operation_directory().display()))
 }
 
@@ -298,6 +305,7 @@ pub fn wait_ready(config: &Config, box_id: &str) -> Result<()> {
         .build()?;
     runtime.block_on(async {
         let started = Instant::now();
+        let mut explained_wait = false;
         loop {
             let result = tokio::time::timeout(Duration::from_secs(5), async {
                 let mut client = connect_agent(
@@ -315,17 +323,37 @@ pub fn wait_ready(config: &Config, box_id: &str) -> Result<()> {
             if matches!(result, Ok(Ok(()))) {
                 return Ok(());
             }
+            if !explained_wait && started.elapsed() >= Duration::from_secs(30) {
+                super::progress::substep(&format!("Still waiting for {box_id}; the guest service or outbound connection may need attention"));
+                explained_wait = true;
+            }
             if started.elapsed() > Duration::from_secs(120) {
-                return match result {
+                let failure = match result {
                     Ok(Err(error)) => {
                         Err(error).context("agent did not become ready through relay")
                     }
-                    _ => anyhow::bail!("agent relay connection timed out"),
+                    _ => Err(anyhow::anyhow!("agent relay connection timed out")),
                 };
+                return failure.context(AgentStartupFailure { box_id: box_id.to_owned() });
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     })
+}
+
+#[derive(Debug)]
+pub(crate) struct AgentStartupFailure {
+    pub box_id: String,
+}
+
+impl std::fmt::Display for AgentStartupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "No agent connection for {} after 120 seconds; the box has been kept",
+            self.box_id
+        )
+    }
 }
 
 pub fn repair(

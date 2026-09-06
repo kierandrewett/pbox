@@ -364,7 +364,7 @@ run_timed() {
         "$@"
     fi
 }
-if [ -x /sbin/init ] && command -v sshd >/dev/null 2>&1 && command -v ip >/dev/null 2>&1 && command -v dhclient >/dev/null 2>&1; then
+if [ -x /sbin/init ] && command -v sshd >/dev/null 2>&1 && command -v ip >/dev/null 2>&1 && command -v dhclient >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
     exit 0
 fi
 if command -v apt-get >/dev/null 2>&1; then
@@ -383,7 +383,7 @@ elif command -v dnf >/dev/null 2>&1; then
     printf '%s\n' '[pbox-image] Cleaning package metadata'
     dnf clean all
 else
-    echo 'pbox needs a systemd init and OpenSSH server in the OCI image' >&2
+    echo 'Image compatibility check failed: pbox needs systemd, OpenSSH, sudo, Python and guest networking tools. Automatic preparation supports apt-get or dnf. Install these prerequisites in your Dockerfile, rebuild and publish the image, then retry pbox new --image IMAGE. No PVE box has been created.' >&2
     exit 1
 fi
 printf '%s\n' '[pbox-image] Guest preparation complete'
@@ -406,7 +406,7 @@ pub fn build_local_oci_archive(
             .to_owned();
         let preparation = if payload.is_some() {
             format!(
-                "set -eu\n(\n{OCI_GUEST_PREPARATION}\n)\n{}\n{RELAY_GUEST_PREPARATION}",
+                "set -eu\n(\n{OCI_GUEST_PREPARATION}\n)\n{}\n{RELAY_GUEST_PREPARATION}\n{IMAGE_PREFLIGHT}",
                 super::guest::USER_SETUP
             )
         } else {
@@ -453,7 +453,7 @@ pub fn build_local_oci_archive(
                 "podman",
                 &["start", "--attach", container.as_str()],
                 "Installing guest prerequisites (systemd, OpenSSH, sudo, Python)",
-            )?;
+            ).with_context(|| format!("image {image} could not be prepared; no PVE box has been created. Fix the reported prerequisite in your Dockerfile and rebuild the image. Use --verbose to retain preparation logs"))?;
             run_local_command(
                 "podman",
                 &["export", "--output", tar_text.as_str(), container.as_str()],
@@ -541,6 +541,9 @@ fn ensure_local_command_success(output: &Output, action: &str) -> Result<()> {
         return Ok(());
     }
     let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if let Some((_, reason)) = detail.split_once("Image compatibility check failed:") {
+        bail!("Image compatibility check failed: {}", reason.trim());
+    }
     if detail.is_empty() {
         bail!("{action} failed: {}", output.status);
     }
@@ -852,9 +855,45 @@ mkdir -p /etc/systemd/system/multi-user.target.wants
 ln -sf /etc/systemd/system/pbox-agent.service /etc/systemd/system/multi-user.target.wants/pbox-agent.service
 "#;
 
+/// Runs inside the prepared OCI filesystem before it is uploaded to PVE.
+const IMAGE_PREFLIGHT: &str = r#"
+printf '%s\n' '[pbox-image] Checking image compatibility (init, agent runtime and service startup)'
+fail_image() {
+    printf 'Image compatibility check failed: %s\n' "$1" >&2
+    exit 1
+}
+for tool in systemctl sshd sudo python3 ip; do
+    command -v "$tool" >/dev/null 2>&1 || fail_image "Missing $tool; install it in your Dockerfile."
+done
+[ -x /bin/bash ] || fail_image 'Missing /bin/bash; install Bash for the pbox login shell.'
+init_binary="$(readlink -f /sbin/init)"
+"$init_binary" --version 2>/dev/null | head -n 1 | grep -q '^systemd ' || fail_image '/sbin/init must run systemd; choose a systemd-compatible base image.'
+agent_error=$(/usr/local/bin/pbox-agent --help 2>&1 >/dev/null) || fail_image "pbox-agent cannot run in this image: ${agent_error:-the executable returned an error}. Check its CPU architecture, libc and shared libraries. Use a compatible image or configure agent.binary with a build for this image."
+systemctl --root=/ preset pbox-agent.service >/dev/null || fail_image 'Cannot apply the pbox-agent service preset; check systemd masks and presets in your image.'
+systemctl --root=/ is-enabled --quiet pbox-agent.service || fail_image 'Image policy disables pbox-agent.service. Remove its mask or add an earlier systemd preset that enables pbox-agent.service.'
+printf '%s\n' '[pbox-image] Image checks passed; guest boot and relay connectivity will be checked after creation'
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_preflight_error_keeps_the_actionable_reason_without_package_logs() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = Output {
+            status: ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: b"Downloading package 1\nInstalling package 2\nImage compatibility check failed: pbox-agent cannot run: missing libc. Rebuild the agent.\n".to_vec(),
+        };
+        let error = ensure_local_command_success(&output, "Prepare image")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Image compatibility check failed: pbox-agent cannot run: missing libc. Rebuild the agent."
+        );
+    }
 
     #[test]
     fn image_search_preserves_namespaces_and_selects_registries() {
