@@ -11,6 +11,138 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::atomic::{AtomicU8, Ordering};
 static MODE: AtomicU8 = AtomicU8::new(0);
 
+pub(crate) fn recipe_heading(recipe: &str, box_id: &str) {
+    stderr().heading(&format!("{recipe} → {box_id}"));
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum RecipeEvent {
+    Task(String),
+    Result { success: bool, skipped: bool },
+    Log(String),
+    Finish,
+}
+
+pub(crate) struct RecipeStage {
+    sender: Option<std::sync::mpsc::Sender<RecipeEvent>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl RecipeStage {
+    pub(crate) fn events(&self) -> Option<std::sync::mpsc::Sender<RecipeEvent>> {
+        self.sender.clone()
+    }
+    pub(crate) fn start(label: &str, visible: bool) -> Self {
+        let mut stage = Self {
+            sender: None,
+            worker: None,
+        };
+        if visible {
+            let label = label.to_owned();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            stage.sender = Some(sender);
+            stage.worker = Some(std::thread::spawn(move || {
+                let style = stderr();
+                let animated = style.can_animate();
+                let mut display = CreationDisplay::new();
+                let start = std::time::Instant::now();
+                let mut active: Option<(String, std::time::Instant)> = None;
+                if animated {
+                    display.phase(label.clone());
+                } else {
+                    style.progress(&label);
+                }
+                loop {
+                    match receiver.recv_timeout(std::time::Duration::from_millis(120)) {
+                        Ok(RecipeEvent::Task(task)) => {
+                            active = Some((task.clone(), std::time::Instant::now()));
+                            if animated {
+                                display.substep(task);
+                            } else {
+                                style.progress(&task);
+                            }
+                        }
+                        Ok(RecipeEvent::Result { success, skipped }) => {
+                            if let Some((task, started)) = active.take() {
+                                let task = if skipped {
+                                    format!("{task} (skipped)")
+                                } else {
+                                    task
+                                };
+                                if animated {
+                                    display.substep_done(
+                                        task,
+                                        started.elapsed().as_secs(),
+                                        success,
+                                    );
+                                } else if skipped {
+                                    style.hint(&task);
+                                } else if success {
+                                    style.completed_step(&task, started.elapsed().as_secs());
+                                } else {
+                                    style.error(&task);
+                                }
+                            }
+                        }
+                        Ok(RecipeEvent::Log(line)) => {
+                            if animated {
+                                display.log(line);
+                            } else {
+                                style.hint(&line);
+                            }
+                        }
+                        Ok(RecipeEvent::Finish) => {
+                            if animated {
+                                display.finish(true);
+                            } else {
+                                style.completed_step(&label, start.elapsed().as_secs());
+                            }
+                            break;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            if animated {
+                                display.finish(false);
+                            }
+                            break;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    if animated {
+                        display.tick();
+                    }
+                }
+            }));
+        }
+        stage
+    }
+    pub(crate) fn finish(mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(RecipeEvent::Finish);
+        }
+    }
+}
+impl Drop for RecipeStage {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+pub(crate) fn recipe_raw_output(bytes: &[u8]) -> io::Result<()> {
+    io::stderr().lock().write_all(bytes)
+}
+
+pub(crate) fn recipe_failure(reason: &str, log: &std::path::Path) {
+    let style = stderr();
+    style.error("Recipe failed");
+    for line in wrap_diagnostic(reason, 84) {
+        style.hint(&line);
+    }
+    style.metadata("full log", &log.display().to_string());
+    style.hint("Use --verbose to stream Ansible output.");
+}
+
 pub(crate) fn image_preparation_error(image: &str, reason: &str) {
     let style = stderr();
     style.error("Image preparation failed");
@@ -89,7 +221,10 @@ pub(crate) fn agent_startup_help(box_id: &str) {
     style.hint("Image checks cannot verify guest networking before boot.");
     style.hint("Find the guest location:");
     style.command_stderr(&format!("pbox info {box_id}"));
-    style.hint("In a root shell inside the container, inspect the service:");
+    style.hint("In a root shell inside a workspace container, inspect its logs:");
+    style.command_stderr("cat /var/log/pbox-agent.log");
+    style.command_stderr("cat /var/log/pbox-network.log");
+    style.hint("For an older box using systemd, inspect the service:");
     style.command_stderr("systemctl status pbox-agent.service");
     style.command_stderr("journalctl -u pbox-agent.service -b --no-pager");
     style.hint("If it is disabled, enable it:");
@@ -405,6 +540,22 @@ pub(crate) fn print_recipe_catalog(
     Ok(())
 }
 
+pub(crate) fn desktop_ready(session: &str, local: &str) {
+    let style = stdout();
+    style.stdout_heading("Desktop");
+    style.stdout_metadata("session", &safe_terminal_text(session));
+    style.stdout_metadata("VNC", local);
+    style.stdout_hint("Press Ctrl-C to close the tunnel. Your desktop stays running.");
+}
+
+pub(crate) fn desktop_install_help(box_id: &str) {
+    let style = stderr();
+    let box_id = safe_terminal_text(box_id);
+    style.error(&format!("No desktop installed on {box_id}"));
+    style.command_stderr(&format!("pbox recipe apply desktop/xfce --box-id {box_id}"));
+    style.command_stderr(&format!("pbox desktop {box_id}"));
+}
+
 pub(crate) fn print_recipe_info(recipe: &recipes::Recipe, colour: bool) {
     let style = CliStyle::from_enabled(colour);
     style.stdout_heading(&recipe.id);
@@ -524,37 +675,30 @@ pub(crate) fn format_box_cell(style: CliStyle, value: &str, width: usize, code: 
 pub(crate) fn print_box_records(records: &[BoxRecord], colour: bool) {
     let style = CliStyle::from_enabled(colour);
     let has_ipv6 = records.iter().any(|record| record.ipv6.is_some());
-    let width = |header: &str, values: Vec<String>, minimum: usize| {
+    let width = |header: &str, values: Vec<String>| {
         values
             .into_iter()
             .map(|value| value.chars().count())
             .chain(std::iter::once(header.chars().count()))
             .max()
-            .unwrap_or(minimum)
-            .max(minimum)
+            .unwrap_or(header.len())
     };
-    let id_width = width("ID", records.iter().map(|r| r.id.to_string()).collect(), 16);
-    let state_width = width(
-        "STATE",
-        records.iter().map(|r| r.state.clone()).collect(),
-        10,
-    );
+    let id_width = width("ID", records.iter().map(|r| r.id.to_string()).collect());
+    let state_width = width("STATE", records.iter().map(|r| r.state.clone()).collect());
     let ping_width = width(
         "PING",
         records
             .iter()
             .map(|r| r.ping.as_deref().unwrap_or("-").to_owned())
             .collect(),
-        8,
     );
-    let node_width = width("NODE", records.iter().map(|r| r.node.clone()).collect(), 16);
+    let node_width = width("NODE", records.iter().map(|r| r.node.clone()).collect());
     let ipv4_width = width(
         "IPV4",
         records
             .iter()
             .map(|r| r.ip.as_deref().unwrap_or("-").to_owned())
             .collect(),
-        16,
     );
     let ipv6_width = width(
         "IPV6",
@@ -562,18 +706,25 @@ pub(crate) fn print_box_records(records: &[BoxRecord], colour: bool) {
             .iter()
             .map(|r| r.ipv6.as_deref().unwrap_or("-").to_owned())
             .collect(),
-        39,
+    );
+    let name_width = width(
+        "NAME",
+        records
+            .iter()
+            .map(|r| r.name.as_deref().unwrap_or("-").to_owned())
+            .collect(),
     );
     let gap = "  ";
     let header = format!(
-        "{id:<id_width$}{gap}{state:<state_width$}{gap}{ping:<ping_width$}{gap}{node:<node_width$}{gap}{ipv4:<ipv4_width$}{gap}{ipv6}NAME",
+        "{id:<id_width$}{gap}{state:<state_width$}{gap}{ping:<ping_width$}{gap}{node:<node_width$}{gap}{ipv4:<ipv4_width$}{gap}{ipv6}{name:<name_width$}{gap}IMAGE",
+        name = "NAME",
         id = "ID",
         state = "STATE",
         ping = "PING",
         node = "NODE",
         ipv4 = "IPV4",
         ipv6 = if has_ipv6 {
-            format!("{:<width$}", "IPV6", width = ipv6_width)
+            format!("{:<width$}{gap}", "IPV6", width = ipv6_width)
         } else {
             String::new()
         },
@@ -591,13 +742,17 @@ pub(crate) fn print_box_records(records: &[BoxRecord], colour: bool) {
         let ping = format_box_cell(style, record.ping.as_deref().unwrap_or("-"), ping_width, "");
         let node = format_box_cell(style, &record.node, node_width, ANSI_CYAN);
         let ip = format_box_cell(style, record.ip.as_deref().unwrap_or("-"), ipv4_width, "");
-        let name = style.text(record.name.as_deref().unwrap_or("-"));
+        let name = format_box_cell(style, record.name.as_deref().unwrap_or("-"), name_width, "");
+        let image = style.text(record.image.as_deref().unwrap_or("-"));
         let ipv6 = if has_ipv6 {
-            format_box_cell(style, record.ipv6.as_deref().unwrap_or("-"), ipv6_width, "")
+            format!(
+                "{}{gap}",
+                format_box_cell(style, record.ipv6.as_deref().unwrap_or("-"), ipv6_width, "")
+            )
         } else {
             String::new()
         };
-        println!("{id}{gap}{state}{gap}{ping}{gap}{node}{gap}{ip}{gap}{ipv6}{name}");
+        println!("{id}{gap}{state}{gap}{ping}{gap}{node}{gap}{ip}{gap}{ipv6}{name}{gap}{image}");
     }
     if records.is_empty() {
         println!(
@@ -718,7 +873,7 @@ pub(crate) fn user_access(box_id: &str, user: &str, access: super::guest::UserAc
     use super::guest::UserAccess;
     let style = stderr();
     match access {
-        UserAccess::Passwordless => return,
+        UserAccess::Passwordless | UserAccess::ImageDefined => return,
         UserAccess::Restricted => {
             style.warning(&format!("User {user} cannot use passwordless sudo."))
         }
@@ -1167,6 +1322,7 @@ mod image_feedback_preview {
             "Image compatibility check failed: Alpine uses musl and OpenRC; this agent requires glibc and systemd. Choose a supported systemd image.",
         );
         let record = BoxRecord {
+            image: None,
             id: pbox_core::PboxId::parse("pbx_test1234").unwrap(),
             vmid: 9000,
             state: "running".to_owned(),

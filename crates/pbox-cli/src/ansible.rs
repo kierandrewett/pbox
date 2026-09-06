@@ -7,7 +7,7 @@ use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::sync::{
     Arc,
@@ -54,6 +54,9 @@ pub fn apply_recipe(
     json: bool,
 ) -> Result<RecipeApplyResult> {
     validate_box_id(box_id)?;
+    if !json {
+        crate::ui::recipe_heading(&recipe.id, box_id);
+    }
     if !repository_root.is_dir() {
         bail!(
             "recipe repository directory does not exist: {}",
@@ -521,38 +524,73 @@ fn run_ansible_unix(invocation: &AnsibleInvocation<'_>, playbook: &Path, json: b
         .env("PBOX_BOX_ID", invocation.box_id)
         .stdin(Stdio::inherit());
 
-    let result = if json {
+    let result = (|| -> Result<()> {
+        let verbose = crate::progress::verbose();
+        let stage = crate::ui::RecipeStage::start(
+            if playbook
+                .file_name()
+                .is_some_and(|name| name == "preflight.yml")
+            {
+                "Preparing guest"
+            } else {
+                "Applying recipe"
+            },
+            !json && !verbose,
+        );
+        let log_path = invocation.operation_directory.with_extension("log");
+        let log = fs::File::create(&log_path).context("create recipe log")?;
+        set_mode(&log_path, 0o600)?;
+        let error_log = log.try_clone().context("clone recipe log")?;
+        let callbacks = invocation.operation_directory.join("callback_plugins");
+        fs::create_dir_all(&callbacks)?;
+        write_file(
+            &callbacks.join("pbox_progress.py"),
+            include_str!("ansible-plugins/pbox_progress.py"),
+            0o600,
+        )?;
+        let events_path = invocation.operation_directory.join("events.jsonl");
+        write_file(&events_path, "", 0o600)?;
+        let events_file = fs::File::open(events_path.clone())?;
+        command
+            .env("ANSIBLE_CALLBACK_PLUGINS", callbacks)
+            .env("ANSIBLE_CALLBACKS_ENABLED", "pbox_progress")
+            .env("PBOX_EVENTS", events_path);
+        command.env("ANSIBLE_NOCOLOR", "1");
+        command.env("ANSIBLE_STDOUT_CALLBACK", "default");
         let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .context("run ansible-playbook; install Ansible on the control machine")?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("ansible-playbook stdout pipe was not created"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow!("ansible-playbook stderr pipe was not created"))?;
-        let stdout_thread = thread::spawn(|| stream_child_output(stdout));
-        let stderr_thread = thread::spawn(|| stream_child_output(stderr));
-        let status = child.wait().context("wait for ansible-playbook")?;
+        let stdout = child.stdout.take().context("missing Ansible stdout")?;
+        let stderr = child.stderr.take().context("missing Ansible stderr")?;
+        let events = stage.events();
+        let stop = Arc::new(AtomicBool::new(false));
+        let event_stop = Arc::clone(&stop);
+        let events_thread = thread::spawn(move || read_events(events_file, event_stop, events));
+        let stdout_thread = thread::spawn(move || capture_output(stdout, log, verbose));
+        let stderr_thread = thread::spawn(move || capture_output(stderr, error_log, verbose));
+        let status = child.wait().context("wait for ansible-playbook");
+        stop.store(true, Ordering::Release);
+        let reason = events_thread.join().ok().flatten();
         stdout_thread
             .join()
-            .map_err(|_| anyhow!("Ansible stdout stream thread panicked"))??;
+            .map_err(|_| anyhow!("Ansible stdout thread panicked"))??;
         stderr_thread
             .join()
-            .map_err(|_| anyhow!("Ansible stderr stream thread panicked"))??;
-        ensure_success(status, "ansible-playbook")
-    } else {
-        let status = command
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .context("run ansible-playbook; install Ansible on the control machine")?;
-        ensure_success(status, "ansible-playbook")
-    };
+            .map_err(|_| anyhow!("Ansible stderr thread panicked"))??;
+        let status = status?;
+        if !status.success() {
+            return Err(AnsibleFailure {
+                reason: reason.unwrap_or_else(|| format!("Ansible exited with {}", status)),
+                log_path,
+            }
+            .into());
+        }
+        fs::remove_file(log_path).context("remove successful recipe log")?;
+        stage.finish();
+        Ok(())
+    })();
     let bridge_result = bridge.stop();
     match (result, bridge_result) {
         (Err(error), Err(bridge_error)) => Err(error.context(bridge_error)),
@@ -561,10 +599,92 @@ fn run_ansible_unix(invocation: &AnsibleInvocation<'_>, playbook: &Path, json: b
         (Ok(()), Ok(())) => Ok(()),
     }
 }
-fn stream_child_output<R: Read>(mut reader: R) -> std::io::Result<()> {
-    let stderr = io::stderr();
-    let mut target = stderr.lock();
-    io::copy(&mut reader, &mut target).map(|_| ())
+#[derive(Debug)]
+pub(crate) struct AnsibleFailure {
+    pub(crate) reason: String,
+    pub(crate) log_path: PathBuf,
+}
+impl std::fmt::Display for AnsibleFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+impl std::error::Error for AnsibleFailure {}
+
+#[derive(Deserialize)]
+struct CallbackEvent {
+    version: u32,
+    kind: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    skipped: bool,
+}
+fn decode_event(line: &str) -> Option<CallbackEvent> {
+    serde_json::from_str::<CallbackEvent>(line)
+        .ok()
+        .filter(|event| event.version == 1)
+}
+
+#[cfg(unix)]
+fn read_events(
+    mut file: fs::File,
+    stop: Arc<AtomicBool>,
+    sender: Option<std::sync::mpsc::Sender<crate::ui::RecipeEvent>>,
+) -> Option<String> {
+    use crate::ui::RecipeEvent;
+    let mut pending = String::new();
+    let mut reason = None;
+    loop {
+        let finished = stop.load(Ordering::Acquire);
+        // Display telemetry is best effort. Unknown or malformed events cannot fail a recipe.
+        if file.read_to_string(&mut pending).is_err() {
+            break;
+        }
+        while let Some(end) = pending.find('\n') {
+            let line: String = pending.drain(..=end).collect();
+            if let Some(event) = decode_event(&line) {
+                let rendered = match event.kind.as_str() {
+                    "task" => Some(RecipeEvent::Task(event.text)),
+                    "result" => Some(RecipeEvent::Result {
+                        success: event.success,
+                        skipped: event.skipped,
+                    }),
+                    "log" => Some(RecipeEvent::Log(event.text)),
+                    "error" => {
+                        reason = Some(event.text);
+                        None
+                    }
+                    _ => None,
+                };
+                if let (Some(sender), Some(event)) = (&sender, rendered) {
+                    let _ = sender.send(event);
+                }
+            }
+        }
+        if finished {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    reason
+}
+
+fn capture_output<R: Read>(mut reader: R, mut log: fs::File, verbose: bool) -> io::Result<()> {
+    let mut bytes = [0; 8192];
+    loop {
+        let count = reader.read(&mut bytes)?;
+        if count == 0 {
+            break;
+        }
+        log.write_all(&bytes[..count])?;
+        if verbose {
+            crate::ui::recipe_raw_output(&bytes[..count])?;
+        }
+    }
+    Ok(())
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf> {
@@ -725,19 +845,6 @@ fn validate_box_id(value: &str) -> Result<()> {
         .map_err(|error| anyhow!("invalid pbox identifier {value}: {error}"))
 }
 
-fn ensure_success(status: ExitStatus, command: &str) -> Result<()> {
-    if status.success() {
-        return Ok(());
-    }
-    bail!(
-        "{command} exited with {}",
-        status
-            .code()
-            .map(|code| code.to_string())
-            .unwrap_or_else(|| "a signal".to_owned())
-    );
-}
-
 fn write_file(path: &Path, contents: &str, mode: u32) -> Result<()> {
     fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
     set_mode(path, mode)
@@ -763,13 +870,22 @@ fn preflight_playbook() -> &'static str {
   hosts: all
   gather_facts: false
   tasks:
-    - name: Install Python on Debian guests when it is absent
+    - name: Ensure Python is available
       ansible.builtin.raw: >-
         if command -v python3 >/dev/null 2>&1; then exit 0; fi;
-        if ! command -v apt-get >/dev/null 2>&1; then
-        echo 'python3 is missing and apt-get is unavailable' >&2; exit 1; fi;
+        if command -v apt-get >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive;
-        apt-get update && apt-get install -y --no-install-recommends python3
+        apt-get update && apt-get install -y --no-install-recommends python3 || exit $?;
+        elif command -v pacman >/dev/null 2>&1; then
+        pacman -Syu --needed --noconfirm python || exit $?;
+        elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y python3 || exit $?;
+        elif command -v zypper >/dev/null 2>&1; then
+        zypper --non-interactive install python3 || exit $?;
+        else echo 'Install python3 in this guest before applying recipes' >&2; exit 1; fi;
+        echo PBOX_PYTHON_INSTALLED
+      register: pbox_python
+      changed_when: "'PBOX_PYTHON_INSTALLED' in pbox_python.stdout"
 "#
 }
 
@@ -843,7 +959,7 @@ class Connection(ConnectionBase):
         payload.update(values)
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
-                channel.settimeout(30)
+                channel.settimeout(3600)
                 channel.connect(socket_path)
                 channel.sendall(
                     (
@@ -914,6 +1030,26 @@ class Connection(ConnectionBase):
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn callback_events_ignore_console_text_and_unknown_versions() {
+        assert!(decode_event("TASK [whatever] ***").is_none());
+        assert!(decode_event(r#"{"version":2,"kind":"task","text":"new"}"#).is_none());
+        assert!(decode_event("broken JSON").is_none());
+        let event =
+            decode_event(r#"{"version":1,"kind":"task","text":"Install","future":true}"#).unwrap();
+        assert_eq!(event.text, "Install");
+    }
+
+    #[test]
+    fn recipe_capture_preserves_arbitrary_console_bytes() {
+        let directory = operation_directory("output-test", "pbx_abcd1234").unwrap();
+        let path = directory.join("output.log");
+        let bytes = b"new format\xff\nTASK changed entirely\n";
+        capture_output(&bytes[..], fs::File::create(&path).unwrap(), false).unwrap();
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn plugin_source_contains_required_connection_methods() {

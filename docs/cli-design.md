@@ -36,8 +36,7 @@ before human display. Calculate table padding before applying colour.
 - Interactive SSH saves the host terminal title, sets the box name, and
   restores the title on disconnect using the terminal title stack. Guest OSC 0/1/2 title
   changes receive a `box-name · ` prefix, including across transport chunks. Terminals without title-stack support may not restore it.
-- Guest output from `exec` and `ssh`, transferred files, and Ansible process output
-  are data streams. Preserve their bytes; do not style or sanitise them, except
+- Guest output from `exec` and `ssh`, and transferred files, are data streams. Preserve their bytes; do not style or sanitise them, except
   for the interactive SSH title prefix described above.
 - Creation keeps each completed step with a green `ok` and its elapsed time, then
   shows a new spinner for the active step on a capable terminal. Failed steps are
@@ -65,6 +64,11 @@ before human display. Calculate table padding before applying colour.
 
 ## Command coverage
 
+When a desktop launcher is absent, `desktop` reports `No desktop installed on BOX`
+and shows the Ansible install command followed by the retry command on stderr.
+Transport failures and broken installed launchers retain their own errors.
+JSON mode leaves stdout empty on failure and emits unstyled guidance on stderr.
+
 | Commands | Shared presentation |
 | --- | --- |
 | `setup`, `config` | Headings, metadata, prompts, hints, success, errors |
@@ -73,6 +77,7 @@ before human display. Calculate table padding before applying colour.
 | `rm` / `delete` | Section, metadata, warning, prompt, progress, success |
 | `list`, `info`, `id` | Tables, metadata, resource titles |
 | `recipe` | Tables, metadata, success, warnings |
+| `desktop` | Session and VNC endpoint metadata; JSON receipt, then tunnel until disconnect |
 | `snapshot`, `checkpoint` | Tables, success, errors |
 | `completions` | Unchanged generated script |
 | `ssh`, `exec`, `scp`, `forward` | Connection/transfer status and errors; unchanged guest data |
@@ -107,3 +112,35 @@ available); older boxes without recorded provenance show `Not recorded`.
 `list` probes the guest agent and shows `PING`; a PVE-running container with no
 agent response is shown as `disconnected`. A small per-user `pboxd` process owns
 that probe cache and is restarted automatically by the next CLI invocation.
+
+`list` shows `deleting` when PVE reports an active destroy task or the
+`destroyed` configuration lock. Agent pings are skipped for that state. Cached
+agent status must not replace a fresh PVE lifecycle state such as stopped or deleting.
+
+The box list includes IMAGE from recorded OCI provenance, with `-` for older
+boxes lacking it. Columns fit their content and use two spaces between columns,
+including optional IPv6. JSON includes the optional `image` field when known.
+
+`list` reads pboxd's persistent inventory snapshot without PVE requests or pings.
+The daemon refreshes independently and restarts on demand after exiting. Caches
+are scoped to configuration. A missing initial cache reports background loading;
+an old cache is displayed immediately with its age on human stderr. Queued local
+deletions overlay the cached row immediately, before the next PVE refresh.
+
+Recipe application shows the recipe and target, then timed preparation and apply
+stages on stderr. Recipe stages reuse the box-creation display: terminals expand
+to show the active Ansible task, six recent completed tasks, and a three-line
+Ansible log tail, then collapse when the stage succeeds. Task completion follows
+Ansible results; skipped tasks are explicitly labelled. Plain output retains
+task progress, outcomes, and logs as separate lines. Only successful stages receive a completion marker. Failures show a concise reason with
+a private saved log path. Successful runs remove their temporary logs. `--verbose`
+streams raw Ansible output to stderr; JSON stdout retains only the result schema.
+Ansible task banners, result dictionaries, source excerpts, and recaps are hidden
+in the default view. Failed tasks are never marked successful.
+
+Recipe task progress and log messages come from a versioned aggregate Ansible
+callback, independently of console formatting. Raw stdout/stderr are preserved
+in logs and verbose output. Unknown or malformed events are ignored; process exit
+status determines success. Callback logs respect `no_log`. Modules may buffer
+their output until task completion. `python3 scripts/test-ansible-progress.py`
+checks identical events with different stdout callbacks, failures, skips and redaction.
