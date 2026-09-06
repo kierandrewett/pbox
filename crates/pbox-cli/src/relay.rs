@@ -105,7 +105,7 @@ pub(crate) fn write_payload(directory: &Path, config: &Config, box_id: &str) -> 
     fs::write(
         unit,
         format!(
-            "[Unit]\nDescription=pbox guest agent\nWants=network-online.target\nAfter=network-online.target\n\n[Service]\nExecStart=/usr/local/bin/pbox-agent --listen {listen}:{} --box-id {} --certificate /etc/pbox/server.pem --private-key /etc/pbox/server-key.pem --client-ca /etc/pbox/client-ca.pem {relay_arg}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
+            "[Unit]\nDescription=pbox guest agent\nWants=network.target\nAfter=network.target\n\n[Service]\nExecStart=/usr/local/bin/pbox-agent --listen {listen}:{} --box-id {} --certificate /etc/pbox/server.pem --private-key /etc/pbox/server-key.pem --client-ca /etc/pbox/client-ca.pem {relay_arg}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n",
             config.agent.port, box_id
         ),
     )?;
@@ -447,6 +447,8 @@ mod tests {
             fs::read_to_string(directory.join("etc/systemd/system/pbox-agent.service")).unwrap();
         assert!(unit.contains("--relay-config /etc/pbox/relay.json"));
         assert!(unit.contains("--listen 127.0.0.1:7443"));
+        assert!(unit.contains("After=network.target"));
+        assert!(!unit.contains("After=network-online.target"));
         let relay_script = include_str!("guest-scripts/relay.sh");
         assert!(relay_script.contains("systemd-networkd.service"));
         // Fedora applies a disable-all preset on first boot. Exercise systemd's
