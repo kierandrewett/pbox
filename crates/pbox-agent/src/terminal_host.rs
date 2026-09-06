@@ -32,6 +32,8 @@ pub async fn connect(path: &Path) -> Result<Client> {
 /// it as a sibling and passes the socket explicitly. Other init systems retain
 /// the safe legacy update deferral until they provide an independent owner.
 pub async fn managed(max_exec: usize) -> Result<Option<Client>> {
+    let systemd = Path::new("/run/systemd/system").is_dir()
+        && std::env::var_os("PBOX_TERMINAL_SOCKET").is_none();
     let path = if let Some(path) = std::env::var_os("PBOX_TERMINAL_SOCKET") {
         PathBuf::from(path)
     } else if Path::new("/run/systemd/system").is_dir() && nix::unistd::Uid::effective().is_root() {
@@ -52,9 +54,28 @@ pub async fn managed(max_exec: usize) -> Result<Option<Client>> {
     } else {
         return Ok(None);
     };
+    let mut client = wait_ready(&path).await?;
+    if systemd
+        && client.info(InfoRequest {}).await?.into_inner().agent_digest != agent_digest()
+        && client
+            .list_sessions(pbox_proto::agent::ListSessionsRequest {
+                protocol_version: PROTOCOL,
+            })
+            .await?
+            .into_inner()
+            .sessions
+            .is_empty()
+    {
+        checked_systemctl(&["restart", "pbox-terminals.service"]).await?;
+        client = wait_ready(&path).await?;
+    }
+    Ok(Some(client))
+}
+
+async fn wait_ready(path: &Path) -> Result<Client> {
     let client = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            match connect(&path).await {
+            match connect(path).await {
                 Ok(client) => return client,
                 Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
             }
@@ -62,7 +83,7 @@ pub async fn managed(max_exec: usize) -> Result<Option<Client>> {
     })
     .await
     .context("terminal supervisor did not become ready")?;
-    Ok(Some(client))
+    Ok(client)
 }
 
 async fn checked_systemctl(args: &[&str]) -> Result<()> {

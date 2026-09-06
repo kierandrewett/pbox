@@ -37,7 +37,8 @@ before human display. Calculate table padding before applying colour.
   restores the title on disconnect using the terminal title stack. Guest OSC 0/1/2 title
   changes receive a `box-name · ` prefix, including across transport chunks. Terminals without title-stack support may not restore it.
 - Guest output from `exec` and `ssh`, and transferred files, are data streams. Preserve their bytes; do not style or sanitise them, except
-  for the interactive SSH title prefix described above.
+  for interactive SSH title prefixes, the reserved status row and initial
+  session replay described below. Non-terminal streams remain unchanged.
 - Creation keeps each completed step with a green `ok` and its elapsed time, then
   shows a new spinner for the active step on a capable terminal. Failed steps are
   never marked complete. Redirected output
@@ -226,10 +227,37 @@ JSON close receipts add `box_id` while retaining `name` and `closed`.
 
 Terminal cleanup resets input modes without erasing screen contents or the
 current line. It leaves the alternate screen only when guest output entered it
-and has not left it. Guest bytes are observed without rewriting them.
+and has not left it. Cleanup tracks these modes by observing guest output.
 
 A separate terminal supervisor owns persistent PTYs on systemd and pbox minimal
 init guests. The agent proxies session RPCs over a private local socket. Agent
 updates preserve those processes; an interrupted attachment can reconnect.
-Legacy agent-owned sessions still defer updates until closed. The supervisor is
-not restarted as part of an agent update. Box shutdown ends all sessions.
+Legacy agent-owned sessions still defer updates until closed. A running supervisor
+is updated only when it has no sessions. Box shutdown ends all sessions.
+
+## Guest updates and viewing
+
+`agent update BOX` works without a local TTY and returns an explicit `current`,
+`updated`, `blocked` or `unavailable` status. JSON includes box ID, version,
+blocking sessions and sessions ended by the operation. Blocked and unavailable
+results have exit status 1. SSH and session control share the same update path;
+listing, completion and read-only viewing never update a guest.
+
+Legacy sessions block updates by default. `--kill-sessions` permits ending them
+after showing their names, attachment state, users, directories and commands.
+The confirmation warns about stopped programs and unsaved work. `--yes` requires
+`--kill-sessions` and skips that prompt for automation. There is no implicit
+kill or SSH prerequisite, and user input is never retried after an update.
+
+Persistent interactive SSH reserves one bottom row for the box, session and
+`Ctrl+] detach`. The advertised guest PTY height excludes that row, including on
+resize. Scroll margins are constrained to the guest area. The status is drawn
+without overwriting the guest's saved cursor; local history is not cleared.
+Initial shell snapshots append at the local cursor, including snapshots from
+older agents. Full-screen applications retain their alternate-screen behavior.
+
+`ssh` and `attach` accept `--read-only`. It reads decoded snapshots without
+attachment, input or resize RPCs. Ctrl+C leaves the viewer. The status names the
+session, says read-only and shows its exit key. Only the viewer's own lines are
+updated; large screens remain complete in scrollback. No full-screen clear is
+used on entry or exit. Plain output emits changed snapshots without ANSI layout.

@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
-install -m 0755 /tmp/pbox-agent-update /usr/local/bin/pbox-agent
+staged=${1:?missing staged agent binary}
+install -m 0755 "$staged" /usr/local/bin/pbox-agent
+rm -f "$staged"
 if [ -d /run/systemd/system ]; then
     systemctl --no-block restart pbox-agent.service
 elif [ -n "${PBOX_TERMINAL_SOCKET:-}" ] && tr '\000' ' ' < /proc/1/cmdline | grep -q -- '--workspace-init'; then

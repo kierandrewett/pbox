@@ -1217,7 +1217,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "pbox"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "base64",
@@ -1238,12 +1238,14 @@ dependencies = [
  "sha2",
  "time",
  "tokio",
+ "unicode-width",
+ "vt100",
  "vte",
 ]
 
 [[package]]
 name = "pbox-agent"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "clap",
@@ -1269,7 +1271,7 @@ dependencies = [
 
 [[package]]
 name = "pbox-agent-client"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "hyper-util",
  "pbox-crypto",
@@ -1283,11 +1285,12 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tonic",
+ "vt100",
 ]
 
 [[package]]
 name = "pbox-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "base64",
  "dirs",
@@ -1301,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "pbox-crypto"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -1317,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "pbox-proto"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -1328,7 +1331,7 @@ dependencies = [
 
 [[package]]
 name = "pbox-relay"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "axum",

@@ -118,8 +118,15 @@ pub(super) fn validate_name(name: &str) -> Result<()> {
 pub(super) struct TerminalInput {
     pending: Vec<u8>,
     pasted: bool,
+    exit_on_ctrl_c: bool,
 }
 impl TerminalInput {
+    pub fn read_only() -> Self {
+        Self {
+            exit_on_ctrl_c: true,
+            ..Default::default()
+        }
+    }
     pub fn pending(&self) -> bool {
         !self.pending.is_empty()
     }
@@ -130,7 +137,7 @@ impl TerminalInput {
         let mut output = Vec::new();
         for &byte in bytes {
             if self.pending.is_empty() {
-                if byte == 0x1d && !self.pasted {
+                if (byte == 0x1d || self.exit_on_ctrl_c && byte == 3) && !self.pasted {
                     return (output, true);
                 }
                 if byte == 0x1b {
@@ -151,7 +158,10 @@ impl TerminalInput {
                 self.pasted = true;
             } else if self.pending == b"\x1b[201~" {
                 self.pasted = false;
-            } else if !self.pasted && detach_key(&self.pending) {
+            } else if !self.pasted
+                && (control_key(&self.pending, 93)
+                    || self.exit_on_ctrl_c && control_key(&self.pending, 99))
+            {
                 self.pending.clear();
                 return (output, true);
             }
@@ -160,7 +170,7 @@ impl TerminalInput {
         (output, false)
     }
 }
-fn detach_key(sequence: &[u8]) -> bool {
+fn control_key(sequence: &[u8], key_code: u32) -> bool {
     let Some(body) = sequence.strip_prefix(b"\x1b[") else {
         return false;
     };
@@ -188,7 +198,7 @@ fn detach_key(sequence: &[u8]) -> bool {
     } else {
         return false;
     };
-    key == Some(93)
+    key == Some(key_code)
         && matches!(event, Some(1 | 2))
         && modifiers.is_some_and(|value| value > 0 && (value - 1) & !(64 | 128) == 4)
 }
@@ -277,7 +287,7 @@ fn show_sessions(
     })
 }
 
-fn endpoint(config: &Config, id: &str) -> Result<(String, String)> {
+pub(super) fn endpoint(config: &Config, id: &str) -> Result<(String, String)> {
     // A known relay identity is enough to contact its agent. Reading or sending
     // to a running terminal must not depend on the Proxmox management API.
     if config.relay.url.is_some() && id.parse::<PboxId>().is_ok() {
@@ -291,22 +301,20 @@ async fn connect(
     box_id: &str,
     endpoint: &str,
     capability: &str,
+    json: bool,
 ) -> Result<AgentClient> {
-    let materials = agent_materials(config, box_id)?;
-    let mut client = relay::connect_agent(
+    let connection = agent_update::connect(
         config,
-        endpoint,
         box_id,
-        &materials.ca.certificate_pem,
-        &materials.client,
+        endpoint,
+        agent_update::Options {
+            json,
+            ..Default::default()
+        },
     )
     .await?;
-    let info = client.info().await?;
-    anyhow::ensure!(
-        info.capabilities.iter().any(|cap| cap == capability),
-        "the guest agent needs an update for this command; end its running sessions, then connect with `pbox ssh {box_id}` to update it"
-    );
-    Ok(client)
+    connection.require(capability, box_id)?;
+    Ok(connection.client)
 }
 
 pub fn run(store: &ConfigStore, command: SessionCommand, json: bool) -> Result<RunOutcome> {
@@ -364,8 +372,13 @@ pub fn run(store: &ConfigStore, command: SessionCommand, json: bool) -> Result<R
             };
             let (id, name) = target(id, name.as_deref())?;
             let (box_id, endpoint) = endpoint(&config, &id)?;
-            let mut client =
-                runtime.block_on(connect(&config, &box_id, &endpoint, "session-control"))?;
+            let mut client = runtime.block_on(connect(
+                &config,
+                &box_id,
+                &endpoint,
+                "session-control",
+                json,
+            ))?;
             match action {
                 Action::Start {
                     cwd,
@@ -442,8 +455,13 @@ pub fn run(store: &ConfigStore, command: SessionCommand, json: bool) -> Result<R
         Action::Close { id, name, yes } => {
             let (id, name) = target(&id, name.as_deref())?;
             let (box_id, endpoint) = endpoint(&config, &id)?;
-            let mut client =
-                runtime.block_on(connect(&config, &box_id, &endpoint, "terminal-sessions"))?;
+            let mut client = runtime.block_on(connect(
+                &config,
+                &box_id,
+                &endpoint,
+                "terminal-sessions",
+                json,
+            ))?;
             let session = runtime
                 .block_on(client.list_sessions())?
                 .into_iter()
@@ -485,6 +503,71 @@ pub fn run(store: &ConfigStore, command: SessionCommand, json: bool) -> Result<R
             }
         }
     }
+    Ok(RunOutcome::Success)
+}
+
+/// Observe decoded screen snapshots. No attachment, input, resize or update RPCs.
+pub(super) fn view(store: &ConfigStore, command: &SshCommand) -> Result<RunOutcome> {
+    let config = load_config(store)?;
+    let name = command.session.as_deref().unwrap_or("main");
+    validate_name(name)?;
+    let (box_id, endpoint) =
+        resolve_agent_endpoint(&config, &command.id, command.endpoint.as_deref())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let (mut client, info) =
+        runtime.block_on(agent_update::raw_connect(&config, &box_id, &endpoint))?;
+    anyhow::ensure!(
+        info.capabilities.iter().any(|cap| cap == "session-control"),
+        "the guest agent needs an update for read-only viewing; use `pbox agent update {box_id}` (no SSH required)"
+    );
+    // Validate the target before changing any local terminal state.
+    let initial = runtime.block_on(client.read_session(name))?;
+    let signals = runtime.block_on(install_terminal_signals())?;
+    let terminal = TerminalModeGuard::enter()?;
+    let (quit, mut input) = tokio::sync::mpsc::channel(1);
+    if terminal.is_some() {
+        let quit = quit.clone();
+        thread::spawn(move || {
+            let mut input = TerminalInput::read_only();
+            let mut stdin = io::stdin().lock();
+            let mut buffer = [0u8; 8192];
+            while let Ok(count) = stdin.read(&mut buffer) {
+                if count == 0 || input.push(&buffer[..count]).1 {
+                    let _ = quit.blocking_send(());
+                    break;
+                }
+            }
+        });
+    }
+    let mut display = ui::SessionViewer::new(&command.id, name);
+    display.render(&initial.text);
+    let result: Result<()> = runtime.block_on(async {
+        let mut interval = tokio::time::interval(Duration::from_millis(300));
+        #[cfg(unix)]
+        let TerminalSignals { mut interrupt, mut hangup, mut quit, mut terminate } = signals;
+        loop {
+            let read = async { interval.tick().await; client.read_session(name).await };
+            #[cfg(unix)]
+            let result = tokio::select! {
+                _ = input.recv() => break,
+                _ = interrupt.recv() => break,
+                _ = hangup.recv() => break,
+                _ = quit.recv() => break,
+                _ = terminate.recv() => break,
+                result = read => result,
+            };
+            #[cfg(not(unix))]
+            let result = tokio::select! { _ = input.recv() => break, _ = tokio::signal::ctrl_c() => break, result = read => result };
+            display.render(&result?.text);
+        }
+        Ok(())
+    });
+    display.finish();
+    drop(terminal);
+    drop(quit);
+    result?;
     Ok(RunOutcome::Success)
 }
 
@@ -539,6 +622,25 @@ mod tests {
         ] {
             assert!(target(id, name).is_err());
         }
+    }
+
+    #[test]
+    fn read_only_viewing_is_explicit_and_ctrl_c_is_local() {
+        for command in ["ssh", "attach"] {
+            assert!(Cli::try_parse_from(["pbox", command, "work:main", "--read-only"]).is_ok());
+            assert!(
+                Cli::try_parse_from(["pbox", command, "work:main", "--read-only", "--", "bash"])
+                    .is_err()
+            );
+        }
+        for key in [b"\x03".as_slice(), b"\x1b[99;5u", b"\x1b[99;5:1u"] {
+            let mut input = TerminalInput::read_only();
+            assert!(input.push(key).1);
+            let mut input = TerminalInput::default();
+            assert!(!input.push(key).1);
+        }
+        let mut input = TerminalInput::read_only();
+        assert!(!input.push(b"\x1b[200~\x03\x1b[201~").1);
     }
 
     #[test]

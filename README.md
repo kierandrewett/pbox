@@ -198,10 +198,17 @@ results where supported.
 
 `pbox ssh BOX` opens your `main` shell. If the connection drops, run it again
 and carry on where you left off. **Ctrl-]** detaches; `exit` ends the shell.
+The bottom row shows the session and detach key. The guest gets the remaining
+rows, so the status line does not cover application output.
+
+Use `--read-only` to watch without sending input, resizing the guest, or taking
+over another connection. **Ctrl+C** exits the viewer and leaves the session running.
 
 | Task | Command |
 | --- | --- |
 | Open a separate terminal | `pbox ssh BOX:build` |
+| Watch without taking control | `pbox attach BOX:build --read-only` |
+| Update the guest agent | `pbox agent update BOX` |
 | List terminals across all boxes | `pbox session list` |
 | List terminals in one box | `pbox session list BOX` |
 | End a terminal and its processes | `pbox session close BOX:build` |
@@ -215,6 +222,17 @@ Stopping the box or its terminal supervisor ends the sessions.
 > Update survival works with systemd and pbox’s minimal guest init. Sessions created
 > by older agents still defer their first update until you close them. Other init
 > setups also defer updates while sessions are running.
+
+SSH and session control commands check for agent updates before connecting.
+`pbox agent update BOX` performs the same update without opening a shell; use
+`--json` for a result a script can inspect. Updates use the local `pbox-agent`
+binary. Session listing and read-only viewing never update the guest.
+
+> [!WARNING]
+> To end legacy terminals blocking an update, run
+> `pbox agent update BOX --kill-sessions`. It lists the affected sessions and asks
+> for confirmation. Add `--yes` for non-interactive use. This stops their running
+> programs and may lose unsaved work; normal updates preserve sessions.
 
 `pbox ssh BOX -- COMMAND` still runs a one-off command. Add `--session NAME`
 to keep that command in a named terminal. Working directory, user and environment

@@ -258,6 +258,7 @@ impl Sessions {
             }
             // Snapshot and subscription are atomic with output processing, so no bytes
             // can be lost or replayed twice between the redraw and live delivery.
+            state.screen.screen_mut().set_size(rows, cols);
             if !created {
                 let screen = redraw(&state.screen);
                 let _ = output.try_send(Ok(ExecEvent {
@@ -267,7 +268,6 @@ impl Sessions {
             state.output = Some(output.clone());
             state.info.rows = rows.into();
             state.info.cols = cols.into();
-            state.screen.screen_mut().set_size(rows, cols);
             session.attachment.send_replace(state.generation);
             state.generation
         };
@@ -646,12 +646,19 @@ fn encode_key(parser: &vt100::Parser<TerminalModes>, key: &str) -> Result<Vec<u8
 }
 
 fn redraw(parser: &vt100::Parser<TerminalModes>) -> Vec<u8> {
-    let mut result = if parser.screen().alternate_screen() {
-        b"\x1b[?1049h".to_vec()
+    let screen = parser.screen();
+    let (rows, cols) = screen.size();
+    let mut result = if screen.alternate_screen() {
+        // A full-screen application owns an alternate buffer. Rebuild only that
+        // buffer, never erase the user's normal terminal or its scrollback.
+        let mut blank = vt100::Parser::new(rows, cols, 0);
+        blank.process(b"\x1b[?1049h");
+        let mut bytes = b"\x1b[?1049h".to_vec();
+        bytes.extend(screen.state_diff(blank.screen()));
+        bytes
     } else {
-        b"\x1b[?1049l".to_vec()
+        pbox_agent_client::append_terminal_screen(screen)
     };
-    result.extend(parser.screen().state_formatted());
     let modes = parser.callbacks();
     result.extend_from_slice(b"\x1b[<16u");
     if let Some(initial) = modes.stack.first() {
@@ -712,6 +719,24 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn shell_replay_appends_without_clearing_the_local_screen() {
+        let mut remote = vt100::Parser::new_with_callbacks(24, 80, 200, TerminalModes::default());
+        remote.process(b"previous output\r\n$ typed");
+        let replay = redraw(&remote);
+        for clear in [b"\x1b[2J".as_slice(), b"\x1b[3J", b"\x1b[H", b"\x1b[?1049l"] {
+            assert!(!replay.windows(clear.len()).any(|bytes| bytes == clear));
+        }
+        let mut local = vt100::Parser::new(24, 80, 200);
+        local.process(b"LOCAL HISTORY MUST STAY");
+        local.process(&replay);
+        assert_eq!(
+            local.screen().contents(),
+            "LOCAL HISTORY MUST STAY\nprevious output\n$ typed"
+        );
+        assert_eq!(local.screen().cursor_position(), (2, 7));
     }
 
     #[test]

@@ -1472,10 +1472,7 @@ pub(crate) fn terminal_sessions(
             );
         }
     }
-    style.command(&format!(
-        "pbox ssh {} --session NAME",
-        filter.unwrap_or("BOX")
-    ));
+    style.command(&format!("pbox attach {}:NAME", filter.unwrap_or("BOX")));
 }
 
 pub(crate) fn snapshot_deletion_queued(saved: &super::snapshots::SavedEnvironment, upid: &str) {
@@ -1696,5 +1693,648 @@ pub(crate) fn confirm_terminal_close(
         .warning("This ends the terminal and all its running processes. Unsaved work may be lost.");
     if session.attached {
         style.hint("The connected terminal will be disconnected.");
+    }
+}
+
+pub(crate) fn confirm_agent_session_shutdown(
+    box_id: &str,
+    sessions: &[pbox_agent_client::TerminalSession],
+) {
+    let style = stderr();
+    style.section("End legacy terminals and update agent");
+    style.metadata("box", box_id);
+    for session in sessions {
+        style.metadata(
+            "session",
+            &format!(
+                "{} · {} · {}",
+                session.name,
+                if session.attached {
+                    "attached"
+                } else {
+                    "detached"
+                },
+                session.user
+            ),
+        );
+        style.metadata("started in", &session.cwd);
+        style.metadata("command", &session.argv.join(" "));
+    }
+    style.warning(
+        "This ends every listed terminal and its running processes. Unsaved work may be lost.",
+    );
+}
+
+pub(crate) fn agent_update_result(
+    reference: &str,
+    box_id: &str,
+    status: &str,
+    version: &str,
+    blocked: &[String],
+    reason: Option<&str>,
+) {
+    let style = stdout();
+    style.stdout_heading("Guest agent");
+    style.stdout_metadata(
+        "box",
+        &if reference == box_id {
+            box_id.to_owned()
+        } else {
+            format!("{reference} · {box_id}")
+        },
+    );
+    style.stdout_metadata("version", version);
+    style.stdout_metadata("status", status);
+    if !blocked.is_empty() {
+        style.stdout_metadata("terminals", &blocked.join(", "));
+        stderr().warning("Update blocked: the old agent owns these terminals. Ending them will stop their running processes.");
+        style.command(&format!("pbox agent update {box_id} --kill-sessions"));
+        style.stdout_hint("Add --yes to confirm without a prompt.");
+    } else if let Some(reason) = reason {
+        stderr().error(reason);
+    }
+}
+
+/// A reserved terminal row, with the guest constrained to the rows above it.
+/// No alternate screen is entered and the existing screen is never cleared.
+pub(crate) struct TerminalStatus(std::cell::RefCell<StatusState>);
+struct StatusState {
+    parser: vt100::Parser,
+    filter: ViewportFilter,
+    rows: u16,
+    cols: u16,
+    label: String,
+    finished: bool,
+}
+impl StatusState {
+    fn content_rows(&self) -> u16 {
+        if self.rows >= 3 {
+            self.rows - 1
+        } else {
+            self.rows
+        }
+    }
+    fn margins(&self) -> Vec<u8> {
+        let (row, col) = self.parser.screen().cursor_position();
+        format!(
+            "\x1b[?6l\x1b[1;{}r{}\x1b[{};{}H",
+            self.content_rows(),
+            if self.filter.origin_mode {
+                "\x1b[?6h"
+            } else {
+                ""
+            },
+            (row + 1).min(self.content_rows()),
+            col + 1
+        )
+        .into_bytes()
+    }
+    fn bar(&self) -> Vec<u8> {
+        if self.rows < 3 {
+            return Vec::new();
+        }
+        use unicode_width::UnicodeWidthChar;
+        let mut label = String::new();
+        let mut width = 0;
+        for character in safe_terminal_text(&self.label).chars() {
+            let next = character.width().unwrap_or(0);
+            if width + next > usize::from(self.cols) {
+                break;
+            }
+            label.push(character);
+            width += next;
+        }
+        label.push_str(&" ".repeat(usize::from(self.cols) - width));
+        let mut output =
+            format!("\x1b[?6l\x1b[{};1H\x1b[0;7m{label}\x1b[0m", self.rows).into_bytes();
+        if self.filter.origin_mode {
+            output.extend_from_slice(b"\x1b[?6h");
+        }
+        let cursor = self.parser.screen().cursor_state_formatted();
+        output.extend(if self.filter.origin_mode {
+            relative_cursor(cursor, self.filter.top.max(1))
+        } else {
+            cursor
+        });
+        output.extend(self.parser.screen().attributes_formatted());
+        output
+    }
+    fn output(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        for (bytes, reset_margins) in self.filter.push(bytes, self.content_rows()) {
+            self.parser.process(&bytes);
+            output.extend(bytes);
+            if reset_margins {
+                self.filter.top = 1;
+                let margins = self.margins();
+                self.parser.process(&margins);
+                output.extend(margins);
+            }
+        }
+        // Do not put a status line inside an unfinished OSC/DCS string.
+        if self.filter.can_paint() {
+            output.extend(self.bar());
+        }
+        output
+    }
+}
+impl TerminalStatus {
+    pub(crate) fn enter(box_name: &str, session: &str, read_only: bool) -> Option<Self> {
+        if !io::stdin().is_terminal() || !stdout().can_animate() {
+            return None;
+        }
+        let (rows, cols) = super::terminal_size();
+        if rows < 3 || cols < 8 {
+            return None;
+        }
+        let mut state = StatusState {
+            parser: vt100::Parser::new(rows as u16, cols as u16, 0),
+            filter: ViewportFilter::default(),
+            rows: rows as u16,
+            cols: cols as u16,
+            label: format!(
+                " {box_name}:{session}  |  {}",
+                if read_only {
+                    "Read-only · Ctrl+C exit"
+                } else {
+                    "Ctrl+] detach"
+                }
+            ),
+            finished: false,
+        };
+        let initial = format!(
+            "\r\n\r\n\x1b[1;{}r\x1b[{};1H",
+            state.content_rows(),
+            state.content_rows()
+        );
+        state.parser.process(initial.as_bytes());
+        let mut output = initial.into_bytes();
+        output.extend(state.bar());
+        let _ = io::stdout().write_all(&output);
+        let _ = io::stdout().flush();
+        Some(Self(std::cell::RefCell::new(state)))
+    }
+    pub(crate) fn size(&self) -> (u32, u32) {
+        let state = self.0.borrow();
+        (u32::from(state.content_rows()), u32::from(state.cols))
+    }
+    pub(crate) fn output(&self, bytes: Vec<u8>) -> Vec<u8> {
+        self.0.borrow_mut().output(&bytes)
+    }
+    pub(crate) fn resize(&self, rows: u32, cols: u32) {
+        let mut state = self.0.borrow_mut();
+        state.rows = rows.max(1) as u16;
+        state.cols = cols.max(1) as u16;
+        state
+            .parser
+            .screen_mut()
+            .set_size(rows.max(1) as u16, cols.max(1) as u16);
+        state.filter.top = 1;
+        let margins = state.margins();
+        state.parser.process(&margins);
+        let mut output = margins;
+        output.extend(state.bar());
+        let _ = io::stdout().write_all(&output);
+        let _ = io::stdout().flush();
+    }
+    pub(crate) fn finish(&self) {
+        let mut state = self.0.borrow_mut();
+        if state.finished {
+            return;
+        }
+        state.finished = true;
+        // Keep the final status as context in scrollback, then restore the full
+        // terminal area. CAN cancels an incomplete control string after a drop.
+        let output = format!("\x18\x1b[?6l\x1b[r\x1b[{};1H\r\n", state.rows);
+        let _ = io::stdout().write_all(output.as_bytes());
+        let _ = io::stdout().flush();
+    }
+}
+impl Drop for TerminalStatus {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+#[derive(Default)]
+struct ViewportFilter {
+    state: u8, // ground, escape, CSI, string, string escape, escape intermediate
+    pending: Vec<u8>,
+    osc: bool,
+    origin_mode: bool,
+    saved_origin: bool,
+    top: u16,
+    utf8_remaining: u8,
+}
+impl ViewportFilter {
+    fn can_paint(&self) -> bool {
+        self.state == 0 && self.utf8_remaining == 0
+    }
+    fn push(&mut self, bytes: &[u8], rows: u16) -> Vec<(Vec<u8>, bool)> {
+        let mut pieces = Vec::new();
+        let mut output = Vec::new();
+        for &byte in bytes {
+            match self.state {
+                0 if byte == 0x1b => {
+                    self.pending.push(byte);
+                    self.state = 1;
+                }
+                0 => {
+                    self.utf8_remaining = match byte {
+                        0xc2..=0xdf => 1,
+                        0xe0..=0xef => 2,
+                        0xf0..=0xf4 => 3,
+                        0x80..=0xbf => self.utf8_remaining.saturating_sub(1),
+                        _ => 0,
+                    };
+                    output.push(byte);
+                }
+                1 => {
+                    self.pending.push(byte);
+                    if byte == b'[' {
+                        self.state = 2;
+                        continue;
+                    }
+                    output.append(&mut self.pending);
+                    if byte == b'7' {
+                        self.saved_origin = self.origin_mode;
+                    }
+                    if byte == b'8' {
+                        self.origin_mode = self.saved_origin;
+                    }
+                    if byte == b'c' {
+                        self.origin_mode = false;
+                        self.saved_origin = false;
+                    }
+                    if matches!(byte, b']' | b'P' | b'X' | b'^' | b'_') {
+                        self.osc = byte == b']';
+                        self.state = 3;
+                    } else if (0x20..=0x2f).contains(&byte) {
+                        self.state = 5;
+                    } else {
+                        self.state = 0;
+                        if byte == b'c' {
+                            pieces.push((std::mem::take(&mut output), true));
+                        }
+                    }
+                }
+                2 => {
+                    self.pending.push(byte);
+                    if (0x40..=0x7e).contains(&byte) {
+                        let body = &self.pending[2..self.pending.len() - 1];
+                        if byte == b'r' && body.iter().all(|b| b.is_ascii_digit() || *b == b';') {
+                            let text = String::from_utf8_lossy(body);
+                            let mut values = text.split(';');
+                            let top = values
+                                .next()
+                                .and_then(|v| v.parse::<u16>().ok())
+                                .filter(|v| *v > 0)
+                                .unwrap_or(1);
+                            let bottom = values
+                                .next()
+                                .and_then(|v| v.parse::<u16>().ok())
+                                .filter(|v| *v > 0)
+                                .unwrap_or(rows)
+                                .min(rows);
+                            if top < bottom {
+                                self.top = top;
+                                output.extend(format!("\x1b[{top};{bottom}r").bytes());
+                            }
+                        } else {
+                            output.extend_from_slice(&self.pending);
+                        }
+                        if matches!(byte, b'h' | b'l')
+                            && body.strip_prefix(b"?").is_some_and(|body| {
+                                body.split(|b| *b == b';').any(|mode| mode == b"6")
+                            })
+                        {
+                            self.origin_mode = byte == b'h';
+                        }
+                        let buffer_switch = matches!(byte, b'h' | b'l')
+                            && body.strip_prefix(b"?").is_some_and(|body| {
+                                body.split(|b| *b == b';')
+                                    .any(|mode| matches!(mode, b"47" | b"1047" | b"1049"))
+                            });
+                        self.pending.clear();
+                        self.state = 0;
+                        if buffer_switch {
+                            pieces.push((std::mem::take(&mut output), true));
+                        }
+                    } else if self.pending.len() >= 256 {
+                        output.append(&mut self.pending);
+                        self.state = 0;
+                    }
+                }
+                3 => {
+                    output.push(byte);
+                    if byte == 0x1b {
+                        self.state = 4;
+                    } else if self.osc && byte == 7 || matches!(byte, 0x18 | 0x1a) {
+                        self.state = 0;
+                    }
+                }
+                4 => {
+                    output.push(byte);
+                    self.state = if byte == b'\\' || self.osc && byte == 7 {
+                        0
+                    } else if byte == 0x1b {
+                        4
+                    } else {
+                        3
+                    };
+                }
+                5 => {
+                    output.push(byte);
+                    if !(0x20..=0x2f).contains(&byte) {
+                        self.state = 0;
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        if !output.is_empty() {
+            pieces.push((output, false));
+        }
+        pieces
+    }
+}
+
+/// Older owners send a full-screen snapshot as their first attachment event.
+/// Convert that known replay envelope too, without requiring their PTYs to end.
+pub(crate) fn append_initial_screen(bytes: Vec<u8>, rows: u32, cols: u32) -> Vec<u8> {
+    if !bytes.starts_with(b"\x1b[?1049l") {
+        return bytes;
+    }
+    let Some(modes) = bytes
+        .windows(b"\x1b[<16u".len())
+        .rposition(|part| part == b"\x1b[<16u")
+    else {
+        return bytes;
+    };
+    let mut parser = vt100::Parser::new(rows.clamp(1, 200) as u16, cols.clamp(1, 500) as u16, 0);
+    parser.process(&bytes);
+    let mut output = pbox_agent_client::append_terminal_screen(parser.screen());
+    output.extend_from_slice(&bytes[modes..]);
+    output
+}
+
+// Cursor snapshots contain VT cursor/attribute commands, not arbitrary OSC data.
+fn relative_cursor(bytes: Vec<u8>, top: u16) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index..].starts_with(b"\x1b[")
+            && let Some(end) = bytes[index + 2..]
+                .iter()
+                .position(|byte| (0x40..=0x7e).contains(byte))
+        {
+            let end = index + 2 + end;
+            if bytes[end] == b'H' {
+                let params = String::from_utf8_lossy(&bytes[index + 2..end]);
+                let mut params = params.split(';');
+                let row = params
+                    .next()
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .unwrap_or(1);
+                let col = params
+                    .next()
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .unwrap_or(1);
+                output
+                    .extend(format!("\x1b[{};{col}H", row.saturating_sub(top - 1).max(1)).bytes());
+            } else {
+                output.extend_from_slice(&bytes[index..=end]);
+            }
+            index = end + 1;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    output
+}
+
+/// An inline, read-only screen viewer. Large screens are printed in full so
+/// their content remains available in scrollback instead of being truncated.
+pub(crate) struct SessionViewer {
+    status: Option<TerminalStatus>,
+    previous: Vec<String>,
+    previous_size: (u32, u32),
+}
+impl SessionViewer {
+    pub(crate) fn new(box_name: &str, session: &str) -> Self {
+        let status = TerminalStatus::enter(box_name, session, true);
+        if status.is_none() {
+            stdout().stdout_heading(&format!("Watching {box_name}:{session} (read-only)"));
+            stdout().stdout_hint("Ctrl+C exits the viewer. The session keeps running.");
+        }
+        Self {
+            status,
+            previous: Vec::new(),
+            previous_size: super::terminal_size(),
+        }
+    }
+    pub(crate) fn render(&mut self, text: &str) {
+        use unicode_width::UnicodeWidthChar;
+        let size = super::terminal_size();
+        if size != self.previous_size
+            && let Some(status) = &self.status
+        {
+            status.resize(size.0, size.1);
+        }
+        let width = size.1.saturating_sub(1).max(1) as usize;
+        let mut lines = Vec::new();
+        for line in text.lines() {
+            let mut part = String::new();
+            let mut used = 0;
+            for character in safe_terminal_text(line).chars() {
+                let cells = character.width().unwrap_or(0);
+                if used + cells > width && !part.is_empty() {
+                    lines.push(std::mem::take(&mut part));
+                    used = 0;
+                }
+                part.push(character);
+                used += cells;
+            }
+            lines.push(part);
+        }
+        if lines == self.previous && size == self.previous_size {
+            return;
+        }
+        let mut output = Vec::new();
+        if let Some(status) = &self.status {
+            let available = status.size().0.saturating_sub(1) as usize;
+            let inline = self.previous_size == size
+                && self.previous.len() <= available
+                && lines.len() <= available;
+            let count = if inline {
+                self.previous.len().max(lines.len())
+            } else {
+                lines.len()
+            };
+            if inline && !self.previous.is_empty() {
+                output.extend(format!("\x1b[{}A", self.previous.len()).bytes());
+            }
+            for i in 0..count {
+                if inline {
+                    output.extend_from_slice(b"\r\x1b[2K");
+                }
+                if let Some(line) = lines.get(i) {
+                    output.extend_from_slice(line.as_bytes());
+                }
+                output.extend_from_slice(b"\r\n");
+            }
+            if count > lines.len() {
+                output.extend(format!("\x1b[{}A", count - lines.len()).bytes());
+            }
+            let output = status.output(output);
+            let _ = io::stdout().write_all(&output);
+            let _ = io::stdout().flush();
+        } else {
+            println!("{text}\n");
+        }
+        self.previous = lines;
+        self.previous_size = size;
+    }
+    pub(crate) fn finish(&self) {
+        if let Some(status) = &self.status {
+            status.finish();
+        }
+    }
+}
+
+#[cfg(test)]
+mod viewport_tests {
+    use super::*;
+    fn state() -> StatusState {
+        let mut parser = vt100::Parser::new(6, 40, 0);
+        parser.process(b"\x1b[1;5r\x1b[5;1H");
+        StatusState {
+            parser,
+            filter: ViewportFilter::default(),
+            rows: 6,
+            cols: 40,
+            label: "work:main | Ctrl+] detach".into(),
+            finished: false,
+        }
+    }
+    #[test]
+    fn reserved_row_survives_scrolling_and_guest_margin_resets() {
+        let mut state = state();
+        let mut terminal = vt100::Parser::new(6, 40, 200);
+        terminal.process(b"\x1b[1;5r\x1b[5;1H");
+        for line in 0..20 {
+            terminal.process(&state.output(format!("\x1b[rline {line}\r\n").as_bytes()));
+        }
+        let rows = terminal.screen().rows(0, 40).collect::<Vec<_>>();
+        assert!(rows[5].contains("work:main"));
+        assert!(rows[..5].iter().any(|row| row == "line 19"));
+        assert_eq!(state.content_rows(), 5);
+        terminal.process(&state.output(b"\x1b[?1049h\x1b[5;1HALL FIVE GUEST ROWS"));
+        assert!(
+            terminal
+                .screen()
+                .rows(0, 40)
+                .nth(4)
+                .unwrap()
+                .contains("ALL FIVE GUEST ROWS")
+        );
+        assert!(
+            terminal
+                .screen()
+                .rows(0, 40)
+                .nth(5)
+                .unwrap()
+                .contains("work:main")
+        );
+    }
+    #[test]
+    fn origin_mode_does_not_put_the_status_inside_guest_content() {
+        let mut state = state();
+        let mut terminal = vt100::Parser::new(6, 40, 0);
+        terminal.process(b"\x1b[1;5r\x1b[5;1H");
+        terminal.process(&state.output(b"\x1b[2;5r\x1b[?6h\x1b[2;1HORIGIN"));
+        assert!(
+            terminal
+                .screen()
+                .rows(0, 40)
+                .nth(5)
+                .unwrap()
+                .contains("work:main")
+        );
+        assert_eq!(
+            terminal.screen().cursor_position(),
+            state.parser.screen().cursor_position()
+        );
+        terminal.process(&state.output(b" CONTENT"));
+        assert!(terminal.screen().contents().contains("ORIGIN CONTENT"));
+    }
+
+    #[test]
+    fn status_does_not_overwrite_the_guest_saved_cursor() {
+        let mut state = state();
+        let mut terminal = vt100::Parser::new(6, 40, 0);
+        terminal.process(b"\x1b[1;5r\x1b[5;1H");
+        terminal.process(&state.output(b"\x1b[2;4H\x1b7"));
+        terminal.process(&state.output(b"elsewhere"));
+        terminal.process(&state.output(b"\x1b8Z"));
+        assert_eq!(terminal.screen().cell(1, 3).unwrap().contents(), "Z");
+    }
+    #[test]
+    fn painting_preserves_split_unicode_and_last_column_wrapping() {
+        let mut state = state();
+        let mut terminal = vt100::Parser::new(6, 40, 0);
+        terminal.process(b"\x1b[1;5r\x1b[5;1H");
+        let input = format!("\x1b[2;1H\x1b(B{}界next", "a".repeat(38));
+        for byte in input.as_bytes() {
+            terminal.process(&state.output(&[*byte]));
+        }
+        for row in 0..5 {
+            for col in 0..40 {
+                assert_eq!(
+                    terminal.screen().cell(row, col).unwrap().contents(),
+                    state.parser.screen().cell(row, col).unwrap().contents(),
+                    "row {row} column {col}"
+                );
+            }
+        }
+        assert!(
+            terminal
+                .screen()
+                .rows(0, 40)
+                .nth(2)
+                .unwrap()
+                .starts_with("next")
+        );
+    }
+    #[test]
+    fn viewport_filter_handles_split_sequences_and_does_not_rewrite_strings() {
+        let input = b"before\x1b]2;title \x1b[r\x07after\x1b[r";
+        for chunk in 1..=input.len() {
+            let mut filter = ViewportFilter::default();
+            let mut output = Vec::new();
+            for part in input.chunks(chunk) {
+                for (bytes, _) in filter.push(part, 5) {
+                    output.extend(bytes);
+                }
+            }
+            assert_eq!(output, b"before\x1b]2;title \x1b[r\x07after\x1b[1;5r");
+        }
+    }
+    #[test]
+    fn legacy_main_screen_restore_keeps_local_output_visible() {
+        let mut old = vt100::Parser::new(24, 80, 0);
+        old.process(b"$ pending");
+        let mut bytes = b"\x1b[?1049l".to_vec();
+        bytes.extend(old.screen().state_formatted());
+        bytes.extend_from_slice(b"\x1b[<16u\x1b[=0u");
+        let bytes = append_initial_screen(bytes, 24, 80);
+        let mut local = vt100::Parser::new(24, 80, 0);
+        local.process(b"existing local output");
+        local.process(&bytes);
+        assert_eq!(
+            local.screen().contents(),
+            "existing local output\n$ pending"
+        );
     }
 }

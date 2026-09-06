@@ -1,11 +1,11 @@
+mod terminal;
 use hyper_util::rt::TokioIo;
 use pbox_crypto::{CertificateMaterial, server_dns_name};
 use pbox_proto::PROTOCOL_VERSION;
-pub use pbox_proto::agent::{ExecEvent, ExecRequest, TerminalSession, exec_event};
+pub use pbox_proto::agent::{ExecEvent, ExecRequest, InfoResponse, TerminalSession, exec_event};
 use pbox_proto::agent::{
     FileChunk, FileResult, ForwardClose, ForwardEvent, ForwardOpen, GetFileRequest, InfoRequest,
-    InfoResponse, PingRequest, PingResponse, agent_client::AgentClient as GeneratedAgentClient,
-    forward_event,
+    PingRequest, PingResponse, agent_client::AgentClient as GeneratedAgentClient, forward_event,
 };
 use rustls::ClientConfig;
 use rustls::RootCertStore;
@@ -16,6 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+pub use terminal::append_terminal_screen;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
