@@ -1,6 +1,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 mod ansible;
 mod bootstrap;
+mod completions;
 mod guest;
 mod images;
 mod progress;
@@ -145,8 +146,8 @@ enum Command {
     /// Permanently delete a pbox-managed container.
     #[command(visible_alias = "rm")]
     Delete {
-        /// Public pbox identifier, or `current` when exactly one box exists.
-        #[arg(value_name = "ID|current")]
+        /// Box ID, unique name, or `current` when exactly one box exists.
+        #[arg(value_name = "ID|NAME|current")]
         id: String,
         /// Skip the interactive deletion confirmation.
         #[arg(long)]
@@ -255,7 +256,7 @@ struct ImagePullOutput {
 }
 #[derive(Debug, Args)]
 struct SshCommand {
-    /// Public pbox identifier.
+    /// Box ID, unique name, or current when exactly one box exists.
     id: String,
     /// Agent endpoint override. By default pbox resolves the guest address from PVE.
     #[arg(long)]
@@ -275,7 +276,7 @@ struct SshCommand {
 }
 #[derive(Debug, Args)]
 struct ExecCommand {
-    /// Public pbox identifier.
+    /// Box ID, unique name, or current when exactly one box exists.
     id: String,
     /// Agent endpoint override. By default pbox resolves the guest address from PVE.
     #[arg(long)]
@@ -302,7 +303,7 @@ struct ScpCommand {
 }
 #[derive(Debug, Args)]
 struct ForwardCommand {
-    /// Public pbox identifier.
+    /// Box ID, unique name, or current when exactly one box exists.
     id: String,
     /// Local TCP port to listen on.
     local_port: u16,
@@ -343,7 +344,7 @@ enum RecipeSubcommand {
     Apply {
         /// Recipe identifier from `pbox recipe list`.
         recipe: String,
-        /// Public pbox identifier.
+        /// Box ID, unique name, or current when exactly one box exists.
         #[arg(long)]
         box_id: String,
     },
@@ -364,7 +365,7 @@ enum CheckpointSubcommand {
     },
     /// Create a checkpoint of a pbox.
     Create {
-        /// Public pbox identifier.
+        /// Box ID, unique name, or current when exactly one box exists.
         id: String,
         /// Snapshot name.
         name: String,
@@ -374,7 +375,7 @@ enum CheckpointSubcommand {
     },
     /// Roll back a pbox to a checkpoint.
     Rollback {
-        /// Public pbox identifier.
+        /// Box ID, unique name, or current when exactly one box exists.
         id: String,
         /// Snapshot name.
         name: String,
@@ -387,7 +388,7 @@ enum CheckpointSubcommand {
     },
     /// Delete a checkpoint from a pbox.
     Delete {
-        /// Public pbox identifier.
+        /// Box ID, unique name, or current when exactly one box exists.
         id: String,
         /// Snapshot name.
         name: String,
@@ -492,6 +493,9 @@ enum RunOutcome {
 }
 
 fn main() {
+    if completions::dispatch() {
+        return;
+    }
     match run() {
         Ok(RunOutcome::Success) => {}
         Ok(RunOutcome::Exit(code)) => std::process::exit(code),
@@ -1671,6 +1675,7 @@ fn run_recipe(
                 .ok_or_else(|| anyhow!("recipe not found: {recipe}"))?;
             let client = client_from_config(&config)?;
             let record = find_box(&client, &box_id)?;
+            let box_id = record.id.to_string();
             if record.state != "running" {
                 bail!("box {} is not running", record.id);
             }
@@ -3600,10 +3605,14 @@ fn run_repair(
     json: bool,
     color: ColorChoice,
 ) -> Result<()> {
-    let id: PboxId = requested_id.parse().context("parse pbox id")?;
-    let id_text = id.to_string();
     let config = load_config(store)?;
-    if snapshots::repair(&config, requested_id, json, color)? {
+    let id_text = match requested_id.parse::<PboxId>() {
+        Ok(id) => id.to_string(),
+        Err(_) => find_box(&client_from_config(&config)?, requested_id)?
+            .id
+            .to_string(),
+    };
+    if snapshots::repair(&config, &id_text, json, color)? {
         return Ok(());
     }
     let (key, mut operation) = BootstrapKey::find_pending(&id_text)?
@@ -3723,7 +3732,7 @@ fn run_repair(
     })?;
 
     let info = BoxInfo {
-        id,
+        id: record.id,
         vmid: record.vmid,
         state: record.state,
         node: record.node,
@@ -3938,36 +3947,6 @@ fn is_current_box_reference(value: &str) -> bool {
     value.eq_ignore_ascii_case("current")
 }
 
-fn find_box_reference(client: &impl PveApi, requested_id: &str) -> Result<BoxRecord> {
-    if !is_current_box_reference(requested_id) {
-        return find_box(client, requested_id);
-    }
-    let boxes = discover_boxes(client)?;
-    match boxes.len() {
-        0 => bail!("current box is not defined; no pbox-managed containers were found"),
-        1 => Ok(boxes
-            .into_iter()
-            .next()
-            .expect("one current box must be present")),
-        _ => {
-            let available = boxes
-                .iter()
-                .map(|record| {
-                    format!(
-                        "{} ({} on node {}, VMID {})",
-                        record.id,
-                        record.name.as_deref().unwrap_or("unnamed"),
-                        record.node,
-                        record.vmid
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!("current box is ambiguous; choose an explicit ID: {available}");
-        }
-    }
-}
-
 fn delete_box(client: &impl PveApi, record: &BoxRecord, style: CliStyle) -> Result<()> {
     let state = client
         .get_lxc_state(&record.node, record.vmid)
@@ -4008,7 +3987,7 @@ fn run_delete(
     color: ColorChoice,
 ) -> Result<()> {
     let client = client_from_store(store)?;
-    let record = find_box_reference(&client, requested_id)?;
+    let record = find_box(&client, requested_id)?;
     let style = CliStyle::for_stderr(color, json);
     // Failed bootstrap operations still own private templates and recovery files.
     // Finish synchronously in that case so cleanup only follows successful deletion.
@@ -4105,7 +4084,7 @@ fn run_snapshot_list(
 ) -> Result<()> {
     let client = client_from_store(store)?;
     let records = if let Some(id) = requested_id {
-        vec![find_box_reference(&client, id)?]
+        vec![find_box(&client, id)?]
     } else {
         discover_boxes(&client)?
     };
@@ -4607,12 +4586,16 @@ fn resolve_agent_endpoint(
     requested_id: &str,
     endpoint: Option<&str>,
 ) -> Result<(String, String)> {
-    let id: PboxId = requested_id.parse().context("parse pbox id")?;
     if let Some(endpoint) = endpoint {
+        let id = match requested_id.parse::<PboxId>() {
+            Ok(id) => id,
+            Err(_) => find_box(&client_from_config(config)?, requested_id)?.id,
+        };
         return Ok((id.to_string(), endpoint.to_owned()));
     }
     let client = client_from_config(config)?;
-    let record = find_box(&client, &id.to_string())?;
+    let record = find_box(&client, requested_id)?;
+    let id = &record.id;
     if client.get_lxc_state(&record.node, record.vmid)? != "running" {
         return Err(anyhow!("box {} is not running", record.id));
     }
@@ -4787,11 +4770,35 @@ fn discover_boxes(client: &impl PveApi) -> Result<Vec<BoxRecord>> {
 }
 
 fn find_box(client: &impl PveApi, requested_id: &str) -> Result<BoxRecord> {
-    let id: PboxId = requested_id.parse().context("parse pbox id")?;
-    discover_boxes(client)?
+    select_box_reference(discover_boxes(client)?, requested_id)
+}
+
+fn select_box_reference(boxes: Vec<BoxRecord>, reference: &str) -> Result<BoxRecord> {
+    let id = reference.parse::<PboxId>().ok();
+    let current = is_current_box_reference(reference);
+    let mut matches: Vec<_> = boxes
         .into_iter()
-        .find(|record| record.id == id)
-        .ok_or_else(|| anyhow!("box '{id}' was not found"))
+        .filter(|record| {
+            current
+                || if let Some(id) = &id {
+                    &record.id == id
+                } else {
+                    record.name.as_deref() == Some(reference)
+                }
+        })
+        .collect();
+    match matches.len() {
+        0 => bail!("box '{reference}' was not found; use `pbox list`"),
+        1 => Ok(matches.remove(0)),
+        _ => bail!(
+            "box reference '{reference}' is ambiguous; use an explicit ID: {}",
+            matches
+                .iter()
+                .map(|record| record.id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 fn box_state_colour(state: &str) -> &'static str {
@@ -5406,7 +5413,7 @@ mod tests {
             .borrow_mut()
             .push(test_cluster_resource(record.vmid));
 
-        let resolved = super::find_box_reference(&fake, "current").unwrap();
+        let resolved = super::find_box(&fake, "current").unwrap();
 
         assert_eq!(resolved.id, record.id);
         assert_eq!(resolved.vmid, record.vmid);

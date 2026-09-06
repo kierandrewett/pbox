@@ -12,9 +12,15 @@ use std::sync::atomic::{AtomicU8, Ordering};
 static MODE: AtomicU8 = AtomicU8::new(0);
 /// Completion scripts are machine output, independent of colour and JSON mode.
 pub(crate) fn completions(shell: clap_complete::Shell) -> Result<()> {
-    use clap::CommandFactory;
     let mut script = Vec::new();
-    clap_complete::generate(shell, &mut Cli::command(), "pbox", &mut script);
+    clap_complete::env::Shells::builtins()
+        .completer(&shell.to_string())
+        .context("unsupported completion shell")?
+        .write_registration(super::completions::ENV, "pbox", "pbox", "pbox", &mut script)?;
+    if shell == clap_complete::Shell::Zsh {
+        // Support both `source <(...)` and autoloading an installed `_pbox` file.
+        script.extend_from_slice(b"\nif [[ $funcstack[1] == _pbox ]]; then\n    _clap_dynamic_completer_pbox \"$@\"\nfi\n");
+    }
     io::stdout()
         .lock()
         .write_all(&script)

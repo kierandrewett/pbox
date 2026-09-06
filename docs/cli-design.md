@@ -55,7 +55,10 @@ before human display. Calculate table padding before applying colour.
   The confirmation explains the immediate stop; `--wait` uses graceful shutdown.
 - Clap owns help layout and usage errors, with palette tokens supplied by `ui.rs`.
 - `completions SHELL` emits an unchanged shell script on stdout, even with
-  `--json` or forced colour. It needs no PVE configuration or connection.
+  `--json` or forced colour. Generating the script needs no PVE configuration or connection. Live argument
+  completion silently queries the selected PVE configuration, with a two-second
+  waiting limit. Box IDs and unique names are interchangeable; ambiguous names
+  never select a resource.
 - Image compatibility failures name the failed requirement before PVE creation.
   Agent startup timeouts keep the box and show a shared diagnostic section on
   stderr with PVE console checks and the repair command.

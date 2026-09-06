@@ -93,7 +93,7 @@ fn parse_saved(description: &str) -> Result<Option<SavedEnvironment>> {
         .map(|line| serde_json::from_str(line).context("read snapshot metadata"))
         .transpose()
 }
-fn inventory(client: &impl PveApi) -> Result<Vec<SavedEnvironment>> {
+pub(crate) fn inventory(client: &impl PveApi) -> Result<Vec<SavedEnvironment>> {
     let mut result = Vec::new();
     for resource in client.list_cluster_resources()? {
         if resource.resource_type != "lxc" {
@@ -198,7 +198,7 @@ pub fn run(
             }
         }
         Action::RepairSource { source } => {
-            let record = find_box_reference(&client, &source)?;
+            let record = find_box(&client, &source)?;
             let was_running = client.get_lxc_state(&record.node, record.vmid)? == "running";
             if !was_running {
                 wait_for_task(
@@ -328,7 +328,7 @@ fn create(
         !inventory(client)?.iter().any(|s| s.name == name),
         "snapshot name '{name}' already exists"
     );
-    let record = find_box_reference(client, source)?;
+    let record = find_box(client, source)?;
     let original = client.get_lxc_config(&record.node, record.vmid)?;
     for (key, value) in &original.extra {
         anyhow::ensure!(

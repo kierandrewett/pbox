@@ -11,7 +11,7 @@ pbox new --image debian:13
 pbox ssh BOX_ID
 ```
 
-Enable shell completion for commands, flags and known option values:
+Enable shell completion for commands, flags, live box IDs/names and snapshot IDs/names:
 
 ```sh
 # Zsh: add after compinit in ~/.zshrc
@@ -27,8 +27,13 @@ pbox completions fish > ~/.config/fish/completions/pbox.fish
 
 Zsh must initialise completion with `autoload -Uz compinit; compinit` before
 sourcing the script. `pbox completions` also supports `powershell` and `elvish`.
-Generation is offline and always writes a plain shell script, including with
-`--json`. Completion does not query live box IDs or snapshot names.
+Script generation is offline and always writes a plain shell script, including with
+`--json`. Pressing Tab on a box or snapshot argument queries the configured PVE
+instance. Queries honour `--config` and `PBOX_CONFIG_FILE`, stop waiting after two
+seconds and stay silent if PVE is unavailable. Unique box names work wherever a
+box ID is accepted (except the `BOX_ID:path` syntax used by `scp`). Ambiguous names
+require an explicit ID. Re-source the completion script after upgrading from static
+completion: `source <(pbox completions zsh)`.
 
 With a relay configured, creation keeps completed steps above the active spinner
 and names the resolved image. The result shows that image, available IPv4/IPv6

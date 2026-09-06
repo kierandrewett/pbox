@@ -86,9 +86,10 @@ fn completions_are_offline_unstyled_scripts_for_each_shell() {
         assert!(output.status.success(), "{shell}: {:?}", output.stderr);
         assert!(output.stderr.is_empty());
         let script = String::from_utf8(output.stdout.clone()).unwrap();
-        for command in ["snapshot", "checkpoint", "completions"] {
-            assert!(script.contains(command), "{shell} missing {command}");
-        }
+        assert!(
+            script.contains("PBOX_COMPLETE"),
+            "{shell} missing live completion registration"
+        );
         assert!(!output.stdout.contains(&27));
         let forced = pbox(&["--json", "--color=always", "completions", shell], false);
         assert!(forced.status.success());
