@@ -2772,7 +2772,7 @@ async fn run_ssh_session(
     title: Option<&str>,
     display: &ui::TerminalDisplay,
 ) -> Result<ExecResult> {
-    let mut size = terminal_size();
+    let size = terminal_size();
     let (terminal_rows, terminal_cols) = size;
     let persistent = !request.session_name.is_empty();
     let mut initial_screen = if persistent && io::stdout().is_terminal() {
@@ -2805,86 +2805,104 @@ async fn run_ssh_session(
             .await
     }
     .context("open terminal session")?;
-    let (input_sender, mut local_input) = tokio::sync::mpsc::channel(32);
+    let (input_sender, local_input) = tokio::sync::mpsc::channel(32);
     let _input_thread = thread::spawn(move || pump_terminal_input(input_sender, persistent));
+    let input = forward_terminal_input(local_input, session.input.clone(), size);
+    let output = async {
+        let mut result = ExecResult::default();
+        let mut titles = ui::TitlePrefix::new(title);
+        loop {
+            let event = session.output.message().await;
+            let Some(event) = event.context("read pbox-agent PTY output")? else {
+                break;
+            };
+            match event.event {
+                Some(exec_event::Event::Stdout(data)) => {
+                    let data = if std::mem::take(&mut initial_screen) {
+                        // The supervisor resizes before producing this snapshot.
+                        // Old session-list dimensions would truncate a larger replay.
+                        ui::append_initial_screen(data, terminal_rows, terminal_cols)
+                    } else {
+                        data
+                    };
+                    display.observe(&data);
+                    let data = titles.push(&data);
+                    write_pty_output(data, false)
+                        .await
+                        .context("write pbox-agent PTY output")?;
+                }
+                Some(exec_event::Event::Stderr(data)) => {
+                    display.observe(&data);
+                    write_pty_output(titles.push(&data), true)
+                        .await
+                        .context("write pbox-agent PTY error output")?;
+                }
+                Some(exec_event::Event::Exit(exit)) => {
+                    result.code = exit.code;
+                    result.signal = exit.signal;
+                    result.exited = true;
+                    break;
+                }
+                None => bail!("pbox-agent PTY stream sent an empty event"),
+            }
+        }
+        write_pty_output(titles.finish(), false).await?;
+        if !result.exited {
+            bail!("pbox-agent PTY stream ended without exit status");
+        }
+        if persistent {
+            return Ok(result);
+        }
+        match tokio::time::timeout(SSH_POST_EXIT_TIMEOUT, session.output.message()).await {
+            Ok(Ok(None)) => {}
+            Ok(Ok(Some(_))) => bail!("pbox-agent PTY stream sent data after exit"),
+            Ok(Err(error)) => return Err(error).context("close pbox-agent PTY output"),
+            Err(_) => bail!("pbox-agent PTY stream did not close after exit"),
+        }
+        Ok(result)
+    };
+    with_terminal_input(input, output).await
+}
+
+async fn with_terminal_input<T>(
+    input: impl std::future::Future<Output = Result<()>>,
+    output: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::pin!(output);
+    tokio::select! {
+        result = input => { result?; output.await },
+        result = &mut output => result,
+    }
+}
+
+async fn forward_terminal_input(
+    mut local_input: tokio::sync::mpsc::Receiver<ExecInput>,
+    sender: tokio::sync::mpsc::Sender<ExecInput>,
+    mut size: (u32, u32),
+) -> Result<()> {
     let mut input_open = true;
     #[cfg(unix)]
     let mut window_change =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
             .context("register SIGWINCH handler")?;
-    let mut result = ExecResult::default();
-    let mut titles = ui::TitlePrefix::new(title);
     loop {
-        #[cfg(unix)]
-        let event = tokio::select! {
+        tokio::select! {
             input = local_input.recv(), if input_open => {
-                input_open = relay_terminal_input(input, &mut size, terminal_size(), &session.input).await?;
-                continue;
+                input_open = relay_terminal_input(input, &mut size, terminal_size(), &sender).await?;
             }
-            event = session.output.message() => event,
-            _ = window_change.recv() => {
+            _ = async {
+                #[cfg(unix)]
+                { window_change.recv().await; }
+                #[cfg(not(unix))]
+                std::future::pending::<()>().await;
+            } => {
                 let (rows, cols) = terminal_size();
                 size = (rows, cols);
-                session.input.send(pbox_agent_client::ExecInput::Resize { rows, cols }).await
+                sender.send(ExecInput::Resize { rows, cols }).await
                     .map_err(|_| anyhow!("pbox-agent PTY input closed while resizing"))?;
-                continue;
             }
-        };
-        #[cfg(not(unix))]
-        let event = tokio::select! {
-            input = local_input.recv(), if input_open => {
-                input_open = relay_terminal_input(input, &mut size, terminal_size(), &session.input).await?;
-                continue;
-            }
-            event = session.output.message() => event,
-        };
-        let Some(event) = event.context("read pbox-agent PTY output")? else {
-            break;
-        };
-        match event.event {
-            Some(exec_event::Event::Stdout(data)) => {
-                let data = if std::mem::take(&mut initial_screen) {
-                    // The supervisor resizes before producing this snapshot.
-                    // Old session-list dimensions would truncate a larger replay.
-                    ui::append_initial_screen(data, terminal_rows, terminal_cols)
-                } else {
-                    data
-                };
-                display.observe(&data);
-                let data = titles.push(&data);
-                write_pty_output(data, false)
-                    .await
-                    .context("write pbox-agent PTY output")?;
-            }
-            Some(exec_event::Event::Stderr(data)) => {
-                display.observe(&data);
-                write_pty_output(titles.push(&data), true)
-                    .await
-                    .context("write pbox-agent PTY error output")?;
-            }
-            Some(exec_event::Event::Exit(exit)) => {
-                result.code = exit.code;
-                result.signal = exit.signal;
-                result.exited = true;
-                break;
-            }
-            None => bail!("pbox-agent PTY stream sent an empty event"),
         }
     }
-    write_pty_output(titles.finish(), false).await?;
-    if !result.exited {
-        bail!("pbox-agent PTY stream ended without exit status");
-    }
-    if persistent {
-        return Ok(result);
-    }
-    match tokio::time::timeout(SSH_POST_EXIT_TIMEOUT, session.output.message()).await {
-        Ok(Ok(None)) => {}
-        Ok(Ok(Some(_))) => bail!("pbox-agent PTY stream sent data after exit"),
-        Ok(Err(error)) => return Err(error).context("close pbox-agent PTY output"),
-        Err(_) => bail!("pbox-agent PTY stream did not close after exit"),
-    }
-    Ok(result)
 }
 
 async fn relay_terminal_input(
@@ -2940,24 +2958,17 @@ async fn write_pty_output(data: Vec<u8>, stderr: bool) -> Result<()> {
     let result = tokio::task::spawn_blocking(move || {
         if stderr {
             let mut output = io::stderr();
-            write_terminal_chunks(&mut output, &data)
+            output.write_all(&data)?;
+            output.flush()
         } else {
             let mut output = io::stdout();
-            write_terminal_chunks(&mut output, &data)
+            output.write_all(&data)?;
+            output.flush()
         }
     })
     .await
     .context("join PTY output writer")?;
     result.context("write PTY output")
-}
-
-const TERMINAL_WRITE_CHUNK: usize = 1024;
-
-fn write_terminal_chunks<W: Write>(output: &mut W, data: &[u8]) -> io::Result<()> {
-    for chunk in data.chunks(TERMINAL_WRITE_CHUNK) {
-        output.write_all(chunk)?;
-    }
-    output.flush()
 }
 
 fn pump_terminal_input(sender: tokio::sync::mpsc::Sender<ExecInput>, persistent: bool) {
@@ -5412,25 +5423,31 @@ fn box_state_colour(state: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn terminal_output_is_written_in_pty_sized_chunks() {
-        struct Recorder(Vec<usize>);
-        impl std::io::Write for Recorder {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.push(bytes.len());
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
+    #[tokio::test]
+    async fn terminal_input_is_forwarded_while_output_is_blocked() {
+        let (local, input) = tokio::sync::mpsc::channel(1);
+        let (remote, mut received) = tokio::sync::mpsc::channel(1);
+        let (release, blocked) = tokio::sync::oneshot::channel::<()>();
+        let driver = super::with_terminal_input(
+            super::forward_terminal_input(input, remote, super::terminal_size()),
+            async {
+                blocked.await?;
                 Ok(())
-            }
-        }
-        let mut output = Recorder(Vec::new());
-        super::write_terminal_chunks(&mut output, &vec![0; super::TERMINAL_WRITE_CHUNK * 2 + 1])
-            .unwrap();
-        assert_eq!(
-            output.0,
-            vec![super::TERMINAL_WRITE_CHUNK, super::TERMINAL_WRITE_CHUNK, 1]
+            },
         );
+        let interaction = async {
+            local.send(super::ExecInput::Data(vec![3])).await.unwrap();
+            assert!(
+                matches!(received.recv().await, Some(super::ExecInput::Data(bytes)) if bytes == [3])
+            );
+            release.send(()).unwrap();
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let (result, ()) = tokio::join!(driver, interaction);
+            result.unwrap();
+        })
+        .await
+        .expect("blocked output prevented Ctrl-C from reaching the guest");
     }
 
     #[test]
