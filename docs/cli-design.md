@@ -286,3 +286,14 @@ Use a dim cyan session label, dim control hints and small Unicode symbols beside
 percentages remain visible without colour. Keep the terminal's default background
 and avoid reverse video or icon-font dependencies. Account for double-width
 Unicode symbols when fitting the row.
+
+## Desktop computer control
+
+`desktop screenshot/type/send/move/click/drag/scroll` are one-shot operations.
+`desktop_control_result` renders their success and screen dimensions; screenshots
+also show the local PNG path. All external labels and paths are terminal-safe.
+JSON emits a single receipt without human stdout. Screenshot JSON embeds base64
+PNG unless an output file is requested. `screenshot --output -` is a binary data
+stream, refuses a terminal, and conflicts with JSON. Input receipts acknowledge
+a completed VNC round trip, not application completion. Errors never retry input.
+The original `desktop BOX` viewer/tunnel command and its JSON schema are retained.

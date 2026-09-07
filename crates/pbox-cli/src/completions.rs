@@ -37,7 +37,17 @@ fn add_completers(
     saved: ArgValueCompleter,
     recipes: ArgValueCompleter,
 ) -> clap::Command {
-    let desktop = command.get_name() == "desktop";
+    add_scoped_completers(command, boxes, saved, recipes, false)
+}
+
+fn add_scoped_completers(
+    command: clap::Command,
+    boxes: ArgValueCompleter,
+    saved: ArgValueCompleter,
+    recipes: ArgValueCompleter,
+    desktop: bool,
+) -> clap::Command {
+    let desktop = desktop || command.get_name() == "desktop";
     let existing_session = matches!(command.get_name(), "close" | "read" | "send");
     let box_source = matches!(command.get_name(), "create" | "repair-source");
     let mut command = command.mut_args(|arg| match arg.get_id().as_str() {
@@ -52,7 +62,13 @@ fn add_completers(
         _ => arg,
     });
     for child in command.get_subcommands_mut() {
-        *child = add_completers(child.clone(), boxes.clone(), saved.clone(), recipes.clone());
+        *child = add_scoped_completers(
+            child.clone(),
+            boxes.clone(),
+            saved.clone(),
+            recipes.clone(),
+            desktop,
+        );
     }
     command
 }

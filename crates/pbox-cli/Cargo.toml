@@ -42,3 +42,4 @@ tokio.workspace = true
 vte = "0.15"
 vt100 = "0.16.2"
 unicode-width = "0.2"
+png = "0.18"

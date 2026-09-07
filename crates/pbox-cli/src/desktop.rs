@@ -1,8 +1,16 @@
 //! Desktop recipes own session startup; the CLI owns the viewer and tunnel.
 use super::*;
+mod control;
+mod rfb;
 
 #[derive(Debug, Args)]
+#[command(
+    args_conflicts_with_subcommands = true,
+    subcommand_precedence_over_arg = true
+)]
 pub(crate) struct DesktopCommand {
+    #[command(subcommand)]
+    action: Option<control::Action>,
     #[arg(default_value = "current")]
     id: String,
     /// Agent endpoint override (the box identity is still authenticated).
@@ -63,26 +71,52 @@ fn parse_session(bytes: &[u8]) -> Result<Session> {
     Ok(session)
 }
 
+async fn start_session(
+    agent: &mut AgentClient,
+    id: &str,
+    selected_session: Option<String>,
+) -> Result<Session> {
+    agent.info().await?;
+    let installed = agent
+        .exec(
+            vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "test -e /usr/local/bin/pbox-desktop".to_owned(),
+            ],
+            "/",
+            Vec::<(String, String)>::new(),
+            "root",
+        )
+        .await
+        .context("check desktop installation")?;
+    check_launcher(&installed, id)?;
+    let mut argv = vec!["/usr/local/bin/pbox-desktop".to_owned()];
+    if let Some(session) = selected_session {
+        argv.extend(["--session".to_owned(), session]);
+    }
+    let result = agent
+        .exec(argv, "/", Vec::<(String, String)>::new(), "root")
+        .await
+        .context("start the installed desktop")?;
+    anyhow::ensure!(
+        result.exited && result.code == 0,
+        "desktop startup failed: {}",
+        safe_terminal_text(&String::from_utf8_lossy(&result.stderr))
+    );
+    parse_session(&result.stdout)
+}
+
 pub(crate) fn run(store: &ConfigStore, command: DesktopCommand, json: bool) -> Result<()> {
+    if let Some(action) = command.action {
+        return control::run(store, action, json);
+    }
     let config = load_config(store)?;
     let (id, endpoint) = resolve_agent_endpoint(&config, &command.id, command.endpoint.as_deref())?;
     let materials = agent_materials(&config, &id)?;
     tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
         let mut agent = relay::connect_agent(&config, &endpoint, &id, &materials.ca.certificate_pem, &materials.client).await?;
-        agent.info().await?;
-        let installed = agent.exec(
-            vec!["/bin/sh".to_owned(), "-c".to_owned(), "test -e /usr/local/bin/pbox-desktop".to_owned()],
-            "/", Vec::<(String, String)>::new(), "root"
-        ).await.context("check desktop installation")?;
-        check_launcher(&installed, &id)?;
-        let mut argv = vec!["/usr/local/bin/pbox-desktop".to_owned()];
-        if let Some(session) = command.session {
-            argv.extend(["--session".to_owned(), session]);
-        }
-        let result = agent.exec(argv, "/", Vec::<(String, String)>::new(), "root").await
-            .context("start the installed desktop")?;
-        anyhow::ensure!(result.exited && result.code == 0, "desktop startup failed: {}", safe_terminal_text(&String::from_utf8_lossy(&result.stderr)));
-        let session = parse_session(&result.stdout)?;
+        let session = start_session(&mut agent, &id, command.session).await?;
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let local = listener.local_addr()?;
         let mut viewer = if command.no_viewer || json { None } else {

@@ -640,6 +640,27 @@ pub(crate) fn print_recipe_catalog(
     Ok(())
 }
 
+pub(crate) fn desktop_control_result(
+    action: &str,
+    id: &str,
+    session: &str,
+    width: u16,
+    height: u16,
+    output: Option<&str>,
+) {
+    let style = stdout();
+    style.success(&format!(
+        "Desktop {}: {} ({})",
+        action,
+        safe_terminal_text(id),
+        safe_terminal_text(session)
+    ));
+    style.stdout_metadata("screen", &format!("{width}x{height}"));
+    if let Some(path) = output {
+        style.stdout_metadata("PNG", &safe_terminal_text(path));
+    }
+}
+
 pub(crate) fn desktop_ready(session: &str, local: &str) {
     let style = stdout();
     style.stdout_heading("Desktop");
