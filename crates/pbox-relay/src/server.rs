@@ -10,7 +10,7 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, Notify, Semaphore, oneshot};
 
@@ -156,7 +156,7 @@ async fn wait_and_forward(
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     let deadline = tokio::time::sleep(DEAD_PEER);
     tokio::pin!(deadline);
-    let mut client = loop {
+    let client = loop {
         tokio::select! {
             socket = &mut receiver => break socket?,
             _ = heartbeat.tick() => agent.send(Message::Ping(Vec::new().into())).await?,
@@ -168,27 +168,30 @@ async fn wait_and_forward(
         }
     };
     agent.send(Message::Text(READY.into())).await?;
-    loop {
-        tokio::select! {
-            message = agent.next() => if !forward(message, &mut client).await? { return Ok(()); },
-            message = client.next() => if !forward(message, &mut agent).await? { return Ok(()); },
-        }
+    let (agent_write, agent_read) = agent.split();
+    let (client_write, client_read) = client.split();
+    tokio::select! {
+        result = forward(agent_read, client_write) => result,
+        result = forward(client_read, agent_write) => result,
     }
 }
 
 async fn forward(
-    message: Option<Result<Message, axum::Error>>,
-    target: &mut WebSocket,
-) -> anyhow::Result<bool> {
-    let Some(message) = message.transpose()? else {
-        return Ok(false);
-    };
-    let keep_open = !matches!(message, Message::Close(_));
-    if matches!(message, Message::Text(_)) {
-        anyhow::bail!("text frames are not session data");
+    mut source: futures_util::stream::SplitStream<WebSocket>,
+    mut target: futures_util::stream::SplitSink<WebSocket, Message>,
+) -> anyhow::Result<()> {
+    while let Some(message) = source.next().await {
+        let message = message?;
+        let closing = matches!(message, Message::Close(_));
+        if matches!(message, Message::Text(_)) {
+            anyhow::bail!("text frames are not session data");
+        }
+        tokio::time::timeout(DEAD_PEER, target.send(message)).await??;
+        if closing {
+            break;
+        }
     }
-    tokio::time::timeout(DEAD_PEER, target.send(message)).await??;
-    Ok(keep_open)
+    Ok(())
 }
 
 /// Serve on an existing listener, also used by end-to-end transport tests.

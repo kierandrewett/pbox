@@ -174,33 +174,50 @@ pub async fn run_agent(access: RelayAccess, box_id: String, local: SocketAddr) -
     }
 }
 
-async fn bridge<S: AsyncRead + AsyncWrite + Unpin>(mut socket: Socket, stream: S) -> Result<()> {
+async fn bridge<S: AsyncRead + AsyncWrite + Unpin>(socket: Socket, stream: S) -> Result<()> {
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let mut buffer = vec![0; 32 * 1024];
-    let mut heartbeat = tokio::time::interval(HEARTBEAT);
-    let deadline = tokio::time::sleep(DEAD_PEER);
-    tokio::pin!(deadline);
-    loop {
-        tokio::select! {
-            message = socket.next() => {
-                deadline.as_mut().reset(tokio::time::Instant::now() + DEAD_PEER);
-                match message.transpose()? {
-                    Some(Message::Binary(bytes)) => tokio::time::timeout(DEAD_PEER, writer.write_all(&bytes)).await??,
-                    Some(Message::Ping(bytes)) => socket.send(Message::Pong(bytes)).await?,
-                    Some(Message::Pong(_)) => {},
-                    Some(Message::Close(_)) | None => { writer.shutdown().await?; return Ok(()); },
-                    _ => bail!("relay sent non-binary session data"),
+    let (mut outgoing, mut incoming) = socket.split();
+    let (pongs, mut replies) = tokio::sync::mpsc::channel(16);
+    let receive = async {
+        loop {
+            let message = tokio::time::timeout(DEAD_PEER, incoming.next())
+                .await
+                .context("relay peer stopped responding")?;
+            match message.transpose()? {
+                Some(Message::Binary(bytes)) => {
+                    tokio::time::timeout(DEAD_PEER, writer.write_all(&bytes)).await??;
                 }
+                Some(Message::Ping(bytes)) => pongs.send(bytes).await?,
+                Some(Message::Pong(_)) => {}
+                Some(Message::Close(_)) | None => {
+                    writer.shutdown().await?;
+                    return Ok(());
+                }
+                _ => bail!("relay sent non-binary session data"),
             }
-            result = reader.read(&mut buffer) => {
-                let length = result?;
-                if length == 0 { let _ = socket.close(None).await; return Ok(()); }
-                tokio::time::timeout(DEAD_PEER, socket.send(Message::Binary(buffer[..length].to_vec().into()))).await??;
-            }
-            _ = heartbeat.tick() => { tokio::time::timeout(DEAD_PEER, socket.send(Message::Ping(Vec::new().into()))).await??; }
-            _ = &mut deadline => bail!("relay peer stopped responding"),
         }
-    }
+    };
+    let send = async {
+        let mut buffer = vec![0; 32 * 1024];
+        let mut heartbeat = tokio::time::interval(HEARTBEAT);
+        loop {
+            let message = tokio::select! {
+                result = reader.read(&mut buffer) => {
+                    let length = result?;
+                    if length == 0 {
+                        tokio::time::timeout(DEAD_PEER, outgoing.close()).await??;
+                        return Ok(());
+                    }
+                    Message::Binary(buffer[..length].to_vec().into())
+                }
+                Some(bytes) = replies.recv() => Message::Pong(bytes),
+                _ = heartbeat.tick() => Message::Ping(Vec::new().into()),
+            };
+            tokio::time::timeout(DEAD_PEER, outgoing.send(message)).await??;
+        }
+    };
+    // Each direction must remain pollable while the other sink applies pressure.
+    tokio::select! { result = receive => result, result = send => result }
 }
 
 #[cfg(test)]
@@ -264,6 +281,44 @@ mod tests {
         ] {
             assert!(websocket_url(origin, "agent", BOX).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn bridge_forwards_input_while_local_output_is_blocked() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(tcp).await.unwrap()
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let mut peer = peer.await.unwrap();
+        let (mut terminal, tunnel) = tokio::io::duplex(1);
+        let bridge = tokio::spawn(super::bridge(socket, tunnel));
+        peer.send(Message::Binary(vec![b'x'; 8192].into()))
+            .await
+            .unwrap();
+        // Receiving the first byte proves the bridge entered the blocked output write.
+        let mut byte = [0];
+        terminal.read_exact(&mut byte).await.unwrap();
+        terminal.write_all(b"k").await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(Ok(Message::Binary(bytes))) = peer.next().await {
+                    break bytes;
+                }
+            }
+        })
+        .await;
+        bridge.abort();
+        assert_eq!(
+            received
+                .expect("output congestion blocked keyboard input")
+                .as_ref(),
+            b"k"
+        );
     }
 
     #[tokio::test]
