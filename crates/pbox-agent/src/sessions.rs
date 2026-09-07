@@ -363,12 +363,25 @@ async fn attachment(
         }
         permit.send(Ok(request));
     }
-    let mut state = session.state.lock().unwrap();
-    if state.generation == generation {
-        state.output.take();
-        let _ = output.try_send(Ok(ExecEvent {
-            event: Some(exec_event::Event::Exit(ExecExit { code: 0, signal: 0 })),
-        }));
+    let detached = {
+        let mut state = session.state.lock().unwrap();
+        if state.generation == generation {
+            state.output.take();
+            state.generation += 1;
+            session.attachment.send_replace(state.generation);
+            true
+        } else {
+            false
+        }
+    };
+    if detached {
+        let _ = tokio::time::timeout(
+            EXEC_STDIN_WRITE_TIMEOUT,
+            output.send(Ok(ExecEvent {
+                event: Some(exec_event::Event::Exit(ExecExit { code: 0, signal: 0 })),
+            })),
+        )
+        .await;
     }
 }
 
@@ -400,26 +413,7 @@ async fn own_session(
             }
             event = output.recv() => {
                 let Some(event) = event else { break; };
-                let mut state = session.state.lock().unwrap();
-                if let Ok(ExecEvent { event: Some(exec_event::Event::Stdout(ref bytes)) }) = event {
-                    let headless = state.output.as_ref().is_none_or(|output| output.is_closed());
-                    state.screen.callbacks_mut().headless = headless;
-                    state.screen.process(bytes);
-                    let replies = std::mem::take(&mut state.screen.callbacks_mut().replies);
-                    if !replies.is_empty() {
-                        let _ = session.input.try_send(Ok(ExecRequest {
-                            protocol_version: PROTOCOL, stdin: replies, ..Default::default()
-                        }));
-                    }
-                }
-                if let Some(sender) = &state.output
-                    && sender.try_send(event).is_err() {
-                    // A slow/disconnected viewer must not block its shell. A later
-                    // attach redraws the latest screen from bounded parser state.
-                    state.output.take();
-                    state.generation += 1;
-                    session.attachment.send_replace(state.generation);
-                }
+                if !publish_output(&session, event).await { break; }
             }
         }
     }
@@ -435,6 +429,52 @@ async fn own_session(
     }
     registry.0.lock().unwrap().remove(&name);
     session.finished.send_replace(true);
+}
+
+async fn publish_output(session: &Session, event: Result<ExecEvent, Status>) -> bool {
+    let mut attachment = session.attachment.subscribe();
+    let (sender, generation) = {
+        let mut state = session.state.lock().unwrap();
+        if let Ok(ExecEvent {
+            event: Some(exec_event::Event::Stdout(ref bytes)),
+        }) = event
+        {
+            let headless = state
+                .output
+                .as_ref()
+                .is_none_or(|output| output.is_closed());
+            state.screen.callbacks_mut().headless = headless;
+            state.screen.process(bytes);
+            let replies = std::mem::take(&mut state.screen.callbacks_mut().replies);
+            if !replies.is_empty() {
+                let _ = session.input.try_send(Ok(ExecRequest {
+                    protocol_version: PROTOCOL,
+                    stdin: replies,
+                    ..Default::default()
+                }));
+            }
+        }
+        (state.output.clone(), state.generation)
+    };
+    if let Some(sender) = sender {
+        // Preserve live bytes under temporary pressure without holding the screen lock.
+        // Detach/takeover releases the old subscription; its snapshot includes this event.
+        tokio::select! {
+            result = sender.send(event) => {
+                if result.is_err() {
+                    let mut state = session.state.lock().unwrap();
+                    if state.generation == generation {
+                        state.output.take();
+                        state.generation += 1;
+                        session.attachment.send_replace(state.generation);
+                    }
+                }
+            }
+            _ = attachment.wait_for(|current| *current != generation) => {},
+            _ = session.close.notified() => return false,
+        }
+    }
+    true
 }
 
 // Reconstruct keyboard modes separately from screen contents. Replaying raw
@@ -782,6 +822,80 @@ fn describe_processes(info: &mut TerminalSession, pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn output_fixture() -> (Arc<Session>, mpsc::Receiver<Result<ExecEvent, Status>>) {
+        let mut request = ExecRequest {
+            protocol_version: PROTOCOL,
+            allocate_pty: true,
+            session_name: "pressure".into(),
+            ..Default::default()
+        };
+        let (session, _worker) = Sessions::default()
+            .prepare(&mut request, &Arc::new(Semaphore::new(1)), false)
+            .unwrap();
+        let (sender, output) = mpsc::channel(1);
+        session.state.lock().unwrap().output = Some(sender);
+        (session, output)
+    }
+
+    fn output_event(bytes: &[u8]) -> Result<ExecEvent, Status> {
+        Ok(ExecEvent {
+            event: Some(exec_event::Event::Stdout(bytes.to_vec())),
+        })
+    }
+
+    #[tokio::test]
+    async fn output_pressure_waits_without_detaching_or_losing_bytes() {
+        let (session, mut output) = output_fixture();
+        assert!(publish_output(&session, output_event(b"first")).await);
+        let pending = publish_output(&session, output_event(b"second"));
+        tokio::pin!(pending);
+        tokio::select! {
+            biased;
+            _ = &mut pending => panic!("a full output queue detached the viewer"),
+            _ = tokio::task::yield_now() => {},
+        }
+        // Reading/control requests can still acquire the state lock under pressure.
+        assert!(session.state.lock().unwrap().output.is_some());
+        assert_eq!(
+            output.recv().await.unwrap().unwrap().event,
+            output_event(b"first").unwrap().event
+        );
+        assert!(pending.await);
+        assert_eq!(
+            output.recv().await.unwrap().unwrap().event,
+            output_event(b"second").unwrap().event
+        );
+        assert!(session.state.lock().unwrap().output.is_some());
+    }
+
+    #[tokio::test]
+    async fn blocked_output_releases_on_close_takeover_and_disconnect() {
+        for action in ["close", "takeover", "disconnect"] {
+            let (session, output) = output_fixture();
+            assert!(publish_output(&session, output_event(b"first")).await);
+            let pending = publish_output(&session, output_event(b"second"));
+            tokio::pin!(pending);
+            tokio::select! {
+                biased;
+                _ = &mut pending => panic!("output did not apply pressure"),
+                _ = tokio::task::yield_now() => {},
+            }
+            match action {
+                "close" => session.close.notify_one(),
+                "takeover" => {
+                    let mut state = session.state.lock().unwrap();
+                    state.generation += 1;
+                    session.attachment.send_replace(state.generation);
+                }
+                _ => drop(output),
+            }
+            let keep_running = tokio::time::timeout(Duration::from_secs(1), pending)
+                .await
+                .unwrap();
+            assert_eq!(keep_running, action != "close");
+        }
+    }
+
     #[test]
     fn plain_control_encodes_paste_keys_and_answers_terminal_queries_only_when_detached() {
         let mut parser = vt100::Parser::new_with_callbacks(24, 80, 0, TerminalModes::default());
