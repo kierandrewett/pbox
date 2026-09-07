@@ -166,7 +166,9 @@ async fn skip_text<S: AsyncRead + Unpin>(stream: &mut S) -> Result<()> {
 
 pub(super) fn png(width: u16, height: u16, rgba: &[u8]) -> Result<Vec<u8>> {
     let rgb: Vec<u8> = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| p[..3].iter().copied())
         .collect();
     let mut output = Vec::new();
