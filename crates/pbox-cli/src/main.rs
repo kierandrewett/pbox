@@ -2940,17 +2940,24 @@ async fn write_pty_output(data: Vec<u8>, stderr: bool) -> Result<()> {
     let result = tokio::task::spawn_blocking(move || {
         if stderr {
             let mut output = io::stderr();
-            output.write_all(&data)?;
-            output.flush()
+            write_terminal_chunks(&mut output, &data)
         } else {
             let mut output = io::stdout();
-            output.write_all(&data)?;
-            output.flush()
+            write_terminal_chunks(&mut output, &data)
         }
     })
     .await
     .context("join PTY output writer")?;
     result.context("write PTY output")
+}
+
+const TERMINAL_WRITE_CHUNK: usize = 1024;
+
+fn write_terminal_chunks<W: Write>(output: &mut W, data: &[u8]) -> io::Result<()> {
+    for chunk in data.chunks(TERMINAL_WRITE_CHUNK) {
+        output.write_all(chunk)?;
+    }
+    output.flush()
 }
 
 fn pump_terminal_input(sender: tokio::sync::mpsc::Sender<ExecInput>, persistent: bool) {
@@ -5405,6 +5412,27 @@ fn box_state_colour(state: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_output_is_written_in_pty_sized_chunks() {
+        struct Recorder(Vec<usize>);
+        impl std::io::Write for Recorder {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.push(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut output = Recorder(Vec::new());
+        super::write_terminal_chunks(&mut output, &vec![0; super::TERMINAL_WRITE_CHUNK * 2 + 1])
+            .unwrap();
+        assert_eq!(
+            output.0,
+            vec![super::TERMINAL_WRITE_CHUNK, super::TERMINAL_WRITE_CHUNK, 1]
+        );
+    }
+
     #[test]
     fn terminal_resize_precedes_unmodified_input() {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
