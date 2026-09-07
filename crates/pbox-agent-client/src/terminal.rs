@@ -17,9 +17,10 @@ pub fn terminal_extension(
     };
     let (rows, cols) = screen.size();
     let mut parser = vt100::Parser::new(rows, cols, 0);
-    *parser.screen_mut() = screen.clone();
+    // Move the existing grid, including scrollback, instead of copying it.
+    std::mem::swap(parser.screen_mut(), screen);
     parser.process(sequence);
-    *screen = parser.screen().clone();
+    std::mem::swap(parser.screen_mut(), screen);
     true
 }
 
@@ -100,6 +101,52 @@ pub fn append_terminal_screen(screen: &vt100::Screen) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn terminal_extensions_preserve_cursor_attributes_and_full_history() {
+        let mut parser = vt100::Parser::new(24, 80, HISTORY_LINES);
+        for n in 0..10_050 {
+            parser.process(format!("history-{n}\r\n").as_bytes());
+        }
+        parser.process(b"\x1b[3;7H\x1b[31m");
+        let history = terminal_history(parser.screen());
+        let before = parser.screen().state_formatted();
+        for prefix in [None, Some(b'?')] {
+            let param = [1048];
+            let params: &[&[u16]] = if prefix.is_some() { &[&param] } else { &[] };
+            assert!(terminal_extension(
+                parser.screen_mut(),
+                prefix,
+                params,
+                if prefix.is_some() { 'h' } else { 's' }
+            ));
+            parser.process(b"\x1b[10;20H\x1b[32m");
+            assert!(terminal_extension(
+                parser.screen_mut(),
+                prefix,
+                params,
+                if prefix.is_some() { 'l' } else { 'u' }
+            ));
+            assert_eq!(parser.screen().state_formatted(), before);
+        }
+        assert!(terminal_extension(
+            parser.screen_mut(),
+            Some(b'?'),
+            &[&[1047]],
+            'h'
+        ));
+        assert!(parser.screen().alternate_screen());
+        assert!(parser.screen().contents().is_empty());
+        parser.process(b"alternate content");
+        assert!(terminal_extension(
+            parser.screen_mut(),
+            Some(b'?'),
+            &[&[1047]],
+            'l'
+        ));
+        assert!(!parser.screen().alternate_screen());
+        assert_eq!(terminal_history(parser.screen()), history);
+    }
+
     #[test]
     fn history_is_bounded_and_remains_available_inside_an_alternate_app() {
         let mut parser = vt100::Parser::new(5, 30, HISTORY_LINES);
