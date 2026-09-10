@@ -686,7 +686,7 @@ async fn prepare_source(
         )
         .await?;
     let unit = format!(
-        "[Unit]\nDescription=pbox snapshot bootstrap\nConditionHost=!{host}\nAfter=network.target\nBefore=ssh.service sshd.service\n[Service]\nExecStartPre=/etc/pbox-snapshot/sanitize\nExecStart=/etc/pbox-snapshot/pbox-agent --listen 0.0.0.0:{} --box-id {} --certificate /etc/pbox-snapshot/server.pem --private-key /etc/pbox-snapshot/server-key.pem --client-ca /etc/pbox-snapshot/client-ca.pem{relay_arg}\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=pbox snapshot bootstrap\nConditionHost=!{host}\nAfter=network.target\nBefore=ssh.service sshd.service\nStartLimitIntervalSec=0\n[Service]\nExecStartPre=/etc/pbox-snapshot/sanitize\nExecStart=/etc/pbox-snapshot/pbox-agent --listen 0.0.0.0:{} --box-id {} --certificate /etc/pbox-snapshot/server.pem --private-key /etc/pbox-snapshot/server-key.pem --client-ca /etc/pbox-snapshot/client-ca.pem{relay_arg}\nRestart=always\nRestartSec=1\n[Install]\nWantedBy=multi-user.target\n",
         config.agent.port, saved.bootstrap_id
     );
     agent

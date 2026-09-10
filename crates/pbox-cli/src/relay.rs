@@ -338,7 +338,7 @@ pub(crate) fn write_payload(directory: &Path, config: &Config, box_id: &str) -> 
     fs::write(
         unit,
         format!(
-            "[Unit]\nDescription=pbox guest agent\nAfter=local-fs.target\n\n[Service]\nExecStart=/usr/local/bin/pbox-agent {agent_args}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"
+            "[Unit]\nDescription=pbox guest agent\nAfter=local-fs.target\nStartLimitIntervalSec=0\n\n[Service]\nExecStart=/usr/local/bin/pbox-agent {agent_args}\nRestart=always\nRestartSec=1\n\n[Install]\nWantedBy=multi-user.target\n"
         ),
     )?;
     let openrc = directory.join("etc/init.d/pbox-agent");
@@ -714,6 +714,8 @@ mod tests {
         assert!(unit.contains("--relay-config /etc/pbox/relay.json"));
         assert!(unit.contains("--listen 127.0.0.1:7443"));
         assert!(unit.contains("After=local-fs.target"));
+        assert!(unit.contains("StartLimitIntervalSec=0"));
+        assert!(unit.contains("Restart=always"));
         assert!(!unit.contains("After=network-online.target"));
         let openrc = fs::read_to_string(directory.join("etc/init.d/pbox-agent")).unwrap();
         assert!(openrc.contains("command_background=true"));

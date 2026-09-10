@@ -8,7 +8,7 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::{Channel, Endpoint};
 
 pub const SOCKET: &str = "/run/pbox-terminals/control.sock";
-pub const UNIT: &str = "[Unit]\nDescription=pbox terminal supervisor\nAfter=local-fs.target\n[Service]\nExecStart=/usr/local/bin/pbox-agent --terminal-host\nRestart=always\nRestartSec=2\nRuntimeDirectory=pbox-terminals\nRuntimeDirectoryMode=0700\nUMask=0077\n";
+pub const UNIT: &str = "[Unit]\nDescription=pbox terminal supervisor\nAfter=local-fs.target\nStartLimitIntervalSec=0\n[Service]\nExecStart=/usr/local/bin/pbox-agent --terminal-host\nRestart=always\nRestartSec=1\nRuntimeDirectory=pbox-terminals\nRuntimeDirectoryMode=0700\nUMask=0077\n";
 pub type Client = AgentClient<Channel>;
 
 pub async fn connect(path: &Path) -> Result<Client> {

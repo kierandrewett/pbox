@@ -407,7 +407,7 @@ fn write_local_material(request: &BootstrapRequest<'_>) -> Result<LocalMaterial>
     )?;
     write_restricted(&client_ca, &request.client_ca.certificate_pem, 0o644)?;
     let unit = format!(
-        "[Unit]\nDescription=pbox authenticated guest agent\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/pbox-agent --listen 0.0.0.0:{port} --box-id {box_id} --certificate /etc/pbox/server.pem --private-key /etc/pbox/server-key.pem --client-ca /etc/pbox/client-ca.pem\nRestart=on-failure\nRestartSec=2\nUser=root\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=pbox authenticated guest agent\nAfter=network-online.target\nWants=network-online.target\nStartLimitIntervalSec=0\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/pbox-agent --listen 0.0.0.0:{port} --box-id {box_id} --certificate /etc/pbox/server.pem --private-key /etc/pbox/server-key.pem --client-ca /etc/pbox/client-ca.pem\nRestart=always\nRestartSec=1\nUser=root\n\n[Install]\nWantedBy=multi-user.target\n",
         port = request.port,
         box_id = request.box_id,
     );
@@ -690,6 +690,38 @@ mod tests {
         assert!(validate_stage("/tmp/pbox-bootstrap-box-123").is_ok());
         assert!(validate_stage("/tmp/pbox-bootstrap-box/../../etc").is_err());
         assert!(validate_stage("/var/tmp/pbox-bootstrap-box").is_err());
+    }
+
+    #[test]
+    fn direct_bootstrap_service_restarts_after_any_agent_exit() {
+        let key = BootstrapKey::generate("pbx_12345678").unwrap();
+        let ca = pbox_crypto::generate_context_ca(&pbox_crypto::derive_context_seed(
+            "bootstrap-test@pve!agent",
+            "bootstrap-test-secret",
+        ))
+        .unwrap();
+        let server = pbox_crypto::issue_certificate(
+            &ca,
+            &pbox_crypto::server_subject("pbx_12345678").unwrap(),
+            pbox_crypto::CertificatePurpose::Server,
+        )
+        .unwrap();
+        let request = BootstrapRequest {
+            box_id: "pbx_12345678",
+            ip: "192.0.2.10".parse().unwrap(),
+            port: 7443,
+            key: &key,
+            agent_binary: Path::new("/usr/local/bin/pbox-agent"),
+            server_identity: &server,
+            client_ca: &ca,
+            client_subject: "pbox.cwd.dev/context/bootstrap-test/client",
+        };
+        let files = write_local_material(&request).unwrap();
+        let unit = fs::read_to_string(files.service_unit).unwrap();
+        assert!(unit.contains("StartLimitIntervalSec=0"));
+        assert!(unit.contains("Restart=always"));
+        assert!(unit.contains("RestartSec=1"));
+        key.cleanup().unwrap();
     }
 
     #[test]

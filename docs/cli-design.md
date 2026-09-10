@@ -80,7 +80,7 @@ JSON mode leaves stdout empty on failure and emits unstyled guidance on stderr.
 | `setup`, `config`, `relay keygen/check` | Headings, metadata, prompts, hints, success, errors |
 | `update` | Installer command and completion status |
 | `image search/tags/pull` | Headings, metadata, success, verbose diagnostics |
-| `new`, `repair`, `start`, `stop` | Progress, box details, success, next command |
+| `new`, `repair`, `start`, `restart`, `stop` | Progress, box details, success, next command |
 | `rm` / `delete` | Section, metadata, warning, prompt, progress, success |
 | `list`, `info`, `id` | Tables, metadata, resource titles |
 | `recipe` | Tables, metadata, success, warnings |

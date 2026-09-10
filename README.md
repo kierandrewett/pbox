@@ -185,7 +185,7 @@ Replace `BOX` with an ID, unique name or `current`.
 | Run a command | `pbox exec BOX -- uname -a` |
 | Copy a file into a box | `pbox scp ./file.txt BOX:/tmp/file.txt` |
 | Reach an app on port 3000 | `pbox forward BOX 3000` |
-| Stop / start | `pbox stop BOX` / `pbox start BOX` |
+| Stop / start / restart | `pbox stop BOX` / `pbox start BOX` / `pbox restart BOX` |
 | Delete | `pbox rm BOX` |
 | Find images | `pbox image search debian` |
 | List image tags | `pbox image tags debian` |

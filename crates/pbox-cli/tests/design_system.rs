@@ -51,6 +51,7 @@ fn help_for_every_command_uses_the_shared_palette() {
         "ps",
         "info",
         "start",
+        "restart",
         "stop",
         "rm",
         "delete",

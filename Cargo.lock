@@ -1272,7 +1272,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "pbox"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "base64",
@@ -1301,7 +1301,7 @@ dependencies = [
 
 [[package]]
 name = "pbox-agent"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "clap",
@@ -1327,7 +1327,7 @@ dependencies = [
 
 [[package]]
 name = "pbox-agent-client"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "hyper-util",
  "pbox-crypto",
@@ -1346,7 +1346,7 @@ dependencies = [
 
 [[package]]
 name = "pbox-core"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "base64",
  "dirs",
@@ -1360,7 +1360,7 @@ dependencies = [
 
 [[package]]
 name = "pbox-crypto"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -1376,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "pbox-proto"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -1387,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "pbox-relay"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "axum",

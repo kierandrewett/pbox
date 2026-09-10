@@ -136,7 +136,7 @@ enum Command {
     Agent(agent_update::AgentCommand),
     /// Execute a non-interactive command through pbox-agent.
     Exec(ExecCommand),
-    /// Copy files between the control machine and a pbox.
+    /// Copy files, or local directories with --recursive, between the control machine and a pbox.
     Scp(ScpCommand),
     /// Forward a local TCP port to a pbox guest.
     Forward(ForwardCommand),
@@ -155,6 +155,15 @@ enum Command {
     Info { id: String },
     /// Start a stopped pbox-managed container.
     Start { id: String },
+    /// Restart a pbox-managed container.
+    Restart {
+        /// Box ID, unique name, or `current` when exactly one box exists.
+        #[arg(value_name = "ID|NAME|current")]
+        id: String,
+        /// Stop immediately instead of requesting a graceful shutdown.
+        #[arg(long)]
+        force: bool,
+    },
     /// Stop a running pbox-managed container.
     Stop {
         id: String,
@@ -324,10 +333,13 @@ struct ExecCommand {
 }
 #[derive(Debug, Args)]
 struct ScpCommand {
-    /// Local or remote source path.
+    /// Local or remote source path. Remote paths use BOX_ID:/path.
     source: String,
-    /// Local or remote destination path.
+    /// Local or remote destination path. `~/` addresses root's guest home.
     destination: String,
+    /// Copy a local directory and its contents recursively.
+    #[arg(short = 'r', long)]
+    recursive: bool,
 }
 #[derive(Debug, Args)]
 struct ForwardCommand {
@@ -678,6 +690,9 @@ fn run() -> Result<RunOutcome> {
         }
         Command::Start { id } => {
             run_start(&store, &id, cli.json, cli.color).map(|_| RunOutcome::Success)
+        }
+        Command::Restart { id, force } => {
+            run_restart(&store, &id, force, cli.json, cli.color).map(|_| RunOutcome::Success)
         }
         Command::Stop { id, force } => {
             run_stop(&store, &id, force, cli.json, cli.color).map(|_| RunOutcome::Success)
@@ -1539,7 +1554,214 @@ struct RemotePath {
     path: String,
 }
 
+#[derive(Debug)]
+enum ScpUploadSource {
+    File {
+        data: Vec<u8>,
+        mode: u32,
+    },
+    Directory {
+        source_name: String,
+        directories: Vec<PathBuf>,
+        files: Vec<LocalUploadFile>,
+    },
+}
+
+#[derive(Debug)]
+struct LocalUploadFile {
+    relative_path: PathBuf,
+    source_path: PathBuf,
+    mode: u32,
+}
+
+fn prepare_scp_upload(path: &Path, recursive: bool) -> Result<ScpUploadSource> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("read local source metadata {}", path.display()))?;
+    if metadata.is_file() {
+        if metadata.len() > MAX_FILE_TRANSFER_BYTES {
+            bail!("scp source exceeds the 64 MiB limit: {}", path.display());
+        }
+        return Ok(ScpUploadSource::File {
+            data: fs::read(path).with_context(|| format!("read local file {}", path.display()))?,
+            mode: local_file_mode(path)?,
+        });
+    }
+    if metadata.is_dir() {
+        if !recursive {
+            bail!(
+                "scp source is a directory: {}; use `--recursive` (or `-r`) to copy directories",
+                path.display()
+            );
+        }
+        let source_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                anyhow!(
+                    "scp directory source has no usable name: {}",
+                    path.display()
+                )
+            })?
+            .to_owned();
+        let (directories, files) = collect_local_directory(path)?;
+        return Ok(ScpUploadSource::Directory {
+            source_name,
+            directories,
+            files,
+        });
+    }
+    bail!(
+        "scp source is not a regular file or directory: {}",
+        path.display()
+    )
+}
+
+fn collect_local_directory(root: &Path) -> Result<(Vec<PathBuf>, Vec<LocalUploadFile>)> {
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    collect_local_directory_at(
+        root,
+        Path::new(""),
+        &mut Vec::new(),
+        &mut directories,
+        &mut files,
+    )?;
+    directories.sort();
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok((directories, files))
+}
+
+fn collect_local_directory_at(
+    root: &Path,
+    relative_directory: &Path,
+    ancestors: &mut Vec<PathBuf>,
+    directories: &mut Vec<PathBuf>,
+    files: &mut Vec<LocalUploadFile>,
+) -> Result<()> {
+    let directory = root.join(relative_directory);
+    let canonical = fs::canonicalize(&directory)
+        .with_context(|| format!("resolve local directory {}", directory.display()))?;
+    if ancestors.iter().any(|ancestor| ancestor == &canonical) {
+        bail!(
+            "scp source contains a cyclic directory link: {}",
+            directory.display()
+        );
+    }
+    ancestors.push(canonical);
+
+    let result = (|| -> Result<()> {
+        let mut entries = fs::read_dir(&directory)
+            .with_context(|| format!("read local directory {}", directory.display()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("read local directory entries {}", directory.display()))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let relative_path = relative_directory.join(entry.file_name());
+            let path = entry.path();
+            let metadata = fs::metadata(&path)
+                .with_context(|| format!("read local source metadata {}", path.display()))?;
+            if metadata.is_dir() {
+                directories.push(relative_path.clone());
+                collect_local_directory_at(root, &relative_path, ancestors, directories, files)?;
+            } else if metadata.is_file() {
+                if metadata.len() > MAX_FILE_TRANSFER_BYTES {
+                    bail!("scp source exceeds the 64 MiB limit: {}", path.display());
+                }
+                files.push(LocalUploadFile {
+                    relative_path,
+                    source_path: path.clone(),
+                    mode: local_file_mode(&path)?,
+                });
+            } else {
+                bail!("scp cannot copy special file: {}", path.display());
+            }
+        }
+        Ok(())
+    })();
+    ancestors.pop();
+    result
+}
+
+fn expand_remote_home(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(relative) => format!("/root/{relative}"),
+        None if path == "~" => "/root".to_owned(),
+        None => path.to_owned(),
+    }
+}
+
+fn remote_join(directory: &str, relative_path: &Path) -> String {
+    Path::new(directory)
+        .join(relative_path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn remote_directory_target_path(
+    destination: &str,
+    source_name: &str,
+    destination_is_directory: bool,
+) -> String {
+    let destination_name = Path::new(destination)
+        .file_name()
+        .and_then(|name| name.to_str());
+    if destination_is_directory && destination_name != Some(source_name) {
+        remote_join(destination, Path::new(source_name))
+    } else {
+        destination.to_owned()
+    }
+}
+
+async fn remote_directory_target(
+    client: &mut AgentClient,
+    destination: &str,
+    source_name: &str,
+) -> Result<String> {
+    let probe = client
+        .exec(
+            vec!["test".to_owned(), "-d".to_owned(), destination.to_owned()],
+            "/",
+            [],
+            "root",
+        )
+        .await
+        .context("check remote scp destination")?;
+    match exec_exit_code(&probe) {
+        0 => Ok(remote_directory_target_path(destination, source_name, true)),
+        1 => Ok(remote_directory_target_path(
+            destination,
+            source_name,
+            false,
+        )),
+        code => bail!("check remote scp destination exited with status {code}"),
+    }
+}
+
+async fn create_remote_directory(client: &mut AgentClient, path: &str) -> Result<()> {
+    let result = client
+        .exec(
+            vec![
+                "mkdir".to_owned(),
+                "-p".to_owned(),
+                "--".to_owned(),
+                path.to_owned(),
+            ],
+            "/",
+            [],
+            "root",
+        )
+        .await
+        .with_context(|| format!("create remote directory {path}"))?;
+    anyhow::ensure!(
+        exec_exit_code(&result) == 0,
+        "create remote directory {path} exited with status {}",
+        exec_exit_code(&result)
+    );
+    Ok(())
+}
+
 fn run_scp(store: &ConfigStore, command: ScpCommand, json: bool, color: ColorChoice) -> Result<()> {
+    let recursive = command.recursive;
     let source_remote = parse_remote_path(&command.source)?;
     let destination_remote = parse_remote_path(&command.destination)?;
     let (upload, box_id, local_path, remote_path) = match (source_remote, destination_remote) {
@@ -1553,6 +1775,12 @@ fn run_scp(store: &ConfigStore, command: ScpCommand, json: bool, color: ColorCho
         }
     };
 
+    let local = PathBuf::from(&local_path);
+    let upload_source = if upload {
+        Some(prepare_scp_upload(&local, recursive)?)
+    } else {
+        None
+    };
     let config = load_config(store)?;
     let endpoint_command = ExecCommand {
         id: box_id.clone(),
@@ -1564,29 +1792,11 @@ fn run_scp(store: &ConfigStore, command: ScpCommand, json: bool, color: ColorCho
     };
     let (resolved_box_id, endpoint) = resolve_agent_target(&config, &endpoint_command)?;
     let materials = agent_materials(&config, &resolved_box_id)?;
-    let local = PathBuf::from(&local_path);
-    let upload_data = if upload {
-        let metadata = fs::metadata(&local)
-            .with_context(|| format!("read local file metadata {}", local.display()))?;
-        if !metadata.is_file() {
-            bail!("scp source is not a regular file: {}", local.display());
-        }
-        if metadata.len() > MAX_FILE_TRANSFER_BYTES {
-            bail!("scp source exceeds the 64 MiB limit: {}", local.display());
-        }
-        Some(fs::read(&local).with_context(|| format!("read local file {}", local.display()))?)
-    } else {
-        None
-    };
-    let upload_mode = if upload {
-        Some(local_file_mode(&local)?)
-    } else {
-        None
-    };
     let ca_pem = materials.ca.certificate_pem.clone();
     let client_identity = materials.client;
-    let remote_path_for_rpc = remote_path.clone();
+    let remote_path_for_rpc = expand_remote_home(&remote_path);
     let client_box_id = resolved_box_id.clone();
+    let local_for_download = local.clone();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1605,47 +1815,101 @@ fn run_scp(store: &ConfigStore, command: ScpCommand, json: bool, color: ColorCho
             .info()
             .await
             .context("validate pbox-agent identity")?;
-        if let Some(data) = upload_data {
-            let result = client
-                .put_file(
-                    remote_path_for_rpc.clone(),
-                    data,
-                    upload_mode.unwrap_or(0o600),
-                    true,
-                )
-                .await
-                .context("upload file through pbox-agent")?;
-            Ok::<u64, anyhow::Error>(result.size)
+        if let Some(source) = upload_source {
+            match source {
+                ScpUploadSource::File { data, mode } => {
+                    let result = client
+                        .put_file(remote_path_for_rpc.clone(), data, mode, true)
+                        .await
+                        .context("upload file through pbox-agent")?;
+                    Ok::<(u64, Option<usize>), anyhow::Error>((result.size, None))
+                }
+                ScpUploadSource::Directory {
+                    source_name,
+                    directories,
+                    files,
+                } => {
+                    let target =
+                        remote_directory_target(&mut client, &remote_path_for_rpc, &source_name)
+                            .await?;
+                    create_remote_directory(&mut client, &target).await?;
+                    for directory in directories {
+                        create_remote_directory(&mut client, &remote_join(&target, &directory))
+                            .await?;
+                    }
+                    let file_count = files.len();
+                    let mut size = 0u64;
+                    for file in files {
+                        let data = fs::read(&file.source_path).with_context(|| {
+                            format!("read local file {}", file.source_path.display())
+                        })?;
+                        anyhow::ensure!(
+                            data.len() as u64 <= MAX_FILE_TRANSFER_BYTES,
+                            "scp source exceeds the 64 MiB limit: {}",
+                            file.source_path.display()
+                        );
+                        let result = client
+                            .put_file(
+                                remote_join(&target, &file.relative_path),
+                                data,
+                                file.mode,
+                                true,
+                            )
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "upload file {} through pbox-agent",
+                                    file.relative_path.display()
+                                )
+                            })?;
+                        size = size
+                            .checked_add(result.size)
+                            .ok_or_else(|| anyhow!("scp transfer size overflowed"))?;
+                    }
+                    Ok((size, Some(file_count)))
+                }
+            }
         } else {
             let data = client
                 .get_file(remote_path_for_rpc)
                 .await
                 .context("download file through pbox-agent")?;
             let size = data.len() as u64;
-            write_download(&local, data)?;
-            Ok(size)
+            write_download(&local_for_download, data)?;
+            Ok((size, None))
         }
     })?;
+    let (size, file_count) = size;
     if json {
-        ui::json_text(
-            &(serde_json::to_string_pretty(&serde_json::json!({
-                "box_id": resolved_box_id,
-                "local": local_path,
-                "remote": remote_path,
-                "direction": if upload { "upload" } else { "download" },
-                "bytes": size,
-            }))?),
-        );
+        let mut receipt = serde_json::json!({
+            "box_id": resolved_box_id,
+            "local": local_path,
+            "remote": remote_path,
+            "direction": if upload { "upload" } else { "download" },
+            "bytes": size,
+        });
+        if let Some(file_count) = file_count {
+            receipt["files"] = file_count.into();
+        }
+        ui::json_text(&(serde_json::to_string_pretty(&receipt)?));
     } else {
         let _ = color_enabled(color, json);
-        ui::stdout().success(&format!(
-            "{} {} {} {} ({} bytes)",
-            if upload { "uploaded" } else { "downloaded" },
-            local_path,
-            if upload { "to" } else { "from" },
-            remote_path,
-            size
-        ));
+        let message = if let Some(file_count) = file_count {
+            format!(
+                "uploaded {} to {} ({} files, {} bytes)",
+                local_path, remote_path, file_count, size
+            )
+        } else {
+            format!(
+                "{} {} {} {} ({} bytes)",
+                if upload { "uploaded" } else { "downloaded" },
+                local_path,
+                if upload { "to" } else { "from" },
+                remote_path,
+                size
+            )
+        };
+        ui::stdout().success(&message);
     }
     Ok(())
 }
@@ -4196,12 +4460,16 @@ fn run_repair(
     print_box_info(&info, json, color)
 }
 
-fn ensure_box_started(client: &impl PveApi, record: &BoxRecord) -> Result<()> {
+fn ensure_box_started_with_progress(
+    client: &impl PveApi,
+    record: &BoxRecord,
+    progress: Option<CliStyle>,
+) -> Result<()> {
     if client.get_lxc_state(&record.node, record.vmid)? != "running" {
         let task = client
             .start_lxc(&record.node, record.vmid)
             .with_context(|| format!("start box {}", record.id))?;
-        wait_for_task(client, &record.node, task)
+        wait_for_task_with_progress(client, &record.node, task, progress, "starting box")
             .with_context(|| format!("PVE did not finish starting box {}", record.id))?;
     }
     Ok(())
@@ -4216,38 +4484,59 @@ fn run_start(
     let config = load_config(store)?;
     let client = client_from_config(&config)?;
     let record = find_box(&client, requested_id)?;
-    ensure_box_started(&client, &record)?;
+    start_box(&config, &client, &record, json, color)
+}
+
+fn start_box(
+    config: &Config,
+    client: &PveClient,
+    record: &BoxRecord,
+    json: bool,
+    color: ColorChoice,
+) -> Result<()> {
+    let style = CliStyle::for_stderr(color, json);
+    let state = client
+        .get_lxc_state(&record.node, record.vmid)
+        .context("check box state before starting")?;
+    if !json {
+        if state == "running" {
+            style.progress(&format!("Checking box {}...", record.id));
+        } else {
+            style.progress(&format!("Starting box {}...", record.id));
+        }
+    }
+    ensure_box_started_with_progress(client, record, (!json).then_some(style))?;
     if config.relay.url.is_some() {
-        relay::wait_ready(&config, &record.id.to_string())?;
+        relay::wait_ready(config, &record.id.to_string())?;
         if !json {
             ui::user_access(
                 record.id.as_str(),
                 "pbox",
-                guest::check(&config, record.id.as_str(), relay::ENDPOINT),
+                guest::check(config, record.id.as_str(), relay::ENDPOINT),
             );
         }
-        let current = find_box(&client, &record.id.to_string())?;
+        let current = find_box(client, &record.id.to_string())?;
         return print_box_info(
             &BoxInfo {
                 resources: None,
-                id: record.id,
+                id: record.id.clone(),
                 vmid: record.vmid,
-                node: record.node,
+                node: record.node.clone(),
                 state: "running".to_owned(),
                 ip: current.ip.map(|ip| ip.to_string()),
-                ipv6: current.ipv6,
-                name: record.name,
-                recipes: record.recipes,
-                capabilities: record.capabilities,
+                ipv6: current.ipv6.or_else(|| record.ipv6.clone()),
+                name: record.name.clone(),
+                recipes: record.recipes.clone(),
+                capabilities: record.capabilities.clone(),
             },
             json,
             color,
         );
     }
-    let ip = wait_for_lxc_ip(&client, &record.node, record.vmid)
+    let ip = wait_for_lxc_ip(client, &record.node, record.vmid)
         .with_context(|| format!("discover IPv4 address for box {}", record.id))?;
     let box_id = record.id.to_string();
-    let materials = agent_materials(&config, &box_id)?;
+    let materials = agent_materials(config, &box_id)?;
     let probe = AgentProbeRequest {
         box_id: &box_id,
         ip,
@@ -4259,21 +4548,57 @@ fn run_start(
         .with_context(|| format!("wait for authenticated pbox-agent in box {}", record.id))?;
     if !json {
         let endpoint = format!("https://{ip}:{}", config.agent.port);
-        ui::user_access(&box_id, "pbox", guest::check(&config, &box_id, &endpoint));
+        ui::user_access(&box_id, "pbox", guest::check(config, &box_id, &endpoint));
     }
     let info = BoxInfo {
         resources: None,
-        id: record.id,
+        id: record.id.clone(),
         vmid: record.vmid,
         state: "running".to_owned(),
-        node: record.node,
+        node: record.node.clone(),
         ip: Some(ip.to_string()),
-        ipv6: record.ipv6,
-        name: record.name,
-        recipes: record.recipes,
-        capabilities: record.capabilities,
+        ipv6: record.ipv6.clone(),
+        name: record.name.clone(),
+        recipes: record.recipes.clone(),
+        capabilities: record.capabilities.clone(),
     };
     print_box_info(&info, json, color)
+}
+
+fn run_restart(
+    store: &ConfigStore,
+    requested_id: &str,
+    force: bool,
+    json: bool,
+    color: ColorChoice,
+) -> Result<()> {
+    let config = load_config(store)?;
+    let client = client_from_config(&config)?;
+    let record = find_box(&client, requested_id)?;
+    let style = CliStyle::for_stderr(color, json);
+    let state = client
+        .get_lxc_state(&record.node, record.vmid)
+        .context("check box state before restarting")?;
+    if state != "stopped" {
+        if !json {
+            let action = if force { "Force stopping" } else { "Stopping" };
+            style.progress(&format!("{action} box {}...", record.id));
+        }
+        stop_box(&client, &record, force, (!json).then_some(style))
+            .with_context(|| restart_stop_hint(&record, force))?;
+        anyhow::ensure!(
+            client.get_lxc_state(&record.node, record.vmid)? == "stopped",
+            "box {} is still running after restart stop; retry with `pbox restart {} --force`",
+            record.id,
+            record.id
+        );
+    } else if !json {
+        style.progress(&format!(
+            "Box {} is already stopped; starting it...",
+            record.id
+        ));
+    }
+    start_box(&config, &client, &record, json, color)
 }
 
 fn run_stop(
@@ -4320,10 +4645,25 @@ where
 {
     let client = client_from_store(store)?;
     let record = find_box(&client, requested_id)?;
+    if !json {
+        CliStyle::for_stderr(color, json).progress(&format!("{action} box {}...", record.id));
+    }
     let task =
         operation(&client, &record).with_context(|| format!("{action} box {}", record.id))?;
-    wait_for_task(&client, &record.node, task)
-        .with_context(|| format!("PVE did not finish {action} for box {}", record.id))?;
+    if let Err(error) = wait_for_task_with_progress(
+        &client,
+        &record.node,
+        task,
+        (!json).then(|| CliStyle::for_stderr(color, json)),
+        action,
+    )
+    .with_context(|| format!("PVE did not finish {action} for box {}", record.id))
+    {
+        return Err(error.context(restart_stop_hint_for_reference(
+            requested_id,
+            action == "force stop",
+        )));
+    }
     let ip = if state == "running" {
         Some(
             wait_for_lxc_ip(&client, &record.node, record.vmid)
@@ -4350,6 +4690,41 @@ where
         capabilities: record.capabilities,
     };
     print_box_info(&info, json, color)
+}
+
+fn restart_stop_hint(record: &BoxRecord, force: bool) -> String {
+    restart_stop_hint_for_reference(record.id.as_str(), force)
+}
+
+fn restart_stop_hint_for_reference(reference: &str, force: bool) -> String {
+    if force {
+        format!("force stop failed; inspect the PVE task for `{reference}` before retrying")
+    } else {
+        format!(
+            "graceful shutdown failed; retry with `pbox stop {reference} --force` or `pbox restart {reference} --force`"
+        )
+    }
+}
+
+fn stop_box(
+    client: &impl PveApi,
+    record: &BoxRecord,
+    force: bool,
+    progress: Option<CliStyle>,
+) -> Result<()> {
+    let action = if force {
+        "force stop"
+    } else {
+        "graceful shutdown"
+    };
+    let task = if force {
+        client.stop_lxc(&record.node, record.vmid)
+    } else {
+        client.shutdown_lxc(&record.node, record.vmid)
+    }
+    .with_context(|| format!("{action} box {}", record.id))?;
+    wait_for_task_with_progress(client, &record.node, task, progress, action)
+        .with_context(|| format!("PVE did not finish {action} for box {}", record.id))
 }
 fn format_bootstrap_repair_path(key: &BootstrapKey, box_id: &str) -> String {
     format!(
@@ -5472,16 +5847,17 @@ mod tests {
 
     use super::{
         ANSI_CYAN, ANSI_RESET, AnsibleRun, BootstrapKey, BoxRecord, Cli, CliStyle, Command,
-        ForwardCommand, NewCommand, RecipeSnapshot, SetupAnswers, SetupChoice, SetupCommand,
-        SetupOutput, SshCommand, agent_identity_changes, apply_setup_values, create_box_snapshot,
-        create_lxc_with_retry, create_recipe_snapshot, delete_box_snapshot, delete_recipe_snapshot,
-        exec_exit_code, finish_recipe_failure, finish_recipe_success, format_snapshot_time,
+        ForwardCommand, NewCommand, RecipeSnapshot, ScpCommand, SetupAnswers, SetupChoice,
+        SetupCommand, SetupOutput, SshCommand, agent_identity_changes, apply_setup_values,
+        collect_local_directory, create_box_snapshot, create_lxc_with_retry,
+        create_recipe_snapshot, delete_box_snapshot, delete_recipe_snapshot, exec_exit_code,
+        expand_remote_home, finish_recipe_failure, finish_recipe_success, format_snapshot_time,
         parse_env_entry, parse_recipe_sync_ttl, parse_remote_path, parse_setup_bool,
-        record_recipe_provenance, resolve_new_command, resolve_pve_node_with_storage,
-        rollback_box_snapshot, safe_terminal_text, setup_choice_default, setup_pve_error_message,
-        ssh_command_argv, template_matches, validate_forward_arguments,
-        validate_snapshot_arguments, validate_ssh_arguments, wait_for_oci_template_task,
-        write_download,
+        prepare_scp_upload, record_recipe_provenance, remote_directory_target_path,
+        resolve_new_command, resolve_pve_node_with_storage, rollback_box_snapshot,
+        safe_terminal_text, setup_choice_default, setup_pve_error_message, ssh_command_argv,
+        template_matches, validate_forward_arguments, validate_snapshot_arguments,
+        validate_ssh_arguments, wait_for_oci_template_task, write_download,
     };
     use anyhow::anyhow;
     use clap::Parser;
@@ -5496,6 +5872,17 @@ mod tests {
     use std::cell::RefCell;
     use std::fs;
     use std::time::Duration;
+
+    fn scp_test_root() -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "pbox-scp-directory-test-{}-{stamp}",
+            std::process::id()
+        ))
+    }
 
     struct FakePve {
         current_state: RefCell<String>,
@@ -5855,11 +6242,36 @@ mod tests {
         let record = test_record();
         let fake = FakePve::new(&test_metadata(&record), "test");
         assert_eq!(record.state, "running");
-        super::ensure_box_started(&fake, &record).unwrap();
+        super::ensure_box_started_with_progress(&fake, &record, None).unwrap();
         assert!(fake.events.borrow().iter().any(|event| event == "start"));
         fake.events.borrow_mut().clear();
-        super::ensure_box_started(&fake, &record).unwrap();
+        super::ensure_box_started_with_progress(&fake, &record, None).unwrap();
         assert!(fake.events.borrow().is_empty());
+    }
+
+    #[test]
+    fn restart_command_accepts_a_box_reference_and_force() {
+        let cli = Cli::try_parse_from(["pbox", "restart", "ornadb-dev", "--force"]).unwrap();
+        let Command::Restart { id, force } = cli.command else {
+            panic!("expected restart command");
+        };
+        assert_eq!(id, "ornadb-dev");
+        assert!(force);
+    }
+
+    #[test]
+    fn restart_stops_then_starts_using_fresh_pve_state() {
+        let record = test_record();
+        let fake = FakePve::new(&test_metadata(&record), "test");
+        *fake.current_state.borrow_mut() = "running".to_owned();
+
+        super::stop_box(&fake, &record, false, None).unwrap();
+        super::ensure_box_started_with_progress(&fake, &record, None).unwrap();
+
+        assert_eq!(
+            *fake.events.borrow(),
+            ["shutdown", "wait:shutdown", "start", "wait:start"]
+        );
     }
 
     #[test]
@@ -6957,6 +7369,88 @@ mod tests {
         assert!(parse_remote_path("pbx_t3yzd9y3:").is_err());
         assert!(parse_remote_path("not-a-box:/tmp/file").is_err());
         assert!(parse_remote_path("pbx_t3yzd9y3:/tmp\0file").is_err());
+    }
+
+    #[test]
+    fn scp_accepts_recursive_directory_transfers() {
+        let cli = Cli::try_parse_from([
+            "pbox",
+            "scp",
+            "--recursive",
+            "/tmp/.agents",
+            "pbx_t3yzd9y3:~/.agents",
+        ])
+        .unwrap();
+        let Command::Scp(ScpCommand { recursive, .. }) = cli.command else {
+            panic!("expected scp command");
+        };
+        assert!(recursive);
+    }
+
+    #[test]
+    fn scp_directory_sources_explain_recursive_mode() {
+        let root = scp_test_root();
+        fs::create_dir(&root).unwrap();
+        let error = prepare_scp_upload(&root, false).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!(
+                "scp source is a directory: {}; use `--recursive` (or `-r`) to copy directories",
+                root.display()
+            )
+        );
+        fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn scp_collects_nested_files_and_empty_directories() {
+        let root = scp_test_root();
+        fs::create_dir_all(root.join("nested/empty")).unwrap();
+        fs::write(root.join("root.txt"), b"root").unwrap();
+        fs::write(root.join("nested/file.txt"), b"nested").unwrap();
+
+        let (directories, files) = collect_local_directory(&root).unwrap();
+        assert_eq!(
+            directories,
+            [
+                std::path::PathBuf::from("nested"),
+                std::path::PathBuf::from("nested/empty")
+            ]
+        );
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.relative_path.clone())
+                .collect::<Vec<_>>(),
+            [
+                std::path::PathBuf::from("nested/file.txt"),
+                std::path::PathBuf::from("root.txt")
+            ]
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn scp_expands_root_home_paths_for_file_rpc() {
+        assert_eq!(expand_remote_home("~"), "/root");
+        assert_eq!(expand_remote_home("~/.agents"), "/root/.agents");
+        assert_eq!(expand_remote_home("/tmp/.agents"), "/tmp/.agents");
+    }
+
+    #[test]
+    fn scp_reuses_an_existing_destination_named_for_the_source() {
+        assert_eq!(
+            remote_directory_target_path("/root/.agents", ".agents", true),
+            "/root/.agents"
+        );
+        assert_eq!(
+            remote_directory_target_path("/root", ".agents", true),
+            "/root/.agents"
+        );
+        assert_eq!(
+            remote_directory_target_path("/root/.agents", ".agents", false),
+            "/root/.agents"
+        );
     }
 
     #[test]

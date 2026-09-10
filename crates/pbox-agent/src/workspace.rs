@@ -297,7 +297,7 @@ fn configure_systemd(root: &Path) -> Result<()> {
     };
     write(
         "pbox-agent.service",
-        "[Unit]\nDescription=pbox guest agent\nAfter=local-fs.target pbox-network.service\nWants=pbox-network.service\n[Service]\nExecStart=/usr/local/bin/pbox-agent --workspace-service\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=pbox guest agent\nAfter=local-fs.target pbox-network.service\nWants=pbox-network.service\nStartLimitIntervalSec=0\n[Service]\nExecStart=/usr/local/bin/pbox-agent --workspace-service\nRestart=always\nRestartSec=1\n[Install]\nWantedBy=multi-user.target\n",
     )?;
     write(
         "pbox-network.service",
@@ -514,11 +514,10 @@ mod tests {
             fs::read_link(units.join("systemd-firstboot.service")).unwrap(),
             Path::new("/dev/null")
         );
-        assert!(
-            fs::read_to_string(units.join("pbox-agent.service"))
-                .unwrap()
-                .contains("--workspace-service")
-        );
+        let agent_unit = fs::read_to_string(units.join("pbox-agent.service")).unwrap();
+        assert!(agent_unit.contains("--workspace-service"));
+        assert!(agent_unit.contains("StartLimitIntervalSec=0"));
+        assert!(agent_unit.contains("Restart=always"));
         assert_eq!(
             fs::read_link(units.join("multi-user.target.wants/pbox-network.service")).unwrap(),
             Path::new("../pbox-network.service")
