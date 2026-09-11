@@ -1,7 +1,5 @@
 //! Live completion queries are read-only, silent and bounded independently of PVE timeouts.
-use super::{
-    Cli, ConfigStore, client_from_config, discover_boxes, load_config, recipes, snapshots,
-};
+use super::{Cli, ConfigStore, inventory, load_config, recipes};
 use clap::CommandFactory;
 use clap_complete::{ArgValueCompleter, CompleteEnv, CompletionCandidate};
 use std::ffi::{OsStr, OsString};
@@ -10,11 +8,17 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 pub(crate) const ENV: &str = "PBOX_COMPLETE";
+const SESSION_COMPLETION_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub(crate) fn dispatch() -> bool {
     if std::env::var_os(ENV).is_none_or(|value| value.is_empty() || value == "0") {
         return false;
     }
+    // Completion must never be responsible for a foreground PVE request. Start the
+    // normal refresher if necessary, then complete immediately from its snapshot.
+    let config =
+        config_path(std::env::args_os()).unwrap_or_else(pbox_core::config::default_config_path);
+    inventory::ensure_daemon(&config);
     // A failed completion must not print an error or fall through to command execution.
     let _ = CompleteEnv::with_factory(command)
         .var(ENV)
@@ -105,6 +109,27 @@ fn boxes(current: &OsStr) -> Vec<CompletionCandidate> {
 
 fn saved_environments(current: &OsStr) -> Vec<CompletionCandidate> {
     query(current, true)
+}
+
+fn cached_records(snapshot: &inventory::Snapshot) -> Vec<(String, String)> {
+    snapshot
+        .records
+        .iter()
+        .map(|record| {
+            (
+                record.id.to_string(),
+                record.name.clone().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+fn cached_saved_environments(snapshot: &inventory::Snapshot) -> Vec<(String, String)> {
+    snapshot
+        .saved
+        .iter()
+        .map(|environment| (environment.id.clone(), environment.name.clone()))
+        .collect()
 }
 
 fn recipe_ids(current: &OsStr) -> Vec<CompletionCandidate> {
@@ -243,7 +268,15 @@ fn query_terminal_names(target: String) -> Vec<String> {
     std::thread::spawn(move || {
         let result: anyhow::Result<Vec<String>> = (|| {
             let config = load_config(&store)?;
-            let (box_id, endpoint) = super::resolve_agent_endpoint(&config, &target, None)?;
+            let Some(snapshot) = inventory::read(store.path())? else {
+                return Ok(Vec::new());
+            };
+            let record = match super::select_box_reference(snapshot.records, &target) {
+                Ok(record) if record.state == "running" => record,
+                _ => return Ok(Vec::new()),
+            };
+            let box_id = record.id.to_string();
+            let endpoint = super::agent_endpoint(&config, &record)?;
             let materials = super::agent_materials(&config, &box_id)?;
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -268,7 +301,7 @@ fn query_terminal_names(target: String) -> Vec<String> {
         let _ = sender.send(result.unwrap_or_default());
     });
     receiver
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(SESSION_COMPLETION_TIMEOUT)
         .unwrap_or_default()
 }
 
@@ -279,27 +312,16 @@ fn query(current: &OsStr, saved: bool) -> Vec<CompletionCandidate> {
     let store = ConfigStore::new(
         config_path(std::env::args_os()).unwrap_or_else(pbox_core::config::default_config_path),
     );
-    let (sender, receiver) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let result: anyhow::Result<Vec<(String, String)>> = (|| {
-            let config = load_config(&store)?;
-            let client = client_from_config(&config)?;
+    let snapshot = inventory::read(store.path()).ok().flatten();
+    let records = snapshot
+        .as_ref()
+        .map(|snapshot| {
             if saved {
-                Ok(snapshots::inventory(&client)?
-                    .into_iter()
-                    .map(|saved| (saved.id, saved.name))
-                    .collect())
+                cached_saved_environments(snapshot)
             } else {
-                Ok(discover_boxes(&client)?
-                    .into_iter()
-                    .map(|record| (record.id.to_string(), record.name.unwrap_or_default()))
-                    .collect())
+                cached_records(snapshot)
             }
-        })();
-        let _ = sender.send(result.unwrap_or_default());
-    });
-    let records = receiver
-        .recv_timeout(Duration::from_secs(2))
+        })
         .unwrap_or_default();
     candidates(records, prefix, !saved)
 }
@@ -445,6 +467,35 @@ mod tests {
             ("pbx_abcdefgh".into(), "same".into()),
         ];
         assert!(candidates(duplicates, "same", true).is_empty());
+    }
+
+    #[test]
+    fn cached_completion_uses_inventory_without_a_pve_request() {
+        let snapshot = inventory::Snapshot {
+            updated: 0,
+            records: vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "pbx_12345678",
+                    "vmid": 9000,
+                    "state": "running",
+                    "node": "pve",
+                    "ip": null,
+                    "ipv6": null,
+                    "name": "pbox-fedora",
+                    "recipes": [],
+                    "capabilities": [],
+                    "ping": "ok"
+                }))
+                .unwrap(),
+            ],
+            saved: Vec::new(),
+            refresh_failed: false,
+        };
+
+        assert_eq!(
+            candidates(cached_records(&snapshot), "pbox-f", true)[0].get_value(),
+            "pbox-fedora"
+        );
     }
 
     #[test]

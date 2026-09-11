@@ -59,11 +59,14 @@ before human display. Calculate table padding before applying colour.
 - Clap owns help layout and usage errors, with palette tokens supplied by `ui.rs`.
 - `completions SHELL` emits an unchanged shell script on stdout, even with
   `--json` or forced colour. Generating the script needs no PVE configuration or connection. Live argument
-  completion silently queries the selected PVE configuration, with a two-second
-  waiting limit, and reads recipe IDs from the local recipe cache without
-  contacting Git. Box IDs and unique names are interchangeable; ambiguous names
-  never select a resource. Desktop session completion uses the supported session
-  names and remains available without a guest query.
+  completion reads box and saved-environment names from pboxd's local snapshot;
+  a missing snapshot starts pboxd in the background and returns immediately.
+  Guest session completion has a short bounded wait and silently returns no
+  session names when the guest is unavailable. Recipe IDs come from the local
+  recipe cache without contacting Git. Box IDs and unique names are
+  interchangeable; ambiguous names never select a resource. Desktop session
+  completion uses the supported session names and remains available without a
+  guest query.
 - Image compatibility failures name the failed requirement before PVE creation.
   Agent startup timeouts keep the box and show a shared diagnostic section on
   stderr with PVE console checks and the repair command.

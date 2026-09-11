@@ -7,8 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Snapshot {
-    updated: u64,
+    pub(super) updated: u64,
     pub records: Vec<BoxRecord>,
+    #[serde(default)]
+    pub saved: Vec<snapshots::SavedEnvironment>,
     pub refresh_failed: bool,
 }
 
@@ -31,6 +33,10 @@ fn now() -> u64 {
         .as_secs()
 }
 
+fn is_cache_environment_override(key: &str) -> bool {
+    key.starts_with("PBOX_") && key != super::completions::ENV
+}
+
 fn directory(config: &Path) -> Result<PathBuf> {
     let absolute = fs::canonicalize(config).unwrap_or(std::env::current_dir()?.join(config));
     let mut hash = Sha256::new();
@@ -38,7 +44,7 @@ fn directory(config: &Path) -> Result<PathBuf> {
     hash.update(fs::read(config).unwrap_or_default());
     // Environment overrides select a different inventory too, without exposing secrets.
     let mut overrides: Vec<_> = std::env::vars()
-        .filter(|(k, _)| k.starts_with("PBOX_"))
+        .filter(|(k, _)| is_cache_environment_override(k))
         .collect();
     overrides.sort();
     hash.update(serde_json::to_vec(&overrides)?);
@@ -136,6 +142,7 @@ pub(super) fn ensure_daemon(config: &Path) {
             .arg("daemon")
             .arg("--config")
             .arg(config)
+            .env_remove(super::completions::ENV)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -185,7 +192,8 @@ pub(super) fn run_daemon(config_path: &Path) -> Result<RunOutcome> {
             // Keep the last probe result while publishing fresh PVE lifecycle state.
             // Only the background worker probes; readers never wait for it.
             let mut pending = records.clone();
-            if let Some(previous) = read_snapshot(&dir)? {
+            let previous = read_snapshot(&dir)?;
+            if let Some(previous) = previous.as_ref() {
                 for record in &mut pending {
                     if record.state == "running"
                         && let Some(old) = previous.records.iter().find(|old| old.id == record.id)
@@ -196,11 +204,24 @@ pub(super) fn run_daemon(config_path: &Path) -> Result<RunOutcome> {
                     }
                 }
             }
+            // Saved environments change much less often than box state. Keep them in
+            // the same local snapshot, but refresh that part only every ten seconds.
+            // Completion readers can therefore stay entirely local even on a cold
+            // shell, while the extra PVE config reads remain background work.
+            let saved = match previous.as_ref() {
+                Some(previous) if previous.age() < Duration::from_secs(10) => {
+                    previous.saved.clone()
+                }
+                _ => snapshots::inventory(&client).unwrap_or_else(|_| {
+                    previous.as_ref().map_or_else(Vec::new, |s| s.saved.clone())
+                }),
+            };
             write_atomic(
                 &dir.join("inventory.json"),
                 &Snapshot {
                     updated: now(),
                     records: pending,
+                    saved: saved.clone(),
                     refresh_failed: false,
                 },
             )?;
@@ -208,6 +229,7 @@ pub(super) fn run_daemon(config_path: &Path) -> Result<RunOutcome> {
             Ok(Snapshot {
                 updated: now(),
                 records,
+                saved,
                 refresh_failed: false,
             })
         };
@@ -245,6 +267,7 @@ mod tests {
             &Snapshot {
                 updated: now(),
                 records: vec![record],
+                saved: Vec::new(),
                 refresh_failed: false,
             },
         )
@@ -270,5 +293,12 @@ mod tests {
             directory(Path::new("/tmp/pbox-config-one")).unwrap(),
             directory(Path::new("/tmp/pbox-config-two")).unwrap()
         );
+    }
+
+    #[test]
+    fn completion_control_variable_does_not_split_inventory_cache() {
+        assert!(!is_cache_environment_override(super::completions::ENV));
+        assert!(is_cache_environment_override("PBOX_CONFIG_FILE"));
+        assert!(!is_cache_environment_override("OTHER_SETTING"));
     }
 }
