@@ -534,76 +534,30 @@ pub fn run(store: &ConfigStore, command: SessionCommand, json: bool) -> Result<R
 }
 
 /// Observe decoded screen snapshots. No attachment, input, resize or update RPCs.
-pub(super) fn view(store: &ConfigStore, command: &SshCommand) -> Result<RunOutcome> {
-    let config = load_config(store)?;
+pub(super) async fn view(
+    config: &Config,
+    command: &SshCommand,
+    box_id: &str,
+    endpoint: &str,
+    title: Option<&ui::TerminalTitleGuard>,
+) -> Result<()> {
     let name = command.session.as_deref().unwrap_or("main");
     validate_name(name)?;
-    let (box_id, endpoint) =
-        resolve_agent_endpoint(&config, &command.id, command.endpoint.as_deref())?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let (mut client, info) =
-        runtime.block_on(agent_update::raw_connect(&config, &box_id, &endpoint))?;
+    let (mut client, info) = agent_update::raw_connect(config, box_id, endpoint).await?;
     anyhow::ensure!(
         info.capabilities.iter().any(|cap| cap == "session-control"),
         "the guest agent needs an update for read-only viewing; use `pbox agent update {box_id}` (no SSH required)"
     );
-    // Validate the target before changing any local terminal state.
-    let initial = runtime.block_on(client.read_session(name))?;
-    let signals = runtime.block_on(install_terminal_signals())?;
-    let terminal = TerminalModeGuard::enter()?;
-    let (quit, mut input) = tokio::sync::mpsc::channel::<Option<Vec<u8>>>(32);
-    if terminal.is_some() {
-        let quit = quit.clone();
-        thread::spawn(move || {
-            let mut input = TerminalInput::read_only();
-            let mut stdin = io::stdin().lock();
-            let mut buffer = [0u8; 8192];
-            while let Ok(count) = stdin.read(&mut buffer) {
-                let (bytes, exit) = input.push(&buffer[..count]);
-                if count == 0 || exit {
-                    let _ = quit.blocking_send(None);
-                    break;
-                }
-                if !bytes.is_empty() && quit.blocking_send(Some(bytes)).is_err() {
-                    break;
-                }
-            }
-        });
-    }
+    let initial = client.read_session(name).await?;
+    ui::ssh_connection_state(title, "Connected", false);
     let mut display = ui::SessionViewer::new(&command.id, name);
-    display.monitor_resources(config.clone(), box_id.clone());
+    display.monitor_resources(config.clone(), box_id.to_owned());
     display.render(&initial.text);
-    let result: Result<()> = runtime.block_on(async {
-        let mut interval = tokio::time::interval(Duration::from_millis(300));
-        #[cfg(unix)]
-        let TerminalSignals { mut interrupt, mut hangup, mut quit, mut terminate } = signals;
-        loop {
-            let read = async { interval.tick().await; client.read_session(name).await };
-            #[cfg(unix)]
-            let result = tokio::select! {
-                event = input.recv() => match event {
-                    Some(Some(_)) => { continue; }
-                    _ => break,
-                },
-                _ = interrupt.recv() => break,
-                _ = hangup.recv() => break,
-                _ = quit.recv() => break,
-                _ = terminate.recv() => break,
-                result = read => result,
-            };
-            #[cfg(not(unix))]
-            let result = tokio::select! { event = input.recv() => match event { Some(Some(_)) => { continue; }, _ => break }, _ = tokio::signal::ctrl_c() => break, result = read => result };
-            display.render(&result?.text);
-        }
-        Ok(())
-    });
-    display.finish();
-    drop(terminal);
-    drop(quit);
-    result?;
-    Ok(RunOutcome::Success)
+    let mut interval = tokio::time::interval(Duration::from_millis(300));
+    loop {
+        interval.tick().await;
+        display.render(&client.read_session(name).await?.text);
+    }
 }
 
 /// Poll Proxmox outside the async terminal loop. Failure never closes the PTY,

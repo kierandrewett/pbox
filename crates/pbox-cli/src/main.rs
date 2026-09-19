@@ -10,6 +10,7 @@ mod inventory;
 mod progress;
 mod sessions;
 mod snapshots;
+mod ssh_input;
 mod ui;
 mod update;
 use ui::*;
@@ -2711,18 +2712,84 @@ fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<R
     if json {
         bail!("pbox ssh does not support --json");
     }
-    if command.read_only {
-        return sessions::view(store, &command);
-    }
     validate_ssh_arguments(&command)?;
     let config = load_config(store)?;
-    let (box_id, endpoint) =
-        resolve_agent_endpoint(&config, &command.id, command.endpoint.as_deref())?;
-    let box_name = client_from_config(&config)
-        .and_then(|client| find_box(&client, &box_id))
-        .ok()
-        .and_then(|record| record.name)
-        .unwrap_or_else(|| box_id.clone());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create async runtime for pbox-agent shell")?;
+    let signals = runtime.block_on(install_terminal_signals())?;
+    let terminal = TerminalModeGuard::enter()?;
+    let label = match &session_name {
+        Some(name) => format!("{}:{name}", command.id),
+        None => command.id.clone(),
+    };
+    let title = ui::TerminalTitleGuard::enter(&label);
+    let display = ui::TerminalDisplay::default();
+    let mut input = ssh_input::Input::start(command.read_only);
+    ui::ssh_connection_state(title.as_ref(), "Connecting", true);
+    let operation = run_ssh_connected(
+        config,
+        command,
+        session_name,
+        title.as_ref(),
+        &display,
+        input.data.take().unwrap(),
+        input.ready.clone(),
+    );
+    let result = runtime.block_on(ssh_input::cancellable(
+        &mut input.control,
+        run_ssh_session_with_signals(
+            operation,
+            (terminal.as_ref(), title.as_ref(), &display),
+            signals,
+        ),
+    ));
+    drop(input);
+    display.restore();
+    ui::ssh_connection_state(
+        title.as_ref(),
+        if matches!(result, Ok(None)) {
+            "Detached"
+        } else {
+            "Disconnected"
+        },
+        false,
+    );
+    drop(terminal);
+    drop(title);
+    // Cancelled discovery uses blocking HTTP. Do not wait for it during detach.
+    runtime.shutdown_timeout(Duration::ZERO);
+    let result = result?.unwrap_or_default();
+    let exit_code = exec_exit_code(&result);
+    if exit_code == 0 {
+        Ok(RunOutcome::Success)
+    } else {
+        Ok(RunOutcome::Exit(exit_code))
+    }
+}
+
+async fn run_ssh_connected(
+    config: Config,
+    mut command: SshCommand,
+    session_name: Option<String>,
+    title: Option<&ui::TerminalTitleGuard>,
+    display: &ui::TerminalDisplay,
+    local_input: tokio::sync::mpsc::Receiver<ExecInput>,
+    input_ready: Arc<AtomicBool>,
+) -> Result<ExecResult> {
+    let discovery_config = config.clone();
+    let reference = command.id.clone();
+    let override_endpoint = command.endpoint.clone();
+    let (box_id, endpoint) = tokio::task::spawn_blocking(move || {
+        resolve_agent_endpoint(&discovery_config, &reference, override_endpoint.as_deref())
+    })
+    .await
+    .context("join box discovery")??;
+    if command.read_only {
+        sessions::view(&config, &command, &box_id, &endpoint, title).await?;
+        return Ok(ExecResult::default());
+    }
     let materials = agent_materials(&config, &box_id)?;
     let env = ssh_environment(
         &command.env,
@@ -2732,51 +2799,26 @@ fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<R
     let mut argv = ssh_command_argv(&command.argv);
     let ca_pem = materials.ca.certificate_pem.clone();
     let client_identity = materials.client;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("create async runtime for pbox-agent shell")?;
-    let style = ui::stderr();
-    let connection = runtime.block_on(async {
-        let connect = async {
-            let mut client =
-                relay::connect_agent(&config, &endpoint, &box_id, &ca_pem, &client_identity)
-                    .await
-                    .context("connect to pbox-agent")?;
-            let info = client
-                .info()
+    let connection = async {
+        let mut client =
+            relay::connect_agent(&config, &endpoint, &box_id, &ca_pem, &client_identity)
                 .await
-                .context("validate pbox-agent identity")?;
-            Ok::<_, anyhow::Error>((client, info))
-        };
-        tokio::pin!(connect);
-        let mut frames = tokio::time::interval(Duration::from_millis(120));
-        let started = Instant::now();
-        let mut frame = 0;
-        loop {
-            tokio::select! {
-                result = &mut connect => break result,
-                _ = frames.tick() => {
-                    if started.elapsed() >= Duration::from_secs(3) {
-                        if style.can_animate() {
-                            style.spinner(['|', '/', '-', '\\'][frame % 4], "Connecting to your box");
-                        } else if frame == 0 {
-                            style.progress("Connecting to your box");
-                        }
-                        frame += 1;
-                    }
-                }
-            }
-        }
-    });
-    style.clear_progress_line();
-    let prepared = runtime.block_on(agent_update::prepare(
+                .context("connect to pbox-agent")?;
+        let info = client
+            .info()
+            .await
+            .context("validate pbox-agent identity")?;
+        Ok::<_, anyhow::Error>((client, info))
+    }
+    .await;
+    let prepared = agent_update::prepare(
         &config,
         &box_id,
         &endpoint,
         connection?,
         agent_update::Options::default(),
-    ))?;
+    )
+    .await?;
     if session_name.is_some() {
         prepared.require("terminal-sessions", &box_id)?;
     }
@@ -2806,17 +2848,10 @@ fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<R
         } else {
             &command.user
         };
-        let access = runtime.block_on(guest::check_client(&mut client, user));
+        let access = guest::check_client(&mut client, user).await;
         ui::user_access(&info.box_id, user, access);
     }
-    if let Some(name) = &session_name {
-        ui::session_connected(&info.box_id, name);
-    }
-    let signals = runtime.block_on(install_terminal_signals())?;
-    let terminal = TerminalModeGuard::enter()?;
-    let title = ui::TerminalTitleGuard::enter(&box_name);
-    let display = ui::TerminalDisplay::default();
-    let result = runtime.block_on(run_ssh_session_with_signals(
+    run_ssh_session(
         &mut client,
         pbox_agent_client::ExecRequest {
             argv,
@@ -2826,21 +2861,12 @@ fn run_ssh(store: &ConfigStore, mut command: SshCommand, json: bool) -> Result<R
             session_name: session_name.clone().unwrap_or_default(),
             ..Default::default()
         },
-        (terminal.as_ref(), title.as_ref(), &display),
-        signals,
-    ));
-    if result.is_err() || session_name.is_some() {
-        display.restore();
-    }
-    drop(terminal);
-    drop(title);
-    let result = result?;
-    let exit_code = exec_exit_code(&result);
-    if exit_code == 0 {
-        Ok(RunOutcome::Success)
-    } else {
-        Ok(RunOutcome::Exit(exit_code))
-    }
+        title,
+        display,
+        local_input,
+        input_ready,
+    )
+    .await
 }
 
 fn parse_env_entry(entry: &str) -> Result<(String, String)> {
@@ -2973,8 +2999,7 @@ async fn install_terminal_signals() -> Result<TerminalSignals> {
 }
 
 async fn run_ssh_session_with_signals(
-    client: &mut AgentClient,
-    request: pbox_agent_client::ExecRequest,
+    operation: impl std::future::Future<Output = Result<ExecResult>>,
     terminal: (
         Option<&TerminalModeGuard>,
         Option<&ui::TerminalTitleGuard>,
@@ -2991,7 +3016,7 @@ async fn run_ssh_session_with_signals(
             mut terminate,
         } = signals;
         tokio::select! {
-            result = run_ssh_session(client, request, terminal.1.map(|title| title.name.as_str()), terminal.2) => result,
+            result = operation => result,
             _ = interrupt.recv() => terminate_after_signal(terminal, 128 + 2),
             _ = hangup.recv() => terminate_after_signal(terminal, 128 + 1),
             _ = quit.recv() => terminate_after_signal(terminal, 128 + 3),
@@ -3001,13 +3026,7 @@ async fn run_ssh_session_with_signals(
     #[cfg(not(unix))]
     {
         let _ = (terminal, signals);
-        run_ssh_session(
-            client,
-            request,
-            terminal.1.map(|title| title.name.as_str()),
-            terminal.2,
-        )
-        .await
+        operation.await
     }
 }
 
@@ -3033,8 +3052,10 @@ fn terminate_after_signal(
 async fn run_ssh_session(
     client: &mut AgentClient,
     request: pbox_agent_client::ExecRequest,
-    title: Option<&str>,
+    title: Option<&ui::TerminalTitleGuard>,
     display: &ui::TerminalDisplay,
+    local_input: tokio::sync::mpsc::Receiver<ExecInput>,
+    input_ready: Arc<AtomicBool>,
 ) -> Result<ExecResult> {
     let size = terminal_size();
     let (terminal_rows, terminal_cols) = size;
@@ -3069,12 +3090,12 @@ async fn run_ssh_session(
             .await
     }
     .context("open terminal session")?;
-    let (input_sender, local_input) = tokio::sync::mpsc::channel(32);
-    let _input_thread = thread::spawn(move || pump_terminal_input(input_sender, persistent));
+    ui::ssh_connection_state(title, "Connected", false);
+    input_ready.store(true, Ordering::Release);
     let input = forward_terminal_input(local_input, session.input.clone(), size);
     let output = async {
         let mut result = ExecResult::default();
-        let mut titles = ui::TitlePrefix::new(title);
+        let mut titles = ui::TitlePrefix::new(title.map(|t| t.name.as_str()));
         loop {
             let event = session.output.message().await;
             let Some(event) = event.context("read pbox-agent PTY output")? else {
@@ -3233,54 +3254,6 @@ async fn write_pty_output(data: Vec<u8>, stderr: bool) -> Result<()> {
     .await
     .context("join PTY output writer")?;
     result.context("write PTY output")
-}
-
-fn pump_terminal_input(sender: tokio::sync::mpsc::Sender<ExecInput>, persistent: bool) {
-    let stdin = io::stdin();
-    let mut stdin = stdin.lock();
-    let mut buffer = [0_u8; 8192];
-    let mut input = sessions::TerminalInput::default();
-    loop {
-        #[cfg(unix)]
-        if input.pending() {
-            let mut poll = nix::libc::pollfd {
-                fd: nix::libc::STDIN_FILENO,
-                events: nix::libc::POLLIN,
-                revents: 0,
-            };
-            // A lone Escape key must still reach the application promptly.
-            if unsafe { nix::libc::poll(&mut poll, 1, 30) } == 0
-                && sender
-                    .blocking_send(ExecInput::Data(input.flush()))
-                    .is_err()
-            {
-                break;
-            }
-        }
-        let count = match stdin.read(&mut buffer) {
-            Ok(count) => count,
-            Err(error) => {
-                ui::stderr().error(&format!("read terminal input: {error}"));
-                break;
-            }
-        };
-        if count == 0 {
-            let _ = sender.blocking_send(ExecInput::Eof);
-            break;
-        }
-        let (bytes, detach) = if persistent {
-            input.push(&buffer[..count])
-        } else {
-            (buffer[..count].to_vec(), false)
-        };
-        if !bytes.is_empty() && sender.blocking_send(ExecInput::Data(bytes)).is_err() {
-            break;
-        }
-        if detach {
-            let _ = sender.blocking_send(ExecInput::Detach);
-            break;
-        }
-    }
 }
 
 #[cfg(unix)]

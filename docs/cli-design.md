@@ -258,6 +258,13 @@ rewrite scroll margins or reconstruct cursor positions. Terminal emulation is
 only for snapshots and the read-only viewer, never for decorating a live stream.
 Keep plain URLs and OSC 8 hyperlinks intact. Text selection and link activation
 belong to the host terminal; pbox must not capture their mouse events.
+Local input starts before discovery and connection. Ctrl+] cancels locally during
+discovery, authentication, agent preparation, terminal opening and stalled network
+writes. It does not wait for an agent reply. Keys typed before the terminal opens
+are discarded, not replayed later. Connection state appears in the terminal title
+and as short stderr messages: Connecting, Connected, Detached or Disconnected.
+The live guest screen keeps its full dimensions. Failed connections return an
+error; commands and input are never retried automatically.
 Native scrollback belongs to the host terminal. No pbox-owned alternate screen
 or screen clear is used on entry or exit. Show the session and detach key in the
 connection message and keep the box name in the terminal title.

@@ -412,19 +412,6 @@ impl CliStyle {
         self.interactive
     }
 
-    pub(crate) fn spinner(self, frame: char, message: &str) {
-        if self.interactive {
-            eprint!(
-                "\r\x1b[2K{} {}",
-                self.paint(ANSI_CYAN, &frame.to_string()),
-                self.paint(ANSI_BOLD, message)
-            );
-            let _ = io::stderr().flush();
-        } else {
-            self.progress(message);
-        }
-    }
-
     pub(crate) fn clear_progress_line(self) {
         if self.interactive {
             eprint!("\r\x1b[2K");
@@ -1302,6 +1289,37 @@ impl Drop for TerminalTitleGuard {
     }
 }
 
+/// Connection state belongs to the local terminal, not the guest screen.
+pub(crate) fn ssh_connection_state(title: Option<&TerminalTitleGuard>, state: &str, waiting: bool) {
+    if let Some(title) = title {
+        let mut output = io::stderr().lock();
+        let _ = write!(
+            output,
+            "\x1b]2;{} - {}\x07",
+            title.name,
+            safe_terminal_text(state)
+        );
+        let _ = output.flush();
+    }
+    if io::stdin().is_terminal() {
+        let mut output = io::stderr().lock();
+        let hint = if waiting {
+            " | Ctrl+] detach | typing is ignored until connected"
+        } else if state == "Connected" {
+            " | Ctrl+] detach"
+        } else {
+            ""
+        };
+        let _ = write!(
+            output,
+            "\r\npbox: {}{}\r\n",
+            safe_terminal_text(state),
+            hint
+        );
+        let _ = output.flush();
+    }
+}
+
 /// Recognise only OSC title headers; all other bytes pass through unchanged.
 /// Buffer at most the four-byte header, including across transport chunks.
 pub(crate) struct TitlePrefix {
@@ -1407,11 +1425,6 @@ pub(crate) fn image_search_results(entries: &[super::images::ImageSearchEntry]) 
     }
     style.stdout_hint("List versions: pbox image tags IMAGE");
     style.stdout_hint("Create a box:  pbox new --image IMAGE:TAG");
-}
-
-pub(crate) fn session_connected(box_id: &str, name: &str) {
-    stderr().progress(&format!("Connected to {box_id} · {name}"));
-    stderr().hint("Ctrl-] detaches. Type exit to end this shell.");
 }
 
 /// A decoded guest screen is data, without headings, styling or terminal escapes.
@@ -2326,6 +2339,11 @@ pub(crate) struct SessionViewer {
     status: Option<TerminalStatus>,
     previous: Vec<String>,
     previous_size: (u32, u32),
+}
+impl Drop for SessionViewer {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 impl SessionViewer {
     pub(crate) fn monitor_resources(&self, config: super::Config, id: String) {
