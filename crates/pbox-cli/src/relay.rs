@@ -100,6 +100,17 @@ fn check(store: &ConfigStore, json: bool) -> Result<()> {
         .url
         .as_deref()
         .context("relay.url is not configured")?;
+    if config.relay.key_file.is_none() {
+        let response = reqwest::blocking::get(health_url(url)?)?;
+        anyhow::ensure!(response.status().is_success() && response.text()?.trim() == "ok", "relay health check failed");
+        if json {
+            ui::json_text(&serde_json::json!({"relay": url, "healthy": true, "authentication": "pve-visibility", "access_checked": false}).to_string());
+        } else {
+            ui::stdout().success("Relay is reachable");
+            ui::stdout().hint("PVE visibility is checked separately for each box connection.");
+        }
+        return Ok(());
+    }
     let key_path = config
         .relay
         .key_file
@@ -255,6 +266,38 @@ pub async fn connect_agent(
     ca_pem: &str,
     identity: &CertificateMaterial,
 ) -> Result<AgentClient> {
+    if endpoint == ENDPOINT && config.relay.key_file.is_none() {
+        let url = config
+            .relay
+            .url
+            .as_deref()
+            .context("relay.url is not configured")?;
+        let token_id = config
+            .pve
+            .token_id
+            .as_deref()
+            .context("pve.token_id is not configured")?;
+        let secret = config
+            .pve
+            .token_secret
+            .as_ref()
+            .context("pve.token_secret is not configured")?;
+        let credentials =
+            pbox_relay::access::request(url, box_id, token_id, secret.expose()).await?;
+        let identity = credentials.identity()?;
+        let access = RelayAccess {
+            url: url.to_owned(),
+            token: credentials.relay_token,
+        };
+        return Ok(AgentClient::connect_with_relay(
+            endpoint,
+            box_id,
+            &credentials.ca_pem,
+            &identity,
+            Some(&access),
+        )
+        .await?);
+    }
     let relay = if endpoint == ENDPOINT {
         Some(access(config, box_id, "client")?)
     } else {

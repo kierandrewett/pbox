@@ -5563,7 +5563,9 @@ fn resolve_agent_endpoint(
 
 fn agent_endpoint(config: &Config, record: &BoxRecord) -> Result<String> {
     if config.relay.url.is_some() {
-        relay::access(config, &record.id.to_string(), "client")?;
+        if config.relay.key_file.is_some() {
+            relay::access(config, &record.id.to_string(), "client")?;
+        }
         return Ok(relay::ENDPOINT.to_owned());
     }
     let ip = record
