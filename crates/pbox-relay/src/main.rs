@@ -11,6 +11,14 @@ struct Args {
     key_file: PathBuf,
     #[arg(long, default_value_t = 1024)]
     max_connections: usize,
+    /// Enable PVE visibility authentication using an administrator-owned JSON file.
+    #[arg(long, env = "PBOX_RELAY_ACCESS_FILE")]
+    access_file: Option<PathBuf>,
+    /// Export identity files for an enrolled box instead of starting the relay.
+    #[arg(long, requires_all = ["access_file", "guest_directory"])]
+    export_guest: Option<String>,
+    #[arg(long, requires = "export_guest")]
+    guest_directory: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -19,7 +27,36 @@ async fn main() -> Result<()> {
     let key = tokio::fs::read_to_string(&args.key_file)
         .await
         .context("read relay key file")?;
-    let app = pbox_relay::server::router(key.trim().to_owned(), args.max_connections)?;
+    let mut app = pbox_relay::server::router(key.trim().to_owned(), args.max_connections)?;
+    if let Some(path) = args.access_file {
+        let settings: pbox_relay::access::Settings =
+            serde_json::from_slice(&tokio::fs::read(path).await?)?;
+        settings.validate()?;
+        if let Some(id) = args.export_guest {
+            anyhow::ensure!(settings.boxes.contains_key(&id), "box is not enrolled");
+            let directory = args
+                .guest_directory
+                .context("guest directory is required")?;
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+            let (identity, ca) = pbox_relay::access::guest_identity(key.trim(), &id)?;
+            for (name, contents) in [
+                ("server.pem", identity.certificate_pem),
+                ("server-key.pem", identity.private_key_pem),
+                ("client-ca.pem", ca),
+            ] {
+                use std::{io::Write, os::unix::fs::OpenOptionsExt};
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(directory.join(name))?;
+                file.write_all(contents.as_bytes())?;
+            }
+            return Ok(());
+        }
+        app = app.merge(pbox_relay::access::router(settings, key.trim().to_owned())?);
+    }
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
         .context("bind relay listener")?;

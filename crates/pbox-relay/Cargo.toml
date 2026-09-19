@@ -14,6 +14,10 @@ pkg-fmt = "tgz"
 
 [dependencies]
 anyhow.workspace = true
+pbox-crypto = { version = "0.1.14", path = "../pbox-crypto" }
+reqwest.workspace = true
+pem.workspace = true
+time.workspace = true
 clap.workspace = true
 tokio.workspace = true
 serde.workspace = true

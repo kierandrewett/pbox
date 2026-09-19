@@ -1,5 +1,6 @@
 //! Outbound WebSocket transport. The byte stream carries the agent's existing mutual TLS.
 
+pub mod access;
 pub mod server;
 
 use anyhow::{Context, Result, bail};

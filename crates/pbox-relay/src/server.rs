@@ -61,7 +61,7 @@ async fn check(
         .unwrap_or("");
     if matches!(role.as_str(), "agent" | "client")
         && valid_route(&box_id)
-        && authorised(&state.key, &role, &box_id, token)
+        && authorised_connection(&state.key, &role, &box_id, token)
     {
         StatusCode::NO_CONTENT
     } else {
@@ -82,7 +82,7 @@ async fn upgrade(
         .unwrap_or("");
     if !matches!(role.as_str(), "agent" | "client")
         || !valid_route(&box_id)
-        || !authorised(&state.key, &role, &box_id, token)
+        || !authorised_connection(&state.key, &role, &box_id, token)
     {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -147,6 +147,18 @@ async fn remove_waiter(state: &Relay, box_id: &str, generation: u64) {
     if waiting.get(box_id).is_some_and(|(id, _)| *id == generation) {
         waiting.remove(box_id);
     }
+}
+
+fn authorised_connection(master: &str, role: &str, id: &str, token: &str) -> bool {
+    if role == "client" && token.starts_with("v2.") {
+        return crate::access::authorised(
+            master,
+            id,
+            token,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        );
+    }
+    authorised(master, role, id, token)
 }
 
 async fn wait_and_forward(
