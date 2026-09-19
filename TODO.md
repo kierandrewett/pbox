@@ -1,5 +1,12 @@
 # Follow-up work
 
+PVE visibility authentication:
+
+- [x] Issue per-box client credentials after a live PVE visibility check.
+- [x] Connect the CLI without a local relay key and provide guest enrolment.
+- [x] Test denial, expiry, cross-box isolation, and authenticated shell access.
+- [x] Deploy and migrate ornadb-dev through verified host access.
+
 Use [GitHub issues](https://github.com/kierandrewett/pbox/issues) to track work.
 
 Current documented limitations:
