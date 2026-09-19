@@ -102,9 +102,20 @@ fn check(store: &ConfigStore, json: bool) -> Result<()> {
         .context("relay.url is not configured")?;
     if config.relay.key_file.is_none() {
         let response = reqwest::blocking::get(health_url(url)?)?;
-        anyhow::ensure!(response.status().is_success() && response.text()?.trim() == "ok", "relay health check failed");
+        anyhow::ensure!(
+            response.status().is_success() && response.text()?.trim() == "ok",
+            "relay health check failed"
+        );
         if json {
-            ui::json_text(&serde_json::json!({"relay": url, "healthy": true, "authentication": "pve-visibility", "access_checked": false}).to_string());
+            ui::json_text(
+                &serde_json::json!({
+                    "relay": url,
+                    "healthy": true,
+                    "authentication": "pve-visibility",
+                    "access_checked": false,
+                })
+                .to_string(),
+            );
         } else {
             ui::stdout().success("Relay is reachable");
             ui::stdout().hint("PVE visibility is checked separately for each box connection.");
