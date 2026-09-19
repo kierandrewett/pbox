@@ -35,7 +35,9 @@ before human display. Calculate table padding before applying colour.
   into JSON stdout. `json_text` accepts already-serialised machine output only.
 - Interactive SSH saves the host terminal title, sets the box name, and
   restores the title on disconnect using the terminal title stack. Guest OSC 0/1/2 title
-  changes receive a `box-name · ` prefix, including across transport chunks. Terminals without title-stack support may not restore it.
+  changes receive a `box:session - Connected · ` prefix, including across transport
+  chunks. One-off commands omit the session name. Terminals without title-stack
+  support may not restore it.
 - Guest output from `exec`, one-off `ssh`, and transferred files are data streams.
   Preserve their bytes. Persistent interactive SSH also passes live terminal
   controls through, apart from the documented title prefixing.
@@ -265,6 +267,9 @@ are discarded, not replayed later. Connection state appears in the terminal titl
 and as short stderr messages: Connecting, Connected, Detached or Disconnected.
 The live guest screen keeps its full dimensions. Failed connections return an
 error; commands and input are never retried automatically.
+Read-only viewing uses the same local control path, with Ctrl+C as an additional
+exit key. The terminal input queue is bounded; a full interactive queue reports
+an error instead of blocking local control or silently dropping connected input.
 Native scrollback belongs to the host terminal. No pbox-owned alternate screen
 or screen clear is used on entry or exit. Show the session and detach key in the
 connection message and keep the box name in the terminal title.

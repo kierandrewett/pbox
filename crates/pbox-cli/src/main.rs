@@ -3095,7 +3095,8 @@ async fn run_ssh_session(
     let input = forward_terminal_input(local_input, session.input.clone(), size);
     let output = async {
         let mut result = ExecResult::default();
-        let mut titles = ui::TitlePrefix::new(title.map(|t| t.name.as_str()));
+        let connected_title = title.map(|title| format!("{} - Connected", title.name));
+        let mut titles = ui::TitlePrefix::new(connected_title.as_deref());
         loop {
             let event = session.output.message().await;
             let Some(event) = event.context("read pbox-agent PTY output")? else {
