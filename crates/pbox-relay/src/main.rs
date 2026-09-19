@@ -12,8 +12,11 @@ struct Args {
     #[arg(long, default_value_t = 1024)]
     max_connections: usize,
     /// Enable PVE visibility authentication using an administrator-owned JSON file.
-    #[arg(long, env = "PBOX_RELAY_ACCESS_FILE")]
+    #[arg(long, env = "PBOX_RELAY_ACCESS_FILE", requires = "authority_key_file")]
     access_file: Option<PathBuf>,
+    /// Server-only signing secret, separate from the legacy relay key.
+    #[arg(long, env = "PBOX_RELAY_AUTHORITY_KEY_FILE", requires = "access_file")]
+    authority_key_file: Option<PathBuf>,
     /// Export identity files for an enrolled box instead of starting the relay.
     #[arg(long, requires_all = ["access_file", "guest_directory"])]
     export_guest: Option<String>,
@@ -32,6 +35,13 @@ async fn main() -> Result<()> {
         let settings: pbox_relay::access::Settings =
             serde_json::from_slice(&tokio::fs::read(path).await?)?;
         settings.validate()?;
+        let authority = tokio::fs::read_to_string(
+            args.authority_key_file
+                .context("authority key file is required")?,
+        )
+        .await
+        .context("read authority key file")?;
+        pbox_relay::access::validate_authority(key.trim(), authority.trim())?;
         if let Some(id) = args.export_guest {
             anyhow::ensure!(settings.boxes.contains_key(&id), "box is not enrolled");
             let directory = args
@@ -39,7 +49,7 @@ async fn main() -> Result<()> {
                 .context("guest directory is required")?;
             use std::os::unix::fs::DirBuilderExt;
             std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
-            let (identity, ca) = pbox_relay::access::guest_identity(key.trim(), &id)?;
+            let (identity, ca) = pbox_relay::access::guest_identity(authority.trim(), &id)?;
             for (name, contents) in [
                 ("server.pem", identity.certificate_pem),
                 ("server-key.pem", identity.private_key_pem),
@@ -55,7 +65,11 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
-        app = app.merge(pbox_relay::access::router(settings, key.trim().to_owned())?);
+        app = app.merge(pbox_relay::access::router(
+            settings,
+            key.trim().to_owned(),
+            authority.trim().to_owned(),
+        )?);
     }
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await

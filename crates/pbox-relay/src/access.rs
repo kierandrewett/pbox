@@ -29,6 +29,7 @@ pub struct Settings {
 struct Issuer {
     settings: Settings,
     master: String,
+    authority: String,
     http: reqwest::Client,
     slots: tokio::sync::Semaphore,
 }
@@ -98,9 +99,10 @@ pub fn guest_identity(master: &str, id: &str) -> Result<(CertificateMaterial, St
     Ok((server, authority.certificate_pem))
 }
 
-pub fn router(settings: Settings, master: String) -> Result<Router> {
+pub fn router(settings: Settings, master: String, authority: String) -> Result<Router> {
     settings.validate()?;
     ensure!(master.len() >= 32, "relay key is too short");
+    validate_authority(&master, &authority)?;
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(10))
@@ -110,9 +112,20 @@ pub fn router(settings: Settings, master: String) -> Result<Router> {
         .with_state(Arc::new(Issuer {
             settings,
             master,
+            authority,
             http,
             slots: tokio::sync::Semaphore::new(32),
         })))
+}
+
+/// Legacy clients can hold the relay key, so it must not sign new identities.
+pub fn validate_authority(master: &str, authority: &str) -> Result<()> {
+    ensure!(authority.len() >= 32, "authority key is too short");
+    ensure!(
+        authority != master,
+        "authority key must differ from the relay key"
+    );
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -170,14 +183,14 @@ async fn issue(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    match issue_credentials(&state.master, &id) {
+    match issue_credentials(&state.master, &state.authority, &id) {
         Ok(credentials) => ([("cache-control", "no-store")], Json(credentials)).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
-fn issue_credentials(master: &str, id: &str) -> Result<Credentials> {
-    let authority = ca(master, id)?;
+fn issue_credentials(master: &str, authority: &str, id: &str) -> Result<Credentials> {
+    let authority = ca(authority, id)?;
     let identity = issue_certificate(
         &authority,
         "pbox.cwd.dev/pve-visible",
@@ -252,6 +265,7 @@ pub async fn request(
 mod tests {
     use super::*;
     const MASTER: &str = "test-master-key-with-at-least-32-characters";
+    const AUTHORITY: &str = "separate-server-only-authority-key-32-characters";
     #[tokio::test]
     async fn issuer_requires_current_visibility_and_never_follows_redirects() {
         use axum::routing::get;
@@ -297,6 +311,7 @@ mod tests {
                     boxes: BTreeMap::from([("pbx_12345678".into(), 9002)]),
                 },
                 master: MASTER.into(),
+                authority: AUTHORITY.into(),
                 http: reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
@@ -346,7 +361,7 @@ mod tests {
     }
     #[test]
     fn credentials_expire_and_cannot_cross_boxes() {
-        let c = issue_credentials(MASTER, "pbx_12345678").unwrap();
+        let c = issue_credentials(MASTER, AUTHORITY, "pbx_12345678").unwrap();
         assert!(authorised(
             MASTER,
             "pbx_12345678",
@@ -376,6 +391,19 @@ mod tests {
             ca(MASTER, "pbx_87654321").unwrap().private_key_der
         );
         assert!(c.identity().is_ok());
+    }
+    #[test]
+    fn legacy_relay_key_cannot_derive_the_guest_authority() {
+        assert!(validate_authority(MASTER, MASTER).is_err());
+        assert!(validate_authority(MASTER, "short").is_err());
+        assert!(validate_authority(MASTER, AUTHORITY).is_ok());
+        let c = issue_credentials(MASTER, AUTHORITY, "pbx_12345678").unwrap();
+        let (_, trusted_ca) = guest_identity(AUTHORITY, "pbx_12345678").unwrap();
+        assert_eq!(c.ca_pem, trusted_ca);
+        assert_ne!(
+            c.ca_pem,
+            ca(MASTER, "pbx_12345678").unwrap().certificate_pem
+        );
     }
     #[test]
     fn settings_reject_untrusted_origins_and_duplicate_vmids() {
