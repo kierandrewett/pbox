@@ -139,7 +139,7 @@ enum Command {
     Exec(ExecCommand),
     /// Copy files, or local directories with --recursive, between the control machine and a pbox.
     Scp(ScpCommand),
-    /// Forward a local TCP port to a pbox guest.
+    /// Forward a TCP port between this computer and a pbox guest.
     Forward(ForwardCommand),
     /// Open the installed desktop through an authenticated VNC tunnel.
     Desktop(desktop::DesktopCommand),
@@ -346,15 +346,18 @@ struct ScpCommand {
 struct ForwardCommand {
     /// Box ID, unique name, or current when exactly one box exists.
     id: String,
-    /// Local TCP port to listen on.
+    /// Local TCP port (listener normally, service target with --reverse).
     local_port: u16,
-    /// Local address to bind. Defaults to loopback.
+    /// Listener address (local normally, guest with --reverse). Defaults to loopback.
     #[arg(long, default_value = "127.0.0.1")]
     listen: String,
+    /// Let the guest connect to a service on this computer.
+    #[arg(long)]
+    reverse: bool,
     /// Agent endpoint override. By default pbox resolves the guest address from PVE.
     #[arg(long)]
     endpoint: Option<String>,
-    /// Guest TCP host. Defaults to 127.0.0.1.
+    /// Target host (guest normally, this computer with --reverse).
     #[arg(long, default_value = "127.0.0.1")]
     remote_host: String,
     /// Guest TCP port. Defaults to the local port.
@@ -558,6 +561,8 @@ struct ForwardOutput {
     id: String,
     local: String,
     remote: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direction: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2538,6 +2543,33 @@ fn run_forward(
         .build()
         .context("create async runtime for pbox-agent forwarding")?;
     runtime.block_on(async move {
+        if command.reverse {
+            let mut client = relay::connect_agent(
+                &config, &endpoint, &box_id, &ca_pem, &client_identity,
+            ).await.context("connect to pbox-agent")?;
+            client.info().await.context("validate pbox-agent identity")?;
+            let session = client.reverse_forward(&listen, remote_port, &remote_host, local_port)
+                .await.context("start guest listener")?;
+            let output = ForwardOutput {
+                id: box_id,
+                local: format!("{}:{}", remote_host, local_port),
+                remote: session.guest_address.clone(),
+                direction: Some("guest-to-local"),
+            };
+            if json {
+                ui::json_text(&(serde_json::to_string_pretty(&output)?));
+            } else {
+                ui::stdout().forward_ready(&output.local, &output.remote, true);
+            }
+            tokio::select! {
+                result = session.run() => result.context("reverse forward connection"),
+                result = tokio::signal::ctrl_c() => {
+                    result.context("wait for Ctrl-C")?;
+                    Ok(())
+                }
+            }?;
+            return Ok(());
+        }
         let listener = TcpListener::bind((listen.as_str(), local_port))
             .await
             .with_context(|| format!("bind local forwarding address {listen}:{local_port}"))?;
@@ -2548,12 +2580,12 @@ fn run_forward(
             id: box_id.clone(),
             local: local_address.to_string(),
             remote: format!("{}:{}", remote_host, remote_port),
+            direction: None,
         };
         if json {
             ui::json_text(&(serde_json::to_string_pretty(&output)?));
         } else {
-            ui::stdout().success(&format!("forwarding {} -> {} (press Ctrl-C to stop)",
-                output.local, output.remote));
+            ui::stdout().forward_ready(&output.local, &output.remote, false);
         }
         let connection_slots = Arc::new(Semaphore::new(MAX_FORWARD_CONNECTIONS));
         let shutdown = tokio::signal::ctrl_c();
@@ -4558,7 +4590,7 @@ fn run_restart(
             let action = if force { "Force stopping" } else { "Stopping" };
             style.progress(&format!("{action} box {}...", record.id));
         }
-        stop_box(&client, &record, force, (!json).then_some(style))
+        stop_for_restart(&client, &record, force, (!json).then_some(style))
             .with_context(|| restart_stop_hint(&record, force))?;
         anyhow::ensure!(
             client.get_lxc_state(&record.node, record.vmid)? == "stopped",
@@ -4573,6 +4605,42 @@ fn run_restart(
         ));
     }
     start_box(&config, &client, &record, json, color)
+}
+
+fn stop_for_restart(
+    client: &impl PveApi,
+    record: &BoxRecord,
+    force: bool,
+    progress: Option<CliStyle>,
+) -> Result<()> {
+    if force {
+        return stop_box(client, record, true, progress);
+    }
+
+    match stop_box(client, record, false, progress) {
+        Ok(()) => Ok(()),
+        Err(graceful_error)
+            if graceful_error
+                .chain()
+                .any(|cause| cause.downcast_ref::<PveTaskFailure>().is_some()) =>
+        {
+            let state = client
+                .get_lxc_state(&record.node, record.vmid)
+                .context("check box state after graceful shutdown failed")?;
+            if state == "stopped" {
+                return Ok(());
+            }
+            if let Some(style) = progress {
+                style.progress(&format!(
+                    "Graceful shutdown failed; force stopping box {}...",
+                    record.id
+                ));
+            }
+            stop_box(client, record, true, progress)
+                .context("force stop after graceful shutdown failed")
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn run_stop(
@@ -5874,6 +5942,7 @@ mod tests {
         oci_tags: RefCell<Vec<String>>,
         task_log: RefCell<Vec<PveTaskLog>>,
         fail_next_task: RefCell<bool>,
+        fail_graceful_shutdown: RefCell<bool>,
         next_task_exit: RefCell<Option<String>>,
         fail_create: RefCell<bool>,
         fail_updates: RefCell<bool>,
@@ -5922,6 +5991,7 @@ mod tests {
                 task_log: RefCell::new(Vec::new()),
                 fail_create: RefCell::new(false),
                 fail_next_task: RefCell::new(false),
+                fail_graceful_shutdown: RefCell::new(false),
                 next_task_exit: RefCell::new(None),
                 fail_updates: RefCell::new(false),
             }
@@ -5929,6 +5999,9 @@ mod tests {
 
         fn fail_next_task(&self) {
             *self.fail_next_task.borrow_mut() = true;
+        }
+        fn fail_graceful_shutdown(&self) {
+            *self.fail_graceful_shutdown.borrow_mut() = true;
         }
         fn set_task_log(&self, entries: Vec<PveTaskLog>) {
             *self.task_log.borrow_mut() = entries;
@@ -6120,12 +6193,16 @@ mod tests {
 
         fn shutdown_lxc(&self, _node: &str, _vmid: u64) -> Result<PveTaskResponse, PveError> {
             self.events.borrow_mut().push("shutdown".to_owned());
-            *self.current_state.borrow_mut() = "stopped".to_owned();
+            if !self.fail_graceful_shutdown.replace(false) {
+                *self.current_state.borrow_mut() = "stopped".to_owned();
+            }
             Ok(Self::task("shutdown"))
         }
 
         fn stop_lxc(&self, _node: &str, _vmid: u64) -> Result<PveTaskResponse, PveError> {
-            Err(Self::unsupported())
+            self.events.borrow_mut().push("stop".to_owned());
+            *self.current_state.borrow_mut() = "stopped".to_owned();
+            Ok(Self::task("stop"))
         }
 
         fn clone_lxc(
@@ -6248,6 +6325,31 @@ mod tests {
             *fake.events.borrow(),
             ["shutdown", "wait:shutdown", "start", "wait:start"]
         );
+    }
+
+    #[test]
+    fn restart_escalates_a_failed_graceful_shutdown_before_starting() {
+        let record = test_record();
+        let fake = FakePve::new(&test_metadata(&record), "test");
+        *fake.current_state.borrow_mut() = "running".to_owned();
+        fake.fail_graceful_shutdown();
+        fake.fail_next_task();
+
+        super::stop_for_restart(&fake, &record, false, None).unwrap();
+        super::ensure_box_started_with_progress(&fake, &record, None).unwrap();
+
+        assert_eq!(
+            *fake.events.borrow(),
+            [
+                "shutdown",
+                "wait:shutdown",
+                "stop",
+                "wait:stop",
+                "start",
+                "wait:start"
+            ]
+        );
+        assert_eq!(*fake.current_state.borrow(), "running");
     }
 
     #[test]
@@ -7297,6 +7399,7 @@ mod tests {
             id: "pbx_t3yzd9y3".to_owned(),
             local_port: 3000,
             listen: "127.0.0.1".to_owned(),
+            reverse: false,
             endpoint: Some("https://127.0.0.1:7443".to_owned()),
             remote_host: "127.0.0.1".to_owned(),
             remote_port: None,
@@ -7311,6 +7414,24 @@ mod tests {
         nul_host.local_port = 3000;
         nul_host.remote_host.push('\0');
         assert!(validate_forward_arguments(&nul_host).is_err());
+    }
+
+    #[test]
+    fn reverse_forward_receipt_identifies_direction_without_changing_normal_schema() {
+        let output = super::ForwardOutput {
+            id: "pbx_t3yzd9y3".to_owned(),
+            local: "127.0.0.1:3000".to_owned(),
+            remote: "127.0.0.1:3000".to_owned(),
+            direction: None,
+        };
+        let normal = serde_json::to_value(&output).unwrap();
+        assert!(normal.get("direction").is_none());
+        let reverse = serde_json::to_value(super::ForwardOutput {
+            direction: Some("guest-to-local"),
+            ..output
+        })
+        .unwrap();
+        assert_eq!(reverse["direction"], "guest-to-local");
     }
 
     #[test]

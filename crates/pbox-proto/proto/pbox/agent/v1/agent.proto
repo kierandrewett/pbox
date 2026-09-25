@@ -15,6 +15,7 @@ service Agent {
   rpc PutFile(stream FileChunk) returns (FileResult);
   rpc GetFile(GetFileRequest) returns (stream FileChunk);
   rpc Forward(stream ForwardEvent) returns (stream ForwardEvent);
+  rpc ReverseForward(stream ReverseForwardEvent) returns (stream ReverseForwardEvent);
 }
 
 message InfoRequest {}
@@ -153,4 +154,16 @@ message ForwardOpen {
 message ForwardClose {
   uint32 code = 1;
   bool half_close = 2;
+}
+
+// One authenticated stream owns a guest listener and multiplexes its connections.
+message ReverseForwardEvent {
+  uint64 connection_id = 1;
+  oneof event {
+    ForwardOpen listen = 2;
+    string ready = 3;
+    bool connected = 4;
+    bytes data = 5;
+    ForwardClose close = 6;
+  }
 }

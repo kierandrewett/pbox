@@ -185,6 +185,7 @@ Replace `BOX` with an ID, unique name or `current`.
 | Run a command | `pbox exec BOX -- uname -a` |
 | Copy a file into a box | `pbox scp ./file.txt BOX:/tmp/file.txt` |
 | Reach an app on port 3000 | `pbox forward BOX 3000` |
+| Let an app in the box reach a service on this computer | `pbox forward BOX 3000 --reverse` |
 | Stop / start / restart | `pbox stop BOX` / `pbox start BOX` / `pbox restart BOX` |
 | Delete | `pbox rm BOX` |
 | Find images | `pbox image search debian` |
@@ -193,6 +194,13 @@ Replace `BOX` with an ID, unique name or `current`.
 `pbox list` uses a background inventory cache; changes can take a refresh to
 appear. Use `pbox COMMAND --help` for options and `--json` for structured
 results where supported.
+
+`pbox forward BOX 3000` listens on this computer and connects to port 3000 in
+the guest. Add `--reverse` to listen on port 3000 in the guest and connect to
+port 3000 on this computer. Both listeners default to loopback. Use
+`--remote-port` to change the guest port, `--remote-host` to change the target
+host, and `--listen` to change the listener address. Reverse forwarding needs
+an updated guest agent.
 
 ### Terminal sessions
 

@@ -1,4 +1,5 @@
 mod pty;
+mod reverse;
 mod sessions;
 mod terminal_host;
 mod workspace;
@@ -53,9 +54,14 @@ const EXEC_STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const EXEC_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const PTY_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const EXEC_COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-const CONNECTION_MAX_AGE: Duration = Duration::from_secs(60 * 60);
-const CONNECTION_MAX_AGE_GRACE: Duration = Duration::from_secs(30);
 static NEXT_UPLOAD_ID: AtomicU64 = AtomicU64::new(0);
+
+// A live authenticated connection may carry an interactive PTY indefinitely.
+// Per-connection age belongs on bounded one-shot work, not on the transport
+// that owns a persistent shell.
+fn agent_connection_age_policy() -> Option<(Duration, Duration)> {
+    None
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "pbox-agent", about = "Authenticated pbox guest agent")]
@@ -262,6 +268,7 @@ impl Agent for AgentService {
         Pin<Box<dyn tokio_stream::Stream<Item = Result<FileChunk, Status>> + Send>>;
     type ForwardStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<ForwardEvent, Status>> + Send>>;
+    type ReverseForwardStream = reverse::EventStream;
 
     async fn info(&self, _request: Request<InfoRequest>) -> Result<Response<InfoResponse>, Status> {
         let terminal_capabilities = if let Some(host) = &self.terminal_host {
@@ -291,6 +298,7 @@ impl Agent for AgentService {
                 "session-control".to_owned(),
                 "files".to_owned(),
                 "forward".to_owned(),
+                "reverse-forward".to_owned(),
             ]
             .into_iter()
             .chain(
@@ -707,6 +715,13 @@ impl Agent for AgentService {
             .await;
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
+
+    async fn reverse_forward(
+        &self,
+        request: Request<Streaming<pbox_proto::agent::ReverseForwardEvent>>,
+    ) -> Result<Response<Self::ReverseForwardStream>, Status> {
+        reverse::serve(request, self.forward_slots.clone()).await
     }
 }
 
@@ -1853,9 +1868,17 @@ async fn serve() -> Result<()> {
     let terminal_host = terminal_host::managed(args.max_exec).await?;
     let incoming = LimitedIncoming::new(listener, connection_slots, tls);
     println!("pbox-agent listening on {}", args.listen);
-    Server::builder()
-        .max_connection_age(CONNECTION_MAX_AGE)
-        .max_connection_age_grace(CONNECTION_MAX_AGE_GRACE)
+    // Let h2 grow flow-control windows with sustained terminal output. The
+    // default 64 KiB windows otherwise make a busy PTY repeatedly stop while
+    // waiting for window updates, which also delays interactive input.
+    let builder = Server::builder().http2_adaptive_window(Some(true));
+    let mut builder = match agent_connection_age_policy() {
+        Some((age, grace)) => builder
+            .max_connection_age(age)
+            .max_connection_age_grace(grace),
+        None => builder,
+    };
+    builder
         .add_service(AgentServer::new(AgentService {
             box_id: args.box_id,
             handshake_slots,
@@ -2155,23 +2178,10 @@ mod tests {
         assert_eq!((sessions[0].rows, sessions[0].cols), (40, 100));
         assert!(sessions[0].attached);
 
-        // A fresh connection moves the attachment; it does not start another shell.
+        // A fresh connection shares the attachment; it does not start another shell.
         let mut third = agent.terminal_session(request.clone()).await.unwrap();
         until(&mut third, "__state__retained:/").await;
-        // Already queued output can precede the takeover status (even the CRLF
-        // after the marker may arrive in another transport frame).
-        let error = tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                match second.output.message().await {
-                    Ok(Some(_)) => continue,
-                    Err(error) => break error,
-                    Ok(None) => panic!("old attachment ended without its cancellation status"),
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(error.code(), tonic::Code::Cancelled);
+        drop(second);
         let wrong_user = agent
             .terminal_session(ExecRequest {
                 user: "different-user".into(),
@@ -2619,6 +2629,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reverse_forward_connects_guest_clients_to_local_service() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target_listener.local_addr().unwrap().port();
+        let target_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = target_listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4];
+                    socket.read_exact(&mut request).await.unwrap();
+                    assert_eq!(&request, b"ping");
+                    socket.write_all(b"pong").await.unwrap();
+                });
+            }
+        });
+
+        let box_id = "pbx_t3yzd9y3";
+        let seed = derive_context_seed("pbox@pve!cli", "secret");
+        let ca = generate_context_ca(&seed).unwrap();
+        let server = issue_certificate(
+            &ca,
+            &server_subject(box_id).unwrap(),
+            CertificatePurpose::Server,
+        )
+        .unwrap();
+        let client = issue_certificate(
+            &ca,
+            "pbox.cwd.dev/context/test-client",
+            CertificatePurpose::Client,
+        )
+        .unwrap();
+        let (endpoint, task) = spawn_test_agent(box_id, server, &ca).await;
+        let mut agent = AgentClient::connect(&endpoint, box_id, &ca.certificate_pem, &client)
+            .await
+            .unwrap();
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let guest_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let session = agent
+            .reverse_forward("127.0.0.1", guest_port, "127.0.0.1", target_port)
+            .await
+            .unwrap();
+        assert_eq!(session.guest_address, format!("127.0.0.1:{guest_port}"));
+        let tunnel = tokio::spawn(session.run());
+        let client = || async move {
+            let mut socket = TcpStream::connect(("127.0.0.1", guest_port)).await.unwrap();
+            socket.write_all(b"ping").await.unwrap();
+            let mut response = [0u8; 4];
+            socket.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"pong");
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(client(), client());
+        })
+        .await
+        .unwrap();
+        target_task.await.unwrap();
+        tunnel.abort();
+        stop_test_agent(task).await;
+    }
+
+    #[tokio::test]
     async fn wrong_context_cannot_connect_to_agent() {
         let box_id = "pbx_t3yzd9y3";
         let server_seed = derive_context_seed("pbox@pve!cli", "secret");
@@ -2698,6 +2769,11 @@ mod tests {
             &networks,
             "10.0.0.1".parse().unwrap(),
         ));
+    }
+
+    #[test]
+    fn agent_does_not_force_expire_live_connections() {
+        assert!(agent_connection_age_policy().is_none());
     }
 
     #[test]

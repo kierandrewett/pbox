@@ -8,6 +8,7 @@ if [ -d /run/systemd/system ]; then
     # The drop-in avoids overwriting any locally managed ExecStart arguments.
     mkdir -p /etc/systemd/system/pbox-agent.service.d
     printf '%s\n' '[Unit]' 'StartLimitIntervalSec=0' '[Service]' 'Restart=always' 'RestartSec=1' \
+        'CPUWeight=1000' 'IOWeight=1000' 'MemoryLow=64M' 'OOMScoreAdjust=-900' \
         > /etc/systemd/system/pbox-agent.service.d/20-pbox-supervision.conf
     systemctl daemon-reload
     systemctl --no-block restart pbox-agent.service

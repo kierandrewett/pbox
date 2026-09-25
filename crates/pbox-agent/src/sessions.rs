@@ -25,7 +25,7 @@ struct State {
     info: TerminalSession,
     screen: vt100::Parser<TerminalModes>,
     generation: u64,
-    output: Option<mpsc::Sender<Result<ExecEvent, Status>>>,
+    outputs: Vec<mpsc::Sender<Result<ExecEvent, Status>>>,
 }
 
 pub(super) fn check_protocol(version: u32) -> Result<(), Status> {
@@ -69,10 +69,7 @@ impl Sessions {
             .map(|session| {
                 let state = session.state.lock().unwrap();
                 let mut info = state.info.clone();
-                info.attached = state
-                    .output
-                    .as_ref()
-                    .is_some_and(|output| !output.is_closed());
+                info.attached = state.outputs.iter().any(|output| !output.is_closed());
                 describe_processes(
                     &mut info,
                     session.pid.load(std::sync::atomic::Ordering::Relaxed),
@@ -159,7 +156,7 @@ impl Sessions {
                         TerminalModes::default(),
                     ),
                     generation: 0,
-                    output: None,
+                    outputs: Vec::new(),
                 }),
                 close: Notify::new(),
                 finished: watch::channel(false).0,
@@ -212,10 +209,7 @@ impl Sessions {
         let session = self.get(name)?;
         let state = session.state.lock().unwrap();
         let mut info = state.info.clone();
-        info.attached = state
-            .output
-            .as_ref()
-            .is_some_and(|output| !output.is_closed());
+        info.attached = state.outputs.iter().any(|output| !output.is_closed());
         let (row, col) = state.screen.screen().cursor_position();
         Ok(pbox_proto::agent::ReadSessionResponse {
             session: Some(info),
@@ -262,14 +256,8 @@ impl Sessions {
         let created = start.is_some();
         let (rows, cols) = dimensions(first.terminal_rows, first.terminal_cols)?;
         let (output, receiver) = mpsc::channel(64);
-        let generation = {
+        {
             let mut state = session.state.lock().unwrap();
-            state.generation += 1;
-            if let Some(previous) = state.output.take() {
-                let _ = previous.try_send(Err(Status::cancelled(
-                    "session moved to another connection",
-                )));
-            }
             // Snapshot and subscription are atomic with output processing, so no bytes
             // can be lost or replayed twice between the redraw and live delivery.
             state.screen.screen_mut().set_size(rows, cols);
@@ -277,12 +265,10 @@ impl Sessions {
                 let event = exec_event::Event::Stdout(redraw(&state.screen));
                 let _ = output.try_send(Ok(ExecEvent { event: Some(event) }));
             }
-            state.output = Some(output.clone());
+            state.outputs.push(output.clone());
             state.info.rows = rows.into();
             state.info.cols = cols.into();
-            session.attachment.send_replace(state.generation);
-            state.generation
-        };
+        }
         // Resize only the existing PTY; argv, cwd and environment remain its own.
         let _ = session.input.try_send(Ok(ExecRequest {
             protocol_version: PROTOCOL,
@@ -290,7 +276,7 @@ impl Sessions {
             terminal_cols: cols.into(),
             ..Default::default()
         }));
-        tokio::spawn(attachment(session.clone(), generation, requests, output));
+        tokio::spawn(attachment(session.clone(), requests, output));
         // Subscribe before starting the process so even immediate startup output
         // and terminal queries are delivered to the initial viewer.
         if let Some((input, permit)) = start {
@@ -309,17 +295,11 @@ impl Sessions {
 
 async fn attachment(
     session: Arc<Session>,
-    generation: u64,
     mut requests: Streaming<ExecRequest>,
     output: mpsc::Sender<Result<ExecEvent, Status>>,
 ) {
-    let mut attachment = session.attachment.subscribe();
     loop {
-        if *attachment.borrow_and_update() != generation {
-            break;
-        }
         let request = tokio::select! {
-            _ = attachment.changed() => continue,
             _ = output.closed() => break,
             request = tokio::time::timeout(EXEC_STREAM_IDLE_TIMEOUT, requests.message()) => request,
         };
@@ -353,35 +333,12 @@ async fn attachment(
             break;
         };
         let mut state = session.state.lock().unwrap();
-        if state.generation != generation {
-            break;
-        }
         if let Some((rows, cols)) = resize {
             state.screen.screen_mut().set_size(rows, cols);
             state.info.rows = rows.into();
             state.info.cols = cols.into();
         }
         permit.send(Ok(request));
-    }
-    let detached = {
-        let mut state = session.state.lock().unwrap();
-        if state.generation == generation {
-            state.output.take();
-            state.generation += 1;
-            session.attachment.send_replace(state.generation);
-            true
-        } else {
-            false
-        }
-    };
-    if detached {
-        let _ = tokio::time::timeout(
-            EXEC_STDIN_WRITE_TIMEOUT,
-            output.send(Ok(ExecEvent {
-                event: Some(exec_event::Event::Exit(ExecExit { code: 0, signal: 0 })),
-            })),
-        )
-        .await;
     }
 }
 
@@ -421,7 +378,7 @@ async fn own_session(
     let _ = worker.await;
     {
         let mut state = session.state.lock().unwrap();
-        if let Some(output) = state.output.take() {
+        for output in state.outputs.drain(..) {
             let _ = output.try_send(Err(Status::cancelled("terminal session closed")));
         }
         state.generation += 1;
@@ -433,16 +390,14 @@ async fn own_session(
 
 async fn publish_output(session: &Session, event: Result<ExecEvent, Status>) -> bool {
     let mut attachment = session.attachment.subscribe();
-    let (sender, generation) = {
+    let generation = *attachment.borrow();
+    let senders = {
         let mut state = session.state.lock().unwrap();
         if let Ok(ExecEvent {
             event: Some(exec_event::Event::Stdout(ref bytes)),
         }) = event
         {
-            let headless = state
-                .output
-                .as_ref()
-                .is_none_or(|output| output.is_closed());
+            let headless = !state.outputs.iter().any(|output| !output.is_closed());
             state.screen.callbacks_mut().headless = headless;
             state.screen.process(bytes);
             let replies = std::mem::take(&mut state.screen.callbacks_mut().replies);
@@ -454,20 +409,15 @@ async fn publish_output(session: &Session, event: Result<ExecEvent, Status>) -> 
                 }));
             }
         }
-        (state.output.clone(), state.generation)
+        state.outputs.retain(|output| !output.is_closed());
+        state.outputs.clone()
     };
-    if let Some(sender) = sender {
-        // Preserve live bytes under temporary pressure without holding the screen lock.
-        // Detach/takeover releases the old subscription; its snapshot includes this event.
+    for sender in senders {
         tokio::select! {
-            result = sender.send(event) => {
+            result = sender.send(event.clone()) => {
                 if result.is_err() {
                     let mut state = session.state.lock().unwrap();
-                    if state.generation == generation {
-                        state.output.take();
-                        state.generation += 1;
-                        session.attachment.send_replace(state.generation);
-                    }
+                    state.outputs.retain(|output| !output.is_closed());
                 }
             }
             _ = attachment.wait_for(|current| *current != generation) => {},
@@ -833,7 +783,7 @@ mod tests {
             .prepare(&mut request, &Arc::new(Semaphore::new(1)), false)
             .unwrap();
         let (sender, output) = mpsc::channel(1);
-        session.state.lock().unwrap().output = Some(sender);
+        session.state.lock().unwrap().outputs = vec![sender];
         (session, output)
     }
 
@@ -855,7 +805,7 @@ mod tests {
             _ = tokio::task::yield_now() => {},
         }
         // Reading/control requests can still acquire the state lock under pressure.
-        assert!(session.state.lock().unwrap().output.is_some());
+        assert!(!session.state.lock().unwrap().outputs.is_empty());
         assert_eq!(
             output.recv().await.unwrap().unwrap().event,
             output_event(b"first").unwrap().event
@@ -865,7 +815,7 @@ mod tests {
             output.recv().await.unwrap().unwrap().event,
             output_event(b"second").unwrap().event
         );
-        assert!(session.state.lock().unwrap().output.is_some());
+        assert!(!session.state.lock().unwrap().outputs.is_empty());
     }
 
     #[tokio::test]

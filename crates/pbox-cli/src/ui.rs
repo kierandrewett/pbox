@@ -438,6 +438,22 @@ impl CliStyle {
     pub(crate) fn success(self, message: &str) {
         self.stdout_status("ok", ANSI_GREEN, message);
     }
+    pub(crate) fn forward_ready(self, local: &str, guest: &str, reverse: bool) {
+        let message = if reverse {
+            format!("guest {guest} -> this computer {local} (press Ctrl-C to stop)")
+        } else {
+            format!("this computer {local} -> guest {guest} (press Ctrl-C to stop)")
+        };
+        self.success(&message);
+    }
+    pub(crate) fn success_stderr(self, message: &str) {
+        self.ssh_status_stderr("ok", ANSI_GREEN, message);
+    }
+    pub(crate) fn ssh_status_stderr(self, marker: &str, code: &str, message: &str) {
+        let mut output = io::stderr().lock();
+        let _ = writeln!(output, "{}\r", self.status(marker, code, message));
+        let _ = output.flush();
+    }
     pub(crate) fn stdout_heading(self, message: &str) {
         println!("{}", self.paint(ANSI_BOLD_CYAN, message));
     }
@@ -1301,22 +1317,22 @@ pub(crate) fn ssh_connection_state(title: Option<&TerminalTitleGuard>, state: &s
         );
         let _ = output.flush();
     }
-    if io::stdin().is_terminal() {
-        let mut output = io::stderr().lock();
-        let hint = if waiting {
-            " | Ctrl+] detach | typing is ignored until connected"
-        } else if state == "Connected" {
-            " | Ctrl+] detach"
-        } else {
-            ""
-        };
-        let _ = write!(
-            output,
-            "\r\npbox: {}{}\r\n",
-            safe_terminal_text(state),
-            hint
+    let style = stderr();
+    if waiting {
+        style.ssh_status_stderr(
+            ">",
+            ANSI_CYAN,
+            &format!(
+                "Connecting to {}...",
+                title.map_or("box", |value| value.name.as_str())
+            ),
         );
-        let _ = output.flush();
+    } else if state == "Connected" {
+        style.success_stderr(&format!(
+            "Connected to {}",
+            title.map_or("box", |value| value.name.as_str())
+        ));
+        style.hint("Ctrl-] detaches");
     }
 }
 

@@ -93,6 +93,11 @@ JSON mode leaves stdout empty on failure and emits unstyled guidance on stderr.
 | `snapshot`, `checkpoint` | Tables, success, errors; snapshot capture uses timed stages and live task logs |
 | `completions` | Unchanged generated script |
 | `ssh`, `exec`, `scp`, `forward` | Connection/transfer status and errors; unchanged guest data |
+
+`forward` identifies both sides and the connection direction. Normal mode
+listens on this computer; `--reverse` listens in the guest. The JSON receipt
+keeps `local` and `remote` as the computer and guest addresses respectively;
+reverse mode adds `direction: "guest-to-local"`.
 | All help | Shared Clap palette |
 
 ## Enforcement and validation

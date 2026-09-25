@@ -1,3 +1,4 @@
+mod reverse;
 mod terminal;
 use hyper_util::rt::TokioIo;
 use pbox_crypto::{CertificateMaterial, server_dns_name};
@@ -7,6 +8,7 @@ use pbox_proto::agent::{
     FileChunk, FileResult, ForwardClose, ForwardEvent, ForwardOpen, GetFileRequest, InfoRequest,
     PingRequest, PingResponse, agent_client::AgentClient as GeneratedAgentClient, forward_event,
 };
+pub use reverse::ReverseForwardSession;
 use rustls::ClientConfig;
 use rustls::RootCertStore;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
@@ -226,7 +228,10 @@ impl AgentClient {
         )
         .map_err(|error| AgentClientError::Endpoint(error.to_string()))?
         .connect_timeout(AGENT_CONNECT_TIMEOUT)
-        .timeout(AGENT_RPC_TIMEOUT);
+        .timeout(AGENT_RPC_TIMEOUT)
+        // Match the agent's adaptive window policy so sustained PTY output
+        // does not repeatedly stall at the HTTP/2 default window size.
+        .http2_adaptive_window(true);
         validate_https_endpoint(&endpoint)?;
         let mut connector = AgentTlsConnector::new(domain, ca_pem, client_identity)?;
         connector.relay = relay.cloned().map(|access| (access, route.to_owned()));
@@ -532,6 +537,22 @@ impl AgentClient {
         S: tonic::IntoStreamingRequest<Message = ForwardEvent>,
     {
         Ok(self.inner.forward(requests).await?.into_inner())
+    }
+    pub async fn reverse_forward(
+        &mut self,
+        listen_host: impl Into<String>,
+        listen_port: u16,
+        target_host: impl Into<String>,
+        target_port: u16,
+    ) -> Result<ReverseForwardSession, AgentClientError> {
+        reverse::start(
+            &mut self.inner,
+            listen_host.into(),
+            listen_port,
+            target_host.into(),
+            target_port,
+        )
+        .await
     }
     pub async fn forward_tcp(
         &mut self,
