@@ -53,6 +53,8 @@ const EXEC_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const EXEC_STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const EXEC_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const PTY_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const PTY_OUTPUT_COALESCE_DELAY: Duration = Duration::from_millis(2);
+const PTY_OUTPUT_COALESCE_SIZE: usize = 1024;
 const EXEC_COMMAND_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 static NEXT_UPLOAD_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1381,9 +1383,9 @@ async fn send_output<R>(
     let Some(mut reader) = reader else { return };
     let mut buffer = [0u8; 8192];
     loop {
-        let size = match reader.read(&mut buffer).await {
+        let (mut size, mut eof) = match reader.read(&mut buffer).await {
             Ok(0) => return,
-            Ok(size) => size,
+            Ok(size) => (size, false),
             Err(error) if pty && error.raw_os_error() == Some(libc::EIO) => return,
             Err(error) => {
                 let _ = tokio::time::timeout(
@@ -1395,6 +1397,36 @@ async fn send_output<R>(
                 return;
             }
         };
+        if pty && size < PTY_OUTPUT_COALESCE_SIZE {
+            let deadline = tokio::time::Instant::now() + PTY_OUTPUT_COALESCE_DELAY;
+            while size < PTY_OUTPUT_COALESCE_SIZE {
+                let read = tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    result = reader.read(&mut buffer[size..]) => result,
+                };
+                match read {
+                    Ok(0) => {
+                        eof = true;
+                        break;
+                    }
+                    Ok(count) => size += count,
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                        eof = true;
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = tokio::time::timeout(
+                            EXEC_STREAM_IDLE_TIMEOUT,
+                            sender.send(Err(Status::internal(error.to_string()))),
+                        )
+                        .await;
+                        output_failure.notify_one();
+                        return;
+                    }
+                }
+            }
+        }
         let event = if stdout {
             exec_event::Event::Stdout(buffer[..size].to_vec())
         } else {
@@ -1407,6 +1439,9 @@ async fn send_output<R>(
         .await;
         if !matches!(sent, Ok(Ok(()))) {
             output_failure.notify_one();
+            return;
+        }
+        if eof {
             return;
         }
     }
@@ -1903,6 +1938,27 @@ mod tests {
         server_subject,
     };
     use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn pty_output_coalesces_small_reads_without_losing_bytes() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (sender, mut output) = mpsc::channel(8);
+        let failure = Arc::new(Notify::new());
+        let task = tokio::spawn(send_output(Some(reader), sender, true, true, failure));
+        let expected = vec![b'x'; 512];
+        for byte in &expected {
+            writer.write_all(std::slice::from_ref(byte)).await.unwrap();
+        }
+        drop(writer);
+        let event = tokio::time::timeout(Duration::from_secs(1), output.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.event, Some(exec_event::Event::Stdout(expected)));
+        assert!(output.try_recv().is_err());
+        task.await.unwrap();
+    }
 
     async fn spawn_test_agent(
         box_id: &str,
