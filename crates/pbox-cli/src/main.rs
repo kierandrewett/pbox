@@ -10,6 +10,7 @@ mod inventory;
 mod progress;
 mod sessions;
 mod snapshots;
+mod ssh_copy_key;
 mod ssh_input;
 mod ui;
 mod update;
@@ -122,6 +123,10 @@ enum Command {
     Config(ConfigCommand),
     /// Create and verify relay configuration.
     Relay(relay::RelayCommand),
+    /// Copy the pbox relay key from another machine over SSH.
+    SshCopyKey(ssh_copy_key::SshCopyKeyCommand),
+    /// Copy pbox configuration, including PVE API credentials, from another machine over SSH.
+    SshCopyConfig(ssh_copy_key::SshCopyConfigCommand),
     /// Search OCI images, list tags, and prepare PVE templates.
     Image(ImageCommand),
     /// Create a pbox-managed LXC container.
@@ -622,6 +627,8 @@ fn run() -> Result<RunOutcome> {
             | Command::Config(_)
             | Command::Relay(_)
             | Command::Setup(_)
+            | Command::SshCopyKey(_)
+            | Command::SshCopyConfig(_)
     ) {
         update::maybe_notify(cli.json);
     }
@@ -635,6 +642,8 @@ fn run() -> Result<RunOutcome> {
                 | Command::Config(_)
                 | Command::Relay(_)
                 | Command::Setup(_)
+                | Command::SshCopyKey(_)
+                | Command::SshCopyConfig(_)
         )
     {
         inventory::ensure_daemon(store.path());
@@ -655,6 +664,12 @@ fn run() -> Result<RunOutcome> {
         }
         Command::Relay(command) => {
             relay::run(command, &store, cli.json).map(|_| RunOutcome::Success)
+        }
+        Command::SshCopyKey(command) => {
+            ssh_copy_key::run_key(command, cli.json).map(|_| RunOutcome::Success)
+        }
+        Command::SshCopyConfig(command) => {
+            ssh_copy_key::run_config(command, cli.json).map(|_| RunOutcome::Success)
         }
         Command::Image(command) => {
             run_image(command.command, &store, cli.json, cli.color).map(|_| RunOutcome::Success)
@@ -5842,6 +5857,46 @@ fn box_state_colour(state: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ssh_copy_commands_forward_openssh_arguments_and_separate_files() {
+        use clap::Parser;
+        use std::ffi::OsString;
+
+        let key = super::Cli::try_parse_from([
+            "pbox",
+            "ssh-copy-key",
+            "--",
+            "-J",
+            "bastion",
+            "user@fsociety",
+        ])
+        .unwrap();
+        let super::Command::SshCopyKey(key) = key.command else {
+            panic!("expected ssh-copy-key command");
+        };
+        assert_eq!(
+            key.common.ssh_args,
+            ["-J", "bastion", "user@fsociety"].map(OsString::from)
+        );
+
+        let config = super::Cli::try_parse_from([
+            "pbox",
+            "ssh-copy-config",
+            "--",
+            "-i",
+            "/tmp/id_ed25519",
+            "user@fsociety",
+        ])
+        .unwrap();
+        let super::Command::SshCopyConfig(config) = config.command else {
+            panic!("expected ssh-copy-config command");
+        };
+        assert_eq!(
+            config.common.ssh_args,
+            ["-i", "/tmp/id_ed25519", "user@fsociety"].map(OsString::from)
+        );
+    }
+
     #[tokio::test]
     async fn terminal_input_is_forwarded_while_output_is_blocked() {
         let (local, input) = tokio::sync::mpsc::channel(1);

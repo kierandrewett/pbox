@@ -92,7 +92,7 @@ JSON mode leaves stdout empty on failure and emits unstyled guidance on stderr.
 | `desktop` | Session and VNC endpoint metadata; JSON receipt, then tunnel until disconnect |
 | `snapshot`, `checkpoint` | Tables, success, errors; snapshot capture uses timed stages and live task logs |
 | `completions` | Unchanged generated script |
-| `ssh`, `exec`, `scp`, `forward` | Connection/transfer status and errors; unchanged guest data |
+| `ssh`, `exec`, `scp`, `forward`, `ssh-copy-key`, `ssh-copy-config` | Connection/transfer status and errors; unchanged guest data |
 
 `forward` identifies both sides and the connection direction. Normal mode
 listens on this computer; `--reverse` listens in the guest. The JSON receipt

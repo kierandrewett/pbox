@@ -51,6 +51,22 @@ pbox config unset relay.key-file
 pbox ssh BOX
 ```
 
+To copy the relay key from a trusted machine that already has it, use
+`pbox ssh-copy-key`. To copy the PVE API configuration separately, use
+`pbox ssh-copy-config`. Both read their matching file from the remote account's
+default `~/.config/pbox/` directory and install it under this user's pbox
+configuration directory with mode `600`. Existing local files are kept unless
+`--force` is supplied. OpenSSH options go after `--`, with the destination
+last, so the regular SSH configuration, password prompts, keys, forwarding
+options and `SSH_AUTH_SOCK` agent (including Bitwarden SSH Agent) are used:
+
+```sh
+pbox ssh-copy-key -- -J bastion user@bsociety
+pbox ssh-copy-config -- -i ~/.ssh/admin_ed25519 -p 2222 user@bsociety
+```
+
+Use `--force` only when replacing the selected local file is intended.
+
 The relay is trusted to receive the caller's PVE token and issue access. It does
 not send that token to the guest or store it. HTTPS certificate verification is
 required; redirects are rejected. Responses with private credentials use
